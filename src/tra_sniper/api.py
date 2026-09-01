@@ -6,13 +6,14 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .auth import TokenManager, hash_password, verify_password
 from .models import BookingRequest
+from .ocr import MAX_IMAGE_BYTES, OcrService
 from .scheduler import TaskScheduler
 from .storage import Database, TaskRecord, UserRecord
 
@@ -52,6 +53,13 @@ class TaskResponse(BaseModel):
     last_error: str | None
 
 
+class OcrResponse(BaseModel):
+    text: str
+    language: str
+    width: int
+    height: int
+
+
 POPULAR_STATIONS = [
     {"value": "0900-基隆", "label": "基隆"},
     {"value": "1000-臺北", "label": "臺北"},
@@ -77,12 +85,14 @@ def _task_response(task: TaskRecord) -> TaskResponse:
 def create_app(
     database: Database | None = None,
     token_manager: TokenManager | None = None,
+    ocr_service: OcrService | None = None,
     *,
     start_scheduler: bool = True,
 ) -> FastAPI:
     db = database or Database()
     tokens = token_manager or TokenManager()
     scheduler = TaskScheduler(db)
+    ocr = ocr_service or OcrService()
     bearer = HTTPBearer(auto_error=False)
 
     @asynccontextmanager
@@ -96,8 +106,8 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.2.0",
-        description="Local membership and human-in-the-loop TRA booking task API.",
+        version="0.3.0",
+        description="Local membership, booking task, and general image OCR API.",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -187,6 +197,32 @@ def create_app(
     @app.get("/tasks", response_model=list[TaskResponse])
     def list_tasks(user: CurrentUser) -> list[TaskResponse]:
         return [_task_response(task) for task in db.list_tasks(user.id)]
+
+    @app.post("/ocr", response_model=OcrResponse)
+    async def recognize_image(
+        user: CurrentUser,
+        image: Annotated[UploadFile, File(description="PNG, JPEG, or WebP image")],
+        language: Annotated[str, Form()] = "zh-TW",
+    ) -> OcrResponse:
+        del user  # Authentication is required; OCR results are not persisted.
+        if image.content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise HTTPException(status_code=415, detail="Only PNG, JPEG, and WebP are supported")
+        image_data = await image.read(MAX_IMAGE_BYTES + 1)
+        await image.close()
+        if len(image_data) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Image exceeds the 8 MB limit")
+        try:
+            result = ocr.recognize(image_data, language)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return OcrResponse(
+            text=result.text,
+            language=result.language,
+            width=result.width,
+            height=result.height,
+        )
 
     @app.get("/tasks/{task_id}/config")
     def task_config(task_id: str, user: CurrentUser) -> dict[str, Any]:

@@ -70,6 +70,99 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
   );
 }
 
+function OcrPanel({ token }: { token: string }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [language, setLanguage] = useState<"zh-TW" | "en">("zh-TW");
+  const [preview, setPreview] = useState("");
+  const [result, setResult] = useState("");
+  const [details, setDetails] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!file) {
+      setPreview("");
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setPreview(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
+
+  async function recognize(event: FormEvent) {
+    event.preventDefault();
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    setResult("");
+    setDetails("");
+    try {
+      const response = await api.ocr(token, file, language);
+      setResult(response.text);
+      setDetails(`${response.width} × ${response.height} px · ${response.language}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法辨識圖片");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel ocr-panel">
+      <div className="panel-heading">
+        <div><span className="step">03</span><h2>圖片文字辨識</h2></div>
+        <small>Tesseract OCR · 圖片不會保存</small>
+      </div>
+      <form className="ocr-form" onSubmit={recognize}>
+        <div className="ocr-controls">
+          <label>選擇圖片
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              onChange={(event) => {
+                const selected = event.target.files?.[0] ?? null;
+                if (selected && selected.size > 8 * 1024 * 1024) {
+                  setFile(null);
+                  setError("圖片不可超過 8 MB");
+                  event.currentTarget.value = "";
+                  return;
+                }
+                if (selected && !["image/png", "image/jpeg", "image/webp"].includes(selected.type)) {
+                  setFile(null);
+                  setError("僅支援 PNG、JPEG 與 WebP 圖片");
+                  event.currentTarget.value = "";
+                  return;
+                }
+                setFile(selected);
+                setResult("");
+                setDetails("");
+                setError("");
+              }}
+              required
+            />
+          </label>
+          <label>辨識語言
+            <select value={language} onChange={(event) => setLanguage(event.target.value as "zh-TW" | "en")}>
+              <option value="zh-TW">繁體中文＋英文</option>
+              <option value="en">英文</option>
+            </select>
+          </label>
+          <button className="primary" disabled={!file || busy}>{busy ? "辨識中…" : "開始辨識"}</button>
+          <p className="ocr-hint">支援 PNG、JPEG、WebP，檔案上限 8 MB。</p>
+          {error && <p className="error" role="alert">{error}</p>}
+        </div>
+        <div className="ocr-preview">
+          {preview ? <img src={preview} alt="待辨識圖片預覽" /> : <div><b>圖片預覽</b><span>選擇圖片後會顯示在這裡</span></div>}
+        </div>
+        <div className="ocr-output">
+          <div><b>辨識結果</b>{details && <span>{details}</span>}</div>
+          <textarea value={result} readOnly placeholder="辨識出的文字會顯示在這裡" aria-label="OCR 辨識結果" />
+        </div>
+      </form>
+    </section>
+  );
+}
+
 interface BookingFormState {
   identity: string;
   startStation: string;
@@ -224,6 +317,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             </div>
           </section>
         </div>
+        <OcrPanel token={token} />
       </main>
     </div>
   );

@@ -21,6 +21,7 @@
 - **預約排程** — 到達指定時間後提醒使用者接手訂票
 - **多種行程** — 支援單程、來回、依車次或時段查詢
 - **瀏覽器輔助** — 自動開啟台鐵官方頁面並填入訂票條件
+- **圖片 OCR** — 上傳圖片辨識繁體中文與英文，支援網頁及 CLI
 - **資料保護** — 密碼雜湊、Token 驗證與敏感資料加密儲存
 - **Docker 部署** — 一個指令啟動 API、排程器與前端介面
 
@@ -72,6 +73,14 @@ tra-sniper book booking.json
 ```bash
 tra-sniper book booking.json --submit --wait-seconds 600
 ```
+
+一般圖片文字辨識：
+
+```bash
+tra-sniper ocr image.png --language zh-TW
+```
+
+網頁上傳的圖片只在記憶體中處理，不會寫入資料庫；支援 PNG、JPEG、WebP，單檔上限 8 MB。
 
 ## 🛡️ 免責聲明
 

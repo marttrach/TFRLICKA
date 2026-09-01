@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .automation import TRCBookingAutomator
 from .models import BookingRequest
+from .ocr import SUPPORTED_LANGUAGES, OcrService
 
 
 def load_request(path: str | Path) -> BookingRequest:
@@ -28,6 +29,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("config")
 
     subparsers.add_parser("serve", help="Run the local membership and task API")
+
+    ocr = subparsers.add_parser("ocr", help="Recognize text in a local image")
+    ocr.add_argument("image")
+    ocr.add_argument(
+        "--language",
+        choices=SUPPORTED_LANGUAGES,
+        default="zh-TW",
+        help="OCR language preset (default: zh-TW)",
+    )
 
     book = subparsers.add_parser("book", help="Open and prepare the official booking page")
     book.add_argument("config")
@@ -51,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
 
             run()
             return 0
+        if args.command == "ocr":
+            result = OcrService().recognize(Path(args.image).read_bytes(), args.language)
+            print(result.text)
+            return 0
         request = load_request(args.config)
         if args.command == "validate":
             print(json.dumps(request.redacted(), ensure_ascii=False, indent=2, default=str))
@@ -66,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
         return 0 if result.status in {"prepared", "completed"} else 2
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

@@ -21,11 +21,20 @@ export interface Task {
   last_error: string | null;
 }
 
+export interface OcrResult {
+  text: string;
+  language: "zh-TW" | "en";
+  width: number;
+  height: number;
+}
+
 const BASE_URL = import.meta.env.VITE_API_URL ?? "/api";
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const headers = new Headers(options.headers);
-  if (options.body) headers.set("Content-Type", "application/json");
+  if (options.body && !(options.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
   if (token) headers.set("Authorization", `Bearer ${token}`);
 
   const response = await fetch(`${BASE_URL}${path}`, { ...options, headers });
@@ -67,5 +76,11 @@ export const api = {
   },
   taskConfig(token: string, taskId: string) {
     return request<Record<string, unknown>>(`/tasks/${taskId}/config`, {}, token);
+  },
+  ocr(token: string, image: File, language: "zh-TW" | "en") {
+    const form = new FormData();
+    form.append("image", image);
+    form.append("language", language);
+    return request<OcrResult>("/ocr", { method: "POST", body: form }, token);
   },
 };
