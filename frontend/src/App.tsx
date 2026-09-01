@@ -70,12 +70,13 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
   );
 }
 
-function OcrPanel({ token }: { token: string }) {
+function OcrWorkflow({ token }: { token: string }) {
   const [file, setFile] = useState<File | null>(null);
   const [language, setLanguage] = useState<"zh-TW" | "en">("zh-TW");
   const [preview, setPreview] = useState("");
   const [result, setResult] = useState("");
   const [details, setDetails] = useState("");
+  const [copyNotice, setCopyNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -96,6 +97,7 @@ function OcrPanel({ token }: { token: string }) {
     setError("");
     setResult("");
     setDetails("");
+    setCopyNotice("");
     try {
       const response = await api.ocr(token, file, language);
       setResult(response.text);
@@ -107,11 +109,33 @@ function OcrPanel({ token }: { token: string }) {
     }
   }
 
+  async function copyResult() {
+    if (!result) return;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(result);
+      } else {
+        const helper = document.createElement("textarea");
+        helper.value = result;
+        helper.style.position = "fixed";
+        helper.style.opacity = "0";
+        document.body.appendChild(helper);
+        helper.select();
+        const copied = document.execCommand("copy");
+        helper.remove();
+        if (!copied) throw new Error("Copy command failed");
+      }
+      setCopyNotice("已複製到剪貼簿");
+    } catch {
+      setError("無法自動複製，請選取文字後手動複製");
+    }
+  }
+
   return (
-    <section className="panel ocr-panel">
-      <div className="panel-heading">
-        <div><span className="step">03</span><h2>圖片文字辨識</h2></div>
-        <small>Tesseract OCR · 圖片不會保存</small>
+    <section className="ocr-workflow">
+      <div className="ocr-workflow-heading">
+        <div><span>OCR</span><b>圖片辨識輸入框</b></div>
+        <small>辨識、修正，再一鍵複製</small>
       </div>
       <form className="ocr-form" onSubmit={recognize}>
         <div className="ocr-controls">
@@ -136,6 +160,7 @@ function OcrPanel({ token }: { token: string }) {
                 setFile(selected);
                 setResult("");
                 setDetails("");
+                setCopyNotice("");
                 setError("");
               }}
               required
@@ -156,7 +181,12 @@ function OcrPanel({ token }: { token: string }) {
         </div>
         <div className="ocr-output">
           <div><b>辨識結果</b>{details && <span>{details}</span>}</div>
-          <textarea value={result} readOnly placeholder="辨識出的文字會顯示在這裡" aria-label="OCR 辨識結果" />
+          <textarea value={result} onChange={(event) => { setResult(event.target.value); setCopyNotice(""); }} placeholder="辨識出的文字會顯示在這裡，也可直接修正" aria-label="OCR 辨識結果" />
+          <div className="ocr-actions">
+            <button type="button" className="copy-button" disabled={!result} onClick={copyResult}>複製文字</button>
+            <button type="button" className="text-button" disabled={!result} onClick={() => { setResult(""); setDetails(""); setCopyNotice(""); }}>清除</button>
+            {copyNotice && <span role="status">✓ {copyNotice}</span>}
+          </div>
         </div>
       </form>
     </section>
@@ -298,6 +328,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               {notice && <p className="notice wide" role="status">{notice}</p>}
               <button className="primary wide" disabled={busy}>{busy ? "建立中…" : "加入任務佇列"}</button>
             </form>
+            <OcrWorkflow token={token} />
           </section>
 
           <section className="panel task-panel">
@@ -317,7 +348,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             </div>
           </section>
         </div>
-        <OcrPanel token={token} />
       </main>
     </div>
   );
