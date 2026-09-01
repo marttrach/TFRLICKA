@@ -1,0 +1,15 @@
+{
+  "identity": "REPLACE_WITH_YOUR_ID",
+  "identity_type": "PERSON_ID",
+  "start_station": "1000-臺北",
+  "end_station": "3300-臺中",
+  "trip_type": "ONEWAY",
+  "order_type": "BY_TRAIN_NO",
+  "quantity": 1,
+  "seat_preference": "NONE",
+  "allow_seat_change": true,
+  "outbound": {
+    "ride_date": "2026/09/15",
+    "train_numbers": ["110"]
+  }
+}

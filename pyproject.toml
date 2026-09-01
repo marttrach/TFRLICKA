@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tra-sniper"
+version = "0.2.0"
+description = "Human-in-the-loop Taiwan Railway booking form automation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "marttrach" }]
+dependencies = [
+  "cryptography>=45,<47",
+  "fastapi>=0.116,<1",
+  "playwright>=1.55,<2",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+tra-sniper = "tra_sniper.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tra_sniper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

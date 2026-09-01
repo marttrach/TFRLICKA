@@ -1,0 +1,28 @@
+services:
+  tra-sniper-api:
+    build: .
+    container_name: tra-sniper-api
+    environment:
+      TRA_TOKEN_SECRET: ${TRA_TOKEN_SECRET:?Set TRA_TOKEN_SECRET}
+      TRA_ENCRYPTION_KEY: ${TRA_ENCRYPTION_KEY:-}
+      TRA_DATA_DIR: /app/data
+      TRA_API_HOST: 0.0.0.0
+      TRA_API_PORT: 8000
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  tra-sniper-frontend:
+    build: ./frontend
+    container_name: tra-sniper-frontend
+    ports:
+      - "43123:80"
+    depends_on:
+      tra-sniper-api:
+        condition: service_healthy
+    restart: unless-stopped
