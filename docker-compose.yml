@@ -1,28 +1,39 @@
 services:
   tra-sniper-api:
-    build: .
+    image: ghcr.io/marttrach/tra-sniper:latest
     container_name: tra-sniper-api
     environment:
-      TRA_TOKEN_SECRET: ${TRA_TOKEN_SECRET:?Set TRA_TOKEN_SECRET}
+      TRA_TOKEN_SECRET: ${TRA_TOKEN_SECRET:?Set TRA_TOKEN_SECRET in Portainer}
       TRA_ENCRYPTION_KEY: ${TRA_ENCRYPTION_KEY:-}
       TRA_DATA_DIR: /app/data
       TRA_API_HOST: 0.0.0.0
       TRA_API_PORT: 8000
     volumes:
-      - ./data:/app/data
+      - /mnt/NEW_PA9A1_2T/Truenas_App/TRA/data:/app/data
+    ports:
+      - "48100:8000"
     restart: unless-stopped
+    networks:
+      - default
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 20s
       timeout: 5s
       retries: 5
+      start_period: 20s
 
   tra-sniper-frontend:
-    build: ./frontend
+    image: ghcr.io/marttrach/tra-sniper-frontend:latest
     container_name: tra-sniper-frontend
     ports:
-      - "43123:80"
+      - "43124:80"
     depends_on:
       tra-sniper-api:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge

@@ -37,15 +37,16 @@ cp .env.example .env
 編輯 `.env`，將 `TRA_TOKEN_SECRET` 換成至少 32 字元的隨機字串，接著啟動服務：
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 服務啟動後：
 
 | 服務 | 網址 |
 | --- | --- |
-| 儀表板 | <http://localhost:43123> |
-| API 文件 | <http://localhost:8000/docs> |
+| 儀表板 | <http://localhost:43124> |
+| API 文件 | <http://localhost:48100/docs> |
 
 ## 🎯 使用流程
 
