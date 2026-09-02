@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import threading
 
 from .storage import Database
+
+logger = logging.getLogger(__name__)
 
 
 class TaskScheduler:
@@ -15,7 +18,13 @@ class TaskScheduler:
         self._thread: threading.Thread | None = None
 
     def tick(self) -> int:
-        return self.database.promote_due_tasks()
+        promoted = self.database.promote_due_tasks()
+        if promoted:
+            logger.info(
+                "scheduled tasks are ready for human action",
+                extra={"event": "scheduler.tasks_promoted", "promoted_count": promoted},
+            )
+        return promoted
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -31,4 +40,10 @@ class TaskScheduler:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
-            self.tick()
+            try:
+                self.tick()
+            except Exception:
+                logger.exception(
+                    "scheduler tick failed; the scheduler will continue",
+                    extra={"event": "scheduler.tick_failed"},
+                )

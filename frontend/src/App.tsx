@@ -60,7 +60,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
         </div>
         <form onSubmit={submit}>
           <label>電子郵件<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
-          <label>密碼<input type="password" minLength={10} value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
+          <label>密碼<input type="password" minLength={mode === "register" ? 12 : 1} value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
           {error && <p className="error" role="alert">{error}</p>}
           <button className="primary" disabled={busy}>{busy ? "處理中…" : mode === "login" ? "進入工作台" : "建立並登入"}</button>
         </form>
@@ -361,10 +361,19 @@ export default function App() {
     setToken(value);
   }, []);
 
-  const logout = useCallback(() => {
+  const clearSession = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
     setToken("");
   }, []);
+
+  const logout = useCallback(() => {
+    const currentToken = localStorage.getItem(TOKEN_KEY);
+    if (!currentToken) {
+      clearSession();
+      return;
+    }
+    void api.logout(currentToken).finally(clearSession);
+  }, [clearSession]);
 
   return token ? <Dashboard token={token} onLogout={logout} /> : <AuthScreen onAuthenticated={login} />;
 }

@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from cryptography.fernet import Fernet
@@ -36,3 +37,46 @@ def test_task_payload_is_encrypted_and_due_task_is_promoted(tmp_path) -> None:
     assert "TEST-ID" not in (tmp_path / "app.db").read_bytes().decode("latin1")
     assert database.promote_due_tasks((datetime.now(UTC) + timedelta(minutes=6)).isoformat()) == 1
     assert database.get_task(task.id, user.id).status == "waiting_human"
+
+
+def test_existing_database_is_migrated_without_losing_users(tmp_path) -> None:
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO users VALUES (1, 'legacy@example.com', 'existing-hash', ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+
+    database = Database(path, encryption_key=Fernet.generate_key().decode())
+    user = database.get_user(1)
+    assert user is not None
+    assert user.email == "legacy@example.com"
+    assert user.token_version == 0
+
+
+def test_login_attempts_and_token_revocation_are_persistent(tmp_path) -> None:
+    database = Database(tmp_path / "security.db", encryption_key=Fernet.generate_key().decode())
+    user = database.create_user("user@example.com", "password-hash")
+    now = datetime.now(UTC)
+    for offset in range(5):
+        database.record_login_attempt(
+            user.email,
+            succeeded=False,
+            attempted_at=now - timedelta(minutes=offset),
+        )
+    assert database.is_login_locked(user.email, now=now)
+
+    database.record_login_attempt(user.email, succeeded=True, attempted_at=now)
+    assert not database.is_login_locked(user.email, now=now)
+    assert database.revoke_user_tokens(user.id)
+    assert database.get_user(user.id).token_version == 1

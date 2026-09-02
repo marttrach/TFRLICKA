@@ -8,6 +8,8 @@ services:
       TRA_DATA_DIR: /app/data
       TRA_API_HOST: 0.0.0.0
       TRA_API_PORT: 8000
+      TRA_CORS_ORIGINS: ${TRA_CORS_ORIGINS:-}
+      TRA_LOG_LEVEL: ${TRA_LOG_LEVEL:-INFO}
     volumes:
       - /mnt/NEW_PA9A1_2T/Truenas_App/TRA/data:/app/data
     ports:

@@ -19,8 +19,8 @@ def _b64decode(value: str) -> bytes:
 
 
 def hash_password(password: str) -> str:
-    if len(password) < 10:
-        raise ValueError("password must contain at least 10 characters")
+    if len(password) < 12:
+        raise ValueError("password must contain at least 12 characters")
     salt = secrets.token_bytes(16)
     digest = hashlib.scrypt(
         password.encode("utf-8"),
@@ -55,6 +55,7 @@ def verify_password(password: str, encoded: str) -> bool:
 class TokenClaims:
     user_id: int
     expires_at: int
+    version: int
 
 
 class TokenManager:
@@ -67,10 +68,10 @@ class TokenManager:
         self._secret = configured.encode("utf-8")
         self.ttl_seconds = ttl_seconds
 
-    def issue(self, user_id: int, *, now: int | None = None) -> str:
+    def issue(self, user_id: int, token_version: int = 0, *, now: int | None = None) -> str:
         issued_at = int(time.time()) if now is None else now
         payload = json.dumps(
-            {"sub": user_id, "exp": issued_at + self.ttl_seconds},
+            {"sub": user_id, "exp": issued_at + self.ttl_seconds, "ver": token_version},
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
@@ -93,6 +94,10 @@ class TokenManager:
             current = int(time.time()) if now is None else now
             if expires_at <= current:
                 raise ValueError("token expired")
-            return TokenClaims(user_id=int(payload["sub"]), expires_at=expires_at)
+            return TokenClaims(
+                user_id=int(payload["sub"]),
+                expires_at=expires_at,
+                version=int(payload.get("ver", -1)),
+            )
         except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError("invalid or expired token") from exc

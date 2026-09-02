@@ -22,7 +22,7 @@
 - **多種行程** — 支援單程、來回、依車次或時段查詢
 - **瀏覽器輔助** — 自動開啟台鐵官方頁面並填入訂票條件
 - **圖片 OCR** — 在任務流程辨識繁中與英文，結果可修正並一鍵複製
-- **資料保護** — 密碼雜湊、Token 驗證與敏感資料加密儲存
+- **資料保護** — 登入節流、可撤銷 Token 與敏感資料加密儲存
 - **Docker 部署** — 一個指令啟動 API、排程器與前端介面
 
 > TRA-Sniper 採用人工確認流程。驗證碼、reCAPTCHA 與最後訂票動作皆由使用者本人完成。
@@ -62,7 +62,7 @@ docker compose up -d
 安裝 Python 3.11 以上版本後：
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[browser]"
 python -m playwright install chromium
 cp config.example.json booking.json
 tra-sniper book booking.json

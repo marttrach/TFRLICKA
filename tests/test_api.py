@@ -8,6 +8,13 @@ from tra_sniper.auth import TokenManager
 from tra_sniper.storage import Database
 
 
+def _new_app(tmp_path, monkeypatch=None):
+    if monkeypatch is not None:
+        monkeypatch.setenv("TRA_CORS_ORIGINS", "http://nas.local:43124")
+    database = Database(tmp_path / "api.db", encryption_key=Fernet.generate_key().decode())
+    return database, create_app(database, TokenManager("t" * 32), start_scheduler=False)
+
+
 def test_member_and_task_flow(tmp_path) -> None:
     database = Database(tmp_path / "api.db", encryption_key=Fernet.generate_key().decode())
     app = create_app(database, TokenManager("t" * 32), start_scheduler=False)
@@ -53,3 +60,76 @@ def test_member_and_task_flow(tmp_path) -> None:
 
         cancelled = client.post(f"/tasks/{task_id}/cancel", headers=headers)
         assert cancelled.status_code == 204
+
+
+def test_health_stations_login_me_logout_and_revocation(tmp_path) -> None:
+    _, app = _new_app(tmp_path)
+    with TestClient(app) as client:
+        assert client.get("/health").json()["status"] == "ok"
+        stations = client.get("/stations")
+        assert stations.status_code == 200
+        assert any(station["value"] == "1000-臺北" for station in stations.json())
+
+        registered = client.post(
+            "/auth/register",
+            json={"email": "member@example.com", "password": "very-secure-password"},
+        )
+        assert registered.status_code == 201
+        login = client.post(
+            "/auth/login",
+            json={"email": "member@example.com", "password": "very-secure-password"},
+        )
+        assert login.status_code == 200
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        assert client.get("/auth/me", headers=headers).json()["email"] == "member@example.com"
+
+        assert client.post("/auth/logout", headers=headers).status_code == 204
+        revoked = client.get("/auth/me", headers=headers)
+        assert revoked.status_code == 401
+        assert revoked.json()["detail"] == "Token has been revoked"
+
+
+def test_login_is_rate_limited_after_five_failures(tmp_path) -> None:
+    _, app = _new_app(tmp_path)
+    with TestClient(app) as client:
+        client.post(
+            "/auth/register",
+            json={"email": "limited@example.com", "password": "very-secure-password"},
+        )
+        for _ in range(4):
+            response = client.post(
+                "/auth/login",
+                json={"email": "limited@example.com", "password": "wrong"},
+            )
+            assert response.status_code == 401
+        locked = client.post(
+            "/auth/login",
+            json={"email": "limited@example.com", "password": "wrong"},
+        )
+        assert locked.status_code == 429
+        assert locked.headers["retry-after"] == "900"
+
+        correct_but_locked = client.post(
+            "/auth/login",
+            json={"email": "limited@example.com", "password": "very-secure-password"},
+        )
+        assert correct_but_locked.status_code == 429
+
+
+def test_registration_password_policy_and_configured_cors(tmp_path, monkeypatch) -> None:
+    _, app = _new_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        short = client.post(
+            "/auth/register",
+            json={"email": "short@example.com", "password": "tenletters"},
+        )
+        assert short.status_code == 422
+        preflight = client.options(
+            "/auth/login",
+            headers={
+                "Origin": "http://nas.local:43124",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers["access-control-allow-origin"] == "http://nas.local:43124"

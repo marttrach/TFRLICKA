@@ -11,13 +11,15 @@ def test_password_hash_round_trip() -> None:
 
 
 def test_short_password_is_rejected() -> None:
-    with pytest.raises(ValueError, match="at least 10"):
+    with pytest.raises(ValueError, match="at least 12"):
         hash_password("short")
 
 
 def test_signed_token_expires() -> None:
     manager = TokenManager("x" * 32, ttl_seconds=60)
-    token = manager.issue(42, now=100)
-    assert manager.verify(token, now=159).user_id == 42
+    token = manager.issue(42, 7, now=100)
+    claims = manager.verify(token, now=159)
+    assert claims.user_id == 42
+    assert claims.version == 7
     with pytest.raises(ValueError, match="invalid or expired"):
         manager.verify(token, now=160)

@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ class UserRecord:
     email: str
     password_hash: str
     created_at: str
+    token_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,10 +101,18 @@ class Database:
                     id INTEGER PRIMARY KEY,
                     email TEXT NOT NULL COLLATE NOCASE,
                     password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    token_version INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            user_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "token_version" not in user_columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)"
             )
@@ -132,6 +141,19 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_tasks_due "
                 "ON tasks(status, scheduled_at) WHERE status = 'scheduled'"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    email TEXT NOT NULL COLLATE NOCASE,
+                    attempted_at TEXT NOT NULL,
+                    succeeded INTEGER NOT NULL CHECK (succeeded IN (0, 1))
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_login_attempts "
+                "ON login_attempts(email, attempted_at DESC)"
+            )
             connection.execute("PRAGMA optimize")
 
     def create_user(self, email: str, password_hash: str) -> UserRecord:
@@ -145,12 +167,13 @@ class Database:
                 user_id = int(cursor.lastrowid)
         except sqlite3.IntegrityError as exc:
             raise ValueError("email is already registered") from exc
-        return UserRecord(user_id, email.strip().lower(), password_hash, created_at)
+        return UserRecord(user_id, email.strip().lower(), password_hash, created_at, 0)
 
     def get_user_by_email(self, email: str) -> UserRecord | None:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT id, email, password_hash, created_at FROM users WHERE email = ?",
+                "SELECT id, email, password_hash, created_at, token_version "
+                "FROM users WHERE email = ?",
                 (email.strip().lower(),),
             ).fetchone()
         return UserRecord(**dict(row)) if row else None
@@ -158,10 +181,62 @@ class Database:
     def get_user(self, user_id: int) -> UserRecord | None:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT id, email, password_hash, created_at FROM users WHERE id = ?",
+                "SELECT id, email, password_hash, created_at, token_version "
+                "FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         return UserRecord(**dict(row)) if row else None
+
+    def revoke_user_tokens(self, user_id: int) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+                (user_id,),
+            )
+        return cursor.rowcount == 1
+
+    def is_login_locked(
+        self,
+        email: str,
+        *,
+        now: datetime | None = None,
+        max_failures: int = 5,
+        window_minutes: int = 15,
+    ) -> bool:
+        current = now or datetime.now(UTC)
+        cutoff = (current - timedelta(minutes=window_minutes)).isoformat()
+        with self.connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*) FROM login_attempts
+                WHERE email = ? AND succeeded = 0 AND attempted_at >= ?
+                """,
+                (email.strip().lower(), cutoff),
+            ).fetchone()[0]
+        return int(count) >= max_failures
+
+    def record_login_attempt(
+        self,
+        email: str,
+        *,
+        succeeded: bool,
+        attempted_at: datetime | None = None,
+    ) -> None:
+        normalized = email.strip().lower()
+        timestamp = (attempted_at or datetime.now(UTC)).isoformat()
+        with self.connect() as connection:
+            if succeeded:
+                connection.execute("DELETE FROM login_attempts WHERE email = ?", (normalized,))
+            else:
+                connection.execute(
+                    "INSERT INTO login_attempts(email, attempted_at, succeeded) VALUES (?, ?, 0)",
+                    (normalized, timestamp),
+                )
+                cleanup_before = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+                connection.execute(
+                    "DELETE FROM login_attempts WHERE attempted_at < ?",
+                    (cleanup_before,),
+                )
 
     def create_task(
         self,

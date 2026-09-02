@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -12,17 +14,31 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .auth import TokenManager, hash_password, verify_password
+from .logging_config import configure_logging
 from .models import BookingRequest
 from .ocr import MAX_IMAGE_BYTES, OcrService
 from .scheduler import TaskScheduler
 from .storage import Database, TaskRecord, UserRecord
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+DEFAULT_DEV_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+LOGIN_RETRY_AFTER_SECONDS = 15 * 60
+logger = logging.getLogger(__name__)
+DUMMY_PASSWORD_HASH = hash_password("not-a-real-user-password")
 
 
-class Credentials(BaseModel):
+class LoginCredentials(BaseModel):
     email: str = Field(min_length=5, max_length=254)
-    password: str = Field(min_length=10, max_length=256)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class RegistrationCredentials(LoginCredentials):
+    password: str = Field(min_length=12, max_length=256)
 
 
 class TokenResponse(BaseModel):
@@ -82,6 +98,12 @@ def _task_response(task: TaskRecord) -> TaskResponse:
     return TaskResponse(**asdict(task))
 
 
+def _cors_origins() -> list[str]:
+    configured = os.getenv("TRA_CORS_ORIGINS", "")
+    origins = [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return origins or list(DEFAULT_DEV_ORIGINS)
+
+
 def create_app(
     database: Database | None = None,
     token_manager: TokenManager | None = None,
@@ -106,18 +128,13 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.3.0",
+        version="0.4.0",
         description="Local membership, booking task, and general image OCR API.",
         lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-        ],
+        allow_origins=_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -141,6 +158,11 @@ def create_app(
         user = db.get_user(claims.user_id)
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        if claims.version != user.token_version:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+            )
         return user
 
     CurrentUser = Annotated[UserRecord, Depends(current_user)]
@@ -154,7 +176,7 @@ def create_app(
         return POPULAR_STATIONS
 
     @app.post("/auth/register", response_model=TokenResponse, status_code=201)
-    def register(body: Credentials) -> TokenResponse:
+    def register(body: RegistrationCredentials) -> TokenResponse:
         email = body.email.strip().lower()
         if not EMAIL_PATTERN.fullmatch(email):
             raise HTTPException(status_code=422, detail="Invalid email address")
@@ -162,18 +184,42 @@ def create_app(
             user = db.create_user(email, hash_password(body.password))
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return TokenResponse(access_token=tokens.issue(user.id))
+        return TokenResponse(access_token=tokens.issue(user.id, user.token_version))
 
     @app.post("/auth/login", response_model=TokenResponse)
-    def login(body: Credentials) -> TokenResponse:
-        user = db.get_user_by_email(body.email)
-        if not user or not verify_password(body.password, user.password_hash):
+    def login(body: LoginCredentials) -> TokenResponse:
+        email = body.email.strip().lower()
+        if db.is_login_locked(email):
+            logger.warning("login temporarily locked", extra={"event": "auth.login_locked"})
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts; try again later",
+                headers={"Retry-After": str(LOGIN_RETRY_AFTER_SECONDS)},
+            )
+        user = db.get_user_by_email(email)
+        password_hash = user.password_hash if user else DUMMY_PASSWORD_HASH
+        if not verify_password(body.password, password_hash) or not user:
+            db.record_login_attempt(email, succeeded=False)
+            if db.is_login_locked(email):
+                logger.warning("login temporarily locked", extra={"event": "auth.login_locked"})
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed login attempts; try again later",
+                    headers={"Retry-After": str(LOGIN_RETRY_AFTER_SECONDS)},
+                )
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        return TokenResponse(access_token=tokens.issue(user.id))
+        db.record_login_attempt(email, succeeded=True)
+        return TokenResponse(access_token=tokens.issue(user.id, user.token_version))
 
     @app.get("/auth/me", response_model=UserResponse)
     def me(user: CurrentUser) -> UserResponse:
         return UserResponse(id=user.id, email=user.email, created_at=user.created_at)
+
+    @app.post("/auth/logout", status_code=204)
+    def logout(user: CurrentUser) -> Response:
+        db.revoke_user_tokens(user.id)
+        logger.info("user tokens revoked", extra={"event": "auth.logout"})
+        return Response(status_code=204)
 
     @app.post("/tasks", response_model=TaskResponse, status_code=201)
     def create_task(body: TaskCreate, user: CurrentUser) -> TaskResponse:
@@ -212,11 +258,19 @@ def create_app(
         if len(image_data) > MAX_IMAGE_BYTES:
             raise HTTPException(status_code=413, detail="Image exceeds the 8 MB limit")
         try:
+            started_at = time.perf_counter()
             result = ocr.recognize(image_data, language)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        logger.info(
+            "OCR image processed",
+            extra={
+                "event": "ocr.completed",
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
         return OcrResponse(
             text=result.text,
             language=result.language,
@@ -255,6 +309,7 @@ app = create_app()
 def run() -> None:
     import uvicorn
 
+    configure_logging()
     uvicorn.run(
         "tra_sniper.api:app",
         host=os.getenv("TRA_API_HOST", "0.0.0.0"),

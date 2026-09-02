@@ -62,6 +62,9 @@ export const api = {
   me(token: string) {
     return request<User>("/auth/me", {}, token);
   },
+  logout(token: string) {
+    return request<void>("/auth/logout", { method: "POST" }, token);
+  },
   stations() {
     return request<Station[]>("/stations");
   },
