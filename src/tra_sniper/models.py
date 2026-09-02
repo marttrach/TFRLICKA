@@ -26,6 +26,13 @@ class SeatPreference(str, Enum):
     TABLE = "TABLE"
 
 
+# These labels mirror the official TRC booking form. Keep 23:59: it is an
+# actual option even though the regular intervals are every 30 minutes.
+BOOKING_TIME_LABELS = tuple(
+    f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)
+) + ("23:59",)
+
+
 def _parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value.replace("/", "-"))
@@ -64,6 +71,12 @@ class Leg:
         else:
             if not self.start_time or not self.end_time:
                 raise ValueError("BY_TIME requires start_time and end_time")
+            if self.start_time not in BOOKING_TIME_LABELS:
+                raise ValueError(f"Invalid start_time {self.start_time!r}")
+            if self.end_time not in BOOKING_TIME_LABELS:
+                raise ValueError(f"Invalid end_time {self.end_time!r}")
+            if self.start_time >= self.end_time:
+                raise ValueError("start_time must precede end_time")
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tra-sniper"
-version = "0.4.0"
+version = "0.5.0"
 description = "Human-in-the-loop Taiwan Railway booking and OCR workspace"
 readme = "README.md"
 requires-python = ">=3.11"

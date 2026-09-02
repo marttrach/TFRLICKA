@@ -28,6 +28,37 @@ export interface OcrResult {
   height: number;
 }
 
+export interface TrainCandidate {
+  train_no: string;
+  train_type_name: string;
+  departure_time: string;
+  arrival_time: string;
+  duration_minutes: number;
+  is_reserved_type: boolean;
+  seat_type_label: string;
+  note: string;
+  in_requested_window: boolean;
+}
+
+export interface TransferSuggestion {
+  transfer_station: Station;
+  departure_time: string;
+  arrival_time: string;
+  duration_minutes: number;
+  buffer_minutes: number;
+  first_leg: TrainCandidate;
+  second_leg: TrainCandidate;
+  notice: string;
+}
+
+export interface Suggestions {
+  primary: TrainCandidate[];
+  alternatives: TrainCandidate[];
+  transfers: TransferSuggestion[];
+  availability_known: false;
+  notice?: string;
+}
+
 const BASE_URL = import.meta.env.VITE_API_URL ?? "/api";
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
@@ -68,6 +99,12 @@ export const api = {
   stations() {
     return request<Station[]>("/stations");
   },
+  times() {
+    return request<string[]>("/times");
+  },
+  suggestions(token: string, payload: unknown) {
+    return request<Suggestions>("/suggestions", { method: "POST", body: JSON.stringify(payload) }, token);
+  },
   tasks(token: string) {
     return request<Task[]>("/tasks", {}, token);
   },
@@ -79,6 +116,9 @@ export const api = {
   },
   taskConfig(token: string, taskId: string) {
     return request<Record<string, unknown>>(`/tasks/${taskId}/config`, {}, token);
+  },
+  taskSuggestions(token: string, taskId: string) {
+    return request<Suggestions>(`/tasks/${taskId}/suggestions`, {}, token);
   },
   ocr(token: string, image: File, language: "zh-TW" | "en") {
     const form = new FormData();

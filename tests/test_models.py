@@ -45,3 +45,23 @@ def test_by_time_requires_range() -> None:
     data["outbound"] = {"ride_date": future_date()}
     with pytest.raises(ValueError, match="requires start_time and end_time"):
         BookingRequest.from_dict(data)
+
+
+def test_by_time_requires_official_labels_in_order() -> None:
+    data = valid_data()
+    data["order_type"] = "BY_TIME"
+    data["outbound"] = {
+        "ride_date": future_date(),
+        "start_time": "08:15",
+        "end_time": "12:00",
+    }
+    with pytest.raises(ValueError, match="Invalid start_time"):
+        BookingRequest.from_dict(data)
+
+    data["outbound"] = {
+        "ride_date": future_date(),
+        "start_time": "12:00",
+        "end_time": "08:00",
+    }
+    with pytest.raises(ValueError, match="must precede"):
+        BookingRequest.from_dict(data)

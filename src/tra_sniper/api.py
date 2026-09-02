@@ -5,7 +5,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
@@ -15,10 +15,12 @@ from pydantic import BaseModel, Field
 
 from .auth import TokenManager, hash_password, verify_password
 from .logging_config import configure_logging
-from .models import BookingRequest
+from .models import BOOKING_TIME_LABELS, BookingRequest
 from .ocr import MAX_IMAGE_BYTES, OcrService
 from .scheduler import TaskScheduler
 from .storage import Database, TaskRecord, UserRecord
+from .suggestions import SuggestionService
+from .tdx import TdxClient, TdxError
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 DEFAULT_DEV_ORIGINS = (
@@ -76,6 +78,20 @@ class OcrResponse(BaseModel):
     height: int
 
 
+class SuggestionPreferences(BaseModel):
+    prefer_reserved: bool = True
+    include_transfers: bool = True
+
+
+class SuggestionRequest(BaseModel):
+    start_station: str = Field(min_length=1, max_length=64)
+    end_station: str = Field(min_length=1, max_length=64)
+    ride_date: str = Field(min_length=8, max_length=10)
+    start_time: str
+    end_time: str
+    preferences: SuggestionPreferences = Field(default_factory=SuggestionPreferences)
+
+
 POPULAR_STATIONS = [
     {"value": "0900-基隆", "label": "基隆"},
     {"value": "1000-臺北", "label": "臺北"},
@@ -108,6 +124,7 @@ def create_app(
     database: Database | None = None,
     token_manager: TokenManager | None = None,
     ocr_service: OcrService | None = None,
+    tdx_client: TdxClient | None = None,
     *,
     start_scheduler: bool = True,
 ) -> FastAPI:
@@ -115,6 +132,8 @@ def create_app(
     tokens = token_manager or TokenManager()
     scheduler = TaskScheduler(db)
     ocr = ocr_service or OcrService()
+    tdx = tdx_client or TdxClient()
+    suggestion_service = SuggestionService(tdx)
     bearer = HTTPBearer(auto_error=False)
 
     @asynccontextmanager
@@ -128,8 +147,8 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.4.0",
-        description="Local membership, booking task, and general image OCR API.",
+        version="0.5.0",
+        description="Local membership, booking task, timetable suggestion, and image OCR API.",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -173,7 +192,11 @@ def create_app(
 
     @app.get("/stations")
     def stations() -> list[dict[str, str]]:
-        return POPULAR_STATIONS
+        return tdx.stations(POPULAR_STATIONS)
+
+    @app.get("/times")
+    def times() -> list[str]:
+        return list(BOOKING_TIME_LABELS)
 
     @app.post("/auth/register", response_model=TokenResponse, status_code=201)
     def register(body: RegistrationCredentials) -> TokenResponse:
@@ -244,6 +267,35 @@ def create_app(
     def list_tasks(user: CurrentUser) -> list[TaskResponse]:
         return [_task_response(task) for task in db.list_tasks(user.id)]
 
+    @app.post("/suggestions")
+    def suggestions(body: SuggestionRequest, user: CurrentUser) -> dict[str, Any]:
+        del user
+        if body.start_time not in BOOKING_TIME_LABELS or body.end_time not in BOOKING_TIME_LABELS:
+            raise HTTPException(status_code=422, detail="Invalid booking time label")
+        if body.start_time >= body.end_time:
+            raise HTTPException(status_code=422, detail="start_time must precede end_time")
+        if body.start_station == body.end_station:
+            raise HTTPException(status_code=422, detail="start_station and end_station must differ")
+        try:
+            date.fromisoformat(body.ride_date.replace("/", "-"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid ride_date") from exc
+        try:
+            return suggestion_service.suggest(
+                start_station=body.start_station,
+                end_station=body.end_station,
+                ride_date=body.ride_date,
+                start_time=body.start_time,
+                end_time=body.end_time,
+                prefer_reserved=body.preferences.prefer_reserved,
+                include_transfers=body.preferences.include_transfers,
+            )
+        except TdxError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="TDX timetable suggestions are temporarily unavailable; use train-number mode or try again later",
+            ) from exc
+
     @app.post("/ocr", response_model=OcrResponse)
     async def recognize_image(
         user: CurrentUser,
@@ -285,6 +337,20 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Task not found") from exc
 
+    @app.get("/tasks/{task_id}/suggestions")
+    def task_suggestions(task_id: str, user: CurrentUser) -> dict[str, Any]:
+        try:
+            payload = db.get_task_payload(task_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Task not found") from exc
+        suggestions = payload.get("candidate_suggestions")
+        return suggestions if isinstance(suggestions, dict) else {
+            "primary": [],
+            "alternatives": [],
+            "transfers": [],
+            "availability_known": False,
+        }
+
     @app.post("/tasks/{task_id}/cancel", status_code=204)
     def cancel_task(
         task_id: str,
@@ -300,6 +366,7 @@ def create_app(
 
     app.state.database = db
     app.state.scheduler = scheduler
+    app.state.tdx = tdx
     return app
 
 

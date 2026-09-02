@@ -10,6 +10,9 @@ services:
       TRA_API_PORT: 8000
       TRA_CORS_ORIGINS: ${TRA_CORS_ORIGINS:-}
       TRA_LOG_LEVEL: ${TRA_LOG_LEVEL:-INFO}
+      TDX_CLIENT_ID: ${TDX_CLIENT_ID:-}
+      TDX_CLIENT_SECRET: ${TDX_CLIENT_SECRET:-}
+      TDX_CACHE_TTL_HOURS: ${TDX_CACHE_TTL_HOURS:-6}
     volumes:
       - /mnt/NEW_PA9A1_2T/Truenas_App/TRA/data:/app/data
     ports:

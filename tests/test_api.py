@@ -8,6 +8,27 @@ from tra_sniper.auth import TokenManager
 from tra_sniper.storage import Database
 
 
+class FakeTdx:
+    def stations(self, fallback):
+        return fallback + [{"value": "1234-測試站", "label": "測試站"}]
+
+    def daily_timetable(self, start_id, end_id, ride_date):
+        del start_id, end_id, ride_date
+        return [
+            {
+                "TrainInfo": {
+                    "TrainNo": "110",
+                    "TrainTypeCode": "3",
+                    "TrainTypeName": {"Zh_tw": "自強"},
+                },
+                "StopTimes": [
+                    {"DepartureTime": "08:30"},
+                    {"ArrivalTime": "10:00"},
+                ],
+            }
+        ]
+
+
 def _new_app(tmp_path, monkeypatch=None):
     if monkeypatch is not None:
         monkeypatch.setenv("TRA_CORS_ORIGINS", "http://nas.local:43124")
@@ -133,3 +154,73 @@ def test_registration_password_policy_and_configured_cors(tmp_path, monkeypatch)
         )
         assert preflight.status_code == 200
         assert preflight.headers["access-control-allow-origin"] == "http://nas.local:43124"
+
+
+def test_times_suggestions_and_encrypted_offline_snapshot(tmp_path) -> None:
+    database = Database(tmp_path / "api.db", encryption_key=Fernet.generate_key().decode())
+    app = create_app(
+        database,
+        TokenManager("t" * 32),
+        tdx_client=FakeTdx(),
+        start_scheduler=False,
+    )
+    ride_date = (datetime.now().astimezone().date() + timedelta(days=1)).strftime("%Y/%m/%d")
+    with TestClient(app) as client:
+        assert client.get("/times").json()[-1] == "23:59"
+        assert any(item["value"] == "1234-測試站" for item in client.get("/stations").json())
+        registered = client.post(
+            "/auth/register",
+            json={"email": "suggest@example.com", "password": "very-secure-password"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        suggested = client.post(
+            "/suggestions",
+            headers=headers,
+            json={
+                "start_station": "1000-臺北",
+                "end_station": "3300-臺中",
+                "ride_date": ride_date,
+                "start_time": "08:00",
+                "end_time": "12:00",
+                "preferences": {"include_transfers": False},
+            },
+        )
+        assert suggested.status_code == 200
+        assert suggested.json()["availability_known"] is False
+        assert suggested.json()["primary"][0]["seat_type_label"] == "對號列車"
+
+        created = client.post(
+            "/tasks",
+            headers=headers,
+            json={
+                "scheduled_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                "booking": {
+                    "identity": "TEST-ID",
+                    "start_station": "1000-臺北",
+                    "end_station": "3300-臺中",
+                    "order_type": "BY_TIME",
+                    "outbound": {
+                        "ride_date": ride_date,
+                        "start_time": "08:00",
+                        "end_time": "12:00",
+                    },
+                    "candidate_suggestions": suggested.json(),
+                },
+            },
+        )
+        snapshot = client.get(
+            f"/tasks/{created.json()['id']}/suggestions", headers=headers
+        )
+        assert snapshot.json()["primary"][0]["train_no"] == "110"
+
+
+def test_unconfigured_tdx_keeps_api_available(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("TDX_CLIENT_ID", raising=False)
+    monkeypatch.delenv("TDX_CLIENT_SECRET", raising=False)
+    database = Database(tmp_path / "api.db", encryption_key=Fernet.generate_key().decode())
+    app = create_app(database, TokenManager("t" * 32), start_scheduler=False)
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        stations = client.get("/stations")
+        assert stations.status_code == 200
+        assert any(item["value"] == "1000-臺北" for item in stations.json())
