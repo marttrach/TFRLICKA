@@ -28,6 +28,18 @@ export interface OcrResult {
   height: number;
 }
 
+export interface TraOcrResult extends OcrResult {
+  fields: {
+    document_type: "ticket" | "timetable" | "unknown";
+    train_numbers: string[];
+    stations: string[];
+    dates: string[];
+    times: string[];
+    route: string | null;
+  };
+  warnings: string[];
+}
+
 export interface TrainCandidate {
   train_no: string;
   train_type_name: string;
@@ -125,5 +137,11 @@ export const api = {
     form.append("image", image);
     form.append("language", language);
     return request<OcrResult>("/ocr", { method: "POST", body: form }, token);
+  },
+  traOcr(token: string, image: File, language: "zh-TW" | "en") {
+    const form = new FormData();
+    form.append("image", image);
+    form.append("language", language);
+    return request<TraOcrResult>("/ocr/tra", { method: "POST", body: form }, token);
   },
 };

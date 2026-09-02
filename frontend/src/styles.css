@@ -135,9 +135,15 @@ input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb
 .ocr-output span { color: var(--muted); font-size: .72rem; }
 .ocr-output textarea { width: 100%; min-height: 150px; padding: .8rem; resize: vertical; border: 1px solid #bccbd5; color: #122638; background: white; font: .86rem/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .ocr-output textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(18,102,154,.12); outline: none; }
+.ocr-output .tra-ocr-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: initial; gap: .45rem .8rem; padding: .75rem; background: #edf5f9; border-left: 3px solid var(--blue); }
+.tra-ocr-fields b { grid-column: 1 / -1; color: var(--navy); font-size: .78rem; }
+.ocr-output .tra-ocr-fields span { color: #385568; font-size: .75rem; }
+.ocr-output .tra-ocr-warning { display: grid; justify-content: initial; gap: .2rem; padding: .65rem .75rem; background: #fff7e8; border-left: 3px solid #e7a027; }
+.tra-ocr-warning p { margin: 0; color: #705d40; font-size: .72rem; line-height: 1.5; }
 .ocr-output .ocr-actions { justify-content: flex-start; align-items: center; gap: .8rem; }
 .copy-button { border: 0; background: var(--navy); color: white; min-height: 36px; padding: .5rem .8rem; border-radius: 3px; font-weight: 800; }
 .copy-button:hover { background: var(--blue); }
+.copy-button.secondary { background: white; border: 1px solid var(--blue); color: var(--blue); }
 .copy-button:disabled, .ocr-actions .text-button:disabled { opacity: .45; cursor: not-allowed; }
 .ocr-actions .text-button { color: var(--blue); }
 .ocr-actions span { margin-left: auto; color: #176341; font-weight: 750; }

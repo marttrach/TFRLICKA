@@ -21,6 +21,7 @@ from .scheduler import TaskScheduler
 from .storage import Database, TaskRecord, UserRecord
 from .suggestions import SuggestionService
 from .tdx import TdxClient, TdxError
+from .tra_ocr import TraOcrService
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 DEFAULT_DEV_ORIGINS = (
@@ -78,6 +79,20 @@ class OcrResponse(BaseModel):
     height: int
 
 
+class TraDocumentFieldsResponse(BaseModel):
+    document_type: str
+    train_numbers: list[str]
+    stations: list[str]
+    dates: list[str]
+    times: list[str]
+    route: str | None
+
+
+class TraOcrResponse(OcrResponse):
+    fields: TraDocumentFieldsResponse
+    warnings: list[str]
+
+
 class SuggestionPreferences(BaseModel):
     prefer_reserved: bool = True
     include_transfers: bool = True
@@ -132,6 +147,7 @@ def create_app(
     tokens = token_manager or TokenManager()
     scheduler = TaskScheduler(db)
     ocr = ocr_service or OcrService()
+    tra_ocr = TraOcrService(ocr)
     tdx = tdx_client or TdxClient()
     suggestion_service = SuggestionService(tdx)
     bearer = HTTPBearer(auto_error=False)
@@ -147,7 +163,7 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.5.0",
+        version="0.6.0",
         description="Local membership, booking task, timetable suggestion, and image OCR API.",
         lifespan=lifespan,
     )
@@ -328,6 +344,60 @@ def create_app(
             language=result.language,
             width=result.width,
             height=result.height,
+        )
+
+    @app.post("/ocr/tra", response_model=TraOcrResponse)
+    async def recognize_tra_document(
+        user: CurrentUser,
+        image: Annotated[
+            UploadFile,
+            File(description="TRA ticket, booking-result, or timetable screenshot"),
+        ],
+        language: Annotated[str, Form()] = "zh-TW",
+    ) -> TraOcrResponse:
+        del user  # Authentication is required; images and results are not persisted.
+        if image.content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise HTTPException(status_code=415, detail="Only PNG, JPEG, and WebP are supported")
+        image_data = await image.read(MAX_IMAGE_BYTES + 1)
+        await image.close()
+        if len(image_data) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Image exceeds the 8 MB limit")
+        cached_stations = (
+            tdx.load_cached_stations() if hasattr(tdx, "load_cached_stations") else []
+        )
+        station_records = cached_stations or POPULAR_STATIONS
+        try:
+            started_at = time.perf_counter()
+            result = tra_ocr.recognize(
+                image_data,
+                language=language,
+                station_names=[item["label"] for item in station_records],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        logger.info(
+            "TRA document OCR processed",
+            extra={
+                "event": "ocr.tra_completed",
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
+        return TraOcrResponse(
+            text=result.text,
+            language=result.language,
+            width=result.width,
+            height=result.height,
+            fields=TraDocumentFieldsResponse(
+                document_type=result.fields.document_type,
+                train_numbers=list(result.fields.train_numbers),
+                stations=list(result.fields.stations),
+                dates=list(result.fields.dates),
+                times=list(result.fields.times),
+                route=result.fields.route,
+            ),
+            warnings=list(result.warnings),
         )
 
     @app.get("/tasks/{task_id}/config")

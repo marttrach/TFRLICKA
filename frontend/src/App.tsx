@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, Station, Suggestions, Task, TrainCandidate, User } from "./api";
+import { api, Station, Suggestions, Task, TrainCandidate, TraOcrResult, User } from "./api";
 
 const TOKEN_KEY = "tra-sniper-token";
 
@@ -73,12 +73,15 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
 function OcrWorkflow({ token }: { token: string }) {
   const [file, setFile] = useState<File | null>(null);
   const [language, setLanguage] = useState<"zh-TW" | "en">("zh-TW");
+  const [ocrMode, setOcrMode] = useState<"tra" | "general">("tra");
   const [preview, setPreview] = useState("");
   const [result, setResult] = useState("");
   const [details, setDetails] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [traFields, setTraFields] = useState<TraOcrResult["fields"] | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   useEffect(() => {
     if (!file) {
@@ -98,10 +101,20 @@ function OcrWorkflow({ token }: { token: string }) {
     setResult("");
     setDetails("");
     setCopyNotice("");
+    setTraFields(null);
+    setWarnings([]);
     try {
-      const response = await api.ocr(token, file, language);
-      setResult(response.text);
-      setDetails(`${response.width} × ${response.height} px · ${response.language}`);
+      if (ocrMode === "tra") {
+        const response = await api.traOcr(token, file, language);
+        setResult(response.text);
+        setDetails(`${response.width} × ${response.height} px · ${response.language}`);
+        setTraFields(response.fields);
+        setWarnings(response.warnings);
+      } else {
+        const response = await api.ocr(token, file, language);
+        setResult(response.text);
+        setDetails(`${response.width} × ${response.height} px · ${response.language}`);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法辨識圖片");
     } finally {
@@ -109,14 +122,13 @@ function OcrWorkflow({ token }: { token: string }) {
     }
   }
 
-  async function copyResult() {
-    if (!result) return;
+  async function copyText(value: string, notice: string) {
     try {
       if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(result);
+        await navigator.clipboard.writeText(value);
       } else {
         const helper = document.createElement("textarea");
-        helper.value = result;
+        helper.value = value;
         helper.style.position = "fixed";
         helper.style.opacity = "0";
         document.body.appendChild(helper);
@@ -125,17 +137,33 @@ function OcrWorkflow({ token }: { token: string }) {
         helper.remove();
         if (!copied) throw new Error("Copy command failed");
       }
-      setCopyNotice("已複製到剪貼簿");
+      setCopyNotice(notice);
     } catch {
       setError("無法自動複製，請選取文字後手動複製");
     }
   }
 
+  async function copyResult() {
+    if (result) await copyText(result, "已複製文字");
+  }
+
+  async function copyTraSummary() {
+    if (!traFields) return;
+    const summary = [
+      traFields.route ? `路線：${traFields.route}` : "",
+      traFields.train_numbers.length ? `車次：${traFields.train_numbers.join("、")}` : "",
+      traFields.dates.length ? `日期：${traFields.dates.join("、")}` : "",
+      traFields.times.length ? `時間：${traFields.times.join("、")}` : "",
+      traFields.stations.length ? `站名：${traFields.stations.join("、")}` : "",
+    ].filter(Boolean).join("\n");
+    if (summary) await copyText(summary, "已複製台鐵摘要");
+  }
+
   return (
     <section className="ocr-workflow">
       <div className="ocr-workflow-heading">
-        <div><span>OCR</span><b>圖片辨識輸入框</b></div>
-        <small>辨識、修正，再一鍵複製</small>
+        <div><span>TRA OCR</span><b>台鐵影像資訊辨識</b></div>
+        <small>票券／訂票結果／時刻表截圖</small>
       </div>
       <form className="ocr-form" onSubmit={recognize}>
         <div className="ocr-controls">
@@ -162,6 +190,8 @@ function OcrWorkflow({ token }: { token: string }) {
                 setDetails("");
                 setCopyNotice("");
                 setError("");
+                setTraFields(null);
+                setWarnings([]);
               }}
               required
             />
@@ -172,8 +202,14 @@ function OcrWorkflow({ token }: { token: string }) {
               <option value="en">英文</option>
             </select>
           </label>
+          <label>辨識模式
+            <select value={ocrMode} onChange={(event) => { setOcrMode(event.target.value as "tra" | "general"); setTraFields(null); setWarnings([]); }}>
+              <option value="tra">台鐵資訊擷取</option>
+              <option value="general">一般文字 OCR</option>
+            </select>
+          </label>
           <button className="primary" disabled={!file || busy}>{busy ? "辨識中…" : "開始辨識"}</button>
-          <p className="ocr-hint">支援 PNG、JPEG、WebP，檔案上限 8 MB。</p>
+          <p className="ocr-hint">支援 PNG、JPEG、WebP，檔案上限 8 MB；不處理 CAPTCHA 或 reCAPTCHA。</p>
           {error && <p className="error" role="alert">{error}</p>}
         </div>
         <div className="ocr-preview">
@@ -182,9 +218,22 @@ function OcrWorkflow({ token }: { token: string }) {
         <div className="ocr-output">
           <div><b>辨識結果</b>{details && <span>{details}</span>}</div>
           <textarea value={result} onChange={(event) => { setResult(event.target.value); setCopyNotice(""); }} placeholder="辨識出的文字會顯示在這裡，也可直接修正" aria-label="OCR 辨識結果" />
+          {traFields && (
+            <div className="tra-ocr-fields">
+              <b>擷取資訊</b>
+              <span>類型：{traFields.document_type === "ticket" ? "票券／訂票結果" : traFields.document_type === "timetable" ? "時刻資訊" : "未判定"}</span>
+              {traFields.route && <span>路線：{traFields.route}</span>}
+              {traFields.train_numbers.length > 0 && <span>車次：{traFields.train_numbers.join("、")}</span>}
+              {traFields.dates.length > 0 && <span>日期：{traFields.dates.join("、")}</span>}
+              {traFields.times.length > 0 && <span>時間：{traFields.times.join("、")}</span>}
+              {traFields.stations.length > 0 && <span>站名：{traFields.stations.join("、")}</span>}
+            </div>
+          )}
+          {warnings.length > 0 && <div className="tra-ocr-warning">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
           <div className="ocr-actions">
             <button type="button" className="copy-button" disabled={!result} onClick={copyResult}>複製文字</button>
-            <button type="button" className="text-button" disabled={!result} onClick={() => { setResult(""); setDetails(""); setCopyNotice(""); }}>清除</button>
+            <button type="button" className="copy-button secondary" disabled={!traFields} onClick={copyTraSummary}>複製摘要</button>
+            <button type="button" className="text-button" disabled={!result} onClick={() => { setResult(""); setDetails(""); setCopyNotice(""); setTraFields(null); setWarnings([]); }}>清除</button>
             {copyNotice && <span role="status">✓ {copyNotice}</span>}
           </div>
         </div>

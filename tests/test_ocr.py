@@ -73,6 +73,40 @@ def test_ocr_endpoint_rejects_unsupported_media_type(tmp_path) -> None:
     assert response.status_code == 415
 
 
+def test_tra_ocr_endpoint_returns_structured_fields(tmp_path) -> None:
+    class TraFakeOcrService:
+        def recognize(self, image_data: bytes, language: str = "zh-TW") -> OcrResult:
+            assert image_data == b"fake-image"
+            return OcrResult(
+                text="台鐵車票 車次：110 臺北 08:30 臺中 10:10 2026/09/03",
+                language=language,
+                width=640,
+                height=320,
+            )
+
+    app = create_app(
+        Database(tmp_path / "ocr.db", encryption_key=Fernet.generate_key().decode()),
+        TokenManager("t" * 32),
+        TraFakeOcrService(),
+        start_scheduler=False,
+    )
+    with TestClient(app) as client:
+        token = _token(client)
+        response = client.post(
+            "/ocr/tra",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"language": "zh-TW"},
+            files={"image": ("ticket.png", b"fake-image", "image/png")},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["fields"]["document_type"] == "ticket"
+    assert body["fields"]["train_numbers"] == ["110"]
+    assert body["fields"]["route"] == "臺北 → 臺中"
+    assert body["fields"]["times"] == ["08:30", "10:10"]
+    assert body["warnings"]
+
+
 def test_ocr_service_preprocesses_image(monkeypatch) -> None:
     buffer = BytesIO()
     Image.new("RGB", (120, 60), "white").save(buffer, format="PNG")
