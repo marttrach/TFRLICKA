@@ -22,6 +22,7 @@ from .storage import Database, TaskRecord, UserRecord
 from .suggestions import SuggestionService
 from .tdx import TdxClient, TdxError
 from .tra_ocr import TraOcrService
+from .verification import VerificationProvider, create_verification_provider
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 DEFAULT_DEV_ORIGINS = (
@@ -154,6 +155,7 @@ def create_app(
     token_manager: TokenManager | None = None,
     ocr_service: OcrService | None = None,
     tdx_client: TdxClient | None = None,
+    verification_provider: VerificationProvider | None = None,
     *,
     start_scheduler: bool = True,
 ) -> FastAPI:
@@ -164,6 +166,7 @@ def create_app(
     tra_ocr = TraOcrService(ocr)
     tdx = tdx_client or TdxClient()
     suggestion_service = SuggestionService(tdx)
+    verification = verification_provider or create_verification_provider()
     bearer = HTTPBearer(auto_error=False)
 
     @asynccontextmanager
@@ -177,7 +180,7 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.7.0",
+        version="0.8.0",
         description="Accessible membership, booking task, and timetable suggestion API.",
         lifespan=lifespan,
     )
@@ -218,7 +221,15 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "scheduler": "human-in-the-loop"}
+        return {
+            "status": "ok",
+            "scheduler": "human-in-the-loop",
+            "verification": verification.capabilities.mode.value,
+        }
+
+    @app.get("/verification/capabilities")
+    def verification_capabilities() -> dict[str, str | bool]:
+        return verification.capabilities.as_dict()
 
     @app.get("/stations")
     def stations() -> list[dict[str, str]]:
@@ -512,6 +523,7 @@ def create_app(
     app.state.database = db
     app.state.scheduler = scheduler
     app.state.tdx = tdx
+    app.state.verification = verification
     return app
 
 

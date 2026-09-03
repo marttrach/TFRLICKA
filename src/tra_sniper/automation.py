@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import BookingRequest, Leg, OrderType, TripType
+from .verification import VerificationMode, VerificationProvider, create_verification_provider
 
 BOOKING_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query"
 MEMBER_LOGIN_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip008/tip811/memberLogin"
@@ -56,10 +57,12 @@ class TRCBookingAutomator:
         headless: bool = False,
         slow_mo_ms: int = 0,
         booking_url: str = BOOKING_URL,
+        verification_provider: VerificationProvider | None = None,
     ) -> None:
         self.headless = headless
         self.slow_mo_ms = slow_mo_ms
         self.booking_url = booking_url
+        self.verification = verification_provider or create_verification_provider()
 
     def run(
         self,
@@ -115,6 +118,8 @@ class TRCBookingAutomator:
                     "The form is ready. Complete the official CAPTCHA/reCAPTCHA in the "
                     "browser, review the details, and click 訂票 yourself."
                 )
+                if self.verification.capabilities.mode is not VerificationMode.MANUAL:
+                    self._prepare_provider_handoff(page)
                 return self._wait_for_human_verification(
                     page,
                     wait_seconds=wait_seconds,
@@ -123,6 +128,19 @@ class TRCBookingAutomator:
             finally:
                 context.close()
                 browser.close()
+
+    def _prepare_provider_handoff(self, page: Any) -> None:
+        """Exercise the provider contract without submitting the booking form."""
+        token = self.verification.authorize(target_url=page.url)
+        if token is None:
+            return
+        field = page.locator("[data-tra-verification-token]")
+        if field.count() != 1:
+            raise RuntimeError(
+                "verification provider hand-off field was not found; "
+                "the adapter and target contract do not match"
+            )
+        field.fill(token)
 
     def _prepare_member_login(self, page: Any, account: str, password: str) -> None:
         self._accept_cookie_notice(page)
