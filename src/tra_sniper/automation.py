@@ -9,6 +9,7 @@ from typing import Any
 from .models import BookingRequest, Leg, OrderType, TripType
 
 BOOKING_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query"
+MEMBER_LOGIN_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip008/tip811/memberLogin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,8 @@ class TRCBookingAutomator:
         request.validate()
         if submit and self.headless:
             raise ValueError("Submission requires a headed browser for manual reCAPTCHA")
+        if request.member_login and self.headless:
+            raise ValueError("Member login requires a headed browser for official verification")
 
         from playwright.sync_api import sync_playwright
 
@@ -86,6 +89,14 @@ class TRCBookingAutomator:
             context = browser.new_context(locale="zh-TW")
             page = context.new_page()
             try:
+                if request.member_login:
+                    page.goto(MEMBER_LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+                    self._prepare_member_login(page, request.member_login.account, request.member_login.password)
+                    print(
+                        "臺鐵會員帳號與密碼已填入。請在瀏覽器確認，若官方要求驗證，"
+                        "請完成官方驗證後按登入；登入完成後再前往訂票頁。"
+                    )
+                    self._wait_for_member_login(page, wait_seconds=wait_seconds)
                 page.goto(self.booking_url, wait_until="domcontentloaded", timeout=60_000)
                 self._prepare_form(page, request)
 
@@ -112,6 +123,20 @@ class TRCBookingAutomator:
             finally:
                 context.close()
                 browser.close()
+
+    def _prepare_member_login(self, page: Any, account: str, password: str) -> None:
+        self._accept_cookie_notice(page)
+        page.locator("#username").fill(account)
+        page.locator("#password").fill(password)
+
+    @staticmethod
+    def _wait_for_member_login(page: Any, *, wait_seconds: int) -> None:
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            if "/tip811/memberLogin" not in page.url:
+                return
+            page.wait_for_timeout(1_000)
+        raise RuntimeError("等待台鐵會員登入逾時；未嘗試略過官方驗證")
 
     def _prepare_form(self, page: Any, request: BookingRequest) -> None:
         self._accept_cookie_notice(page)

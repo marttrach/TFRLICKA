@@ -80,3 +80,24 @@ def test_login_attempts_and_token_revocation_are_persistent(tmp_path) -> None:
     assert not database.is_login_locked(user.email, now=now)
     assert database.revoke_user_tokens(user.id)
     assert database.get_user(user.id).token_version == 1
+
+
+def test_member_profile_is_encrypted_and_can_be_deleted(tmp_path) -> None:
+    path = tmp_path / "profile.db"
+    database = Database(path, encryption_key=Fernet.generate_key().decode())
+    user = database.create_user("profile@example.com", "password-hash")
+
+    saved = database.save_member_profile(
+        user.id,
+        identity="A123456789",
+        member_account="A123456789",
+        member_password="railway-password",
+    )
+
+    assert saved.identity == "A123456789"
+    assert saved.member_password == "railway-password"
+    raw_database = path.read_bytes().decode("latin1")
+    assert "A123456789" not in raw_database
+    assert "railway-password" not in raw_database
+    assert database.delete_member_profile(user.id)
+    assert database.get_member_profile(user.id) is None

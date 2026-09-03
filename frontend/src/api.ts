@@ -21,23 +21,11 @@ export interface Task {
   last_error: string | null;
 }
 
-export interface OcrResult {
-  text: string;
-  language: "zh-TW" | "en";
-  width: number;
-  height: number;
-}
-
-export interface TraOcrResult extends OcrResult {
-  fields: {
-    document_type: "ticket" | "timetable" | "unknown";
-    train_numbers: string[];
-    stations: string[];
-    dates: string[];
-    times: string[];
-    route: string | null;
-  };
-  warnings: string[];
+export interface MemberProfile {
+  identity: string;
+  member_account: string;
+  has_member_password: boolean;
+  updated_at: string | null;
 }
 
 export interface TrainCandidate {
@@ -105,6 +93,18 @@ export const api = {
   me(token: string) {
     return request<User>("/auth/me", {}, token);
   },
+  profile(token: string) {
+    return request<MemberProfile>("/profile", {}, token);
+  },
+  saveProfile(token: string, payload: { identity: string; member_account: string; member_password: string }) {
+    return request<MemberProfile>("/profile", { method: "PUT", body: JSON.stringify(payload) }, token);
+  },
+  deleteProfile(token: string) {
+    return request<void>("/profile", { method: "DELETE" }, token);
+  },
+  clearMemberLogin(token: string) {
+    return request<void>("/profile/member-login", { method: "DELETE" }, token);
+  },
   logout(token: string) {
     return request<void>("/auth/logout", { method: "POST" }, token);
   },
@@ -131,17 +131,5 @@ export const api = {
   },
   taskSuggestions(token: string, taskId: string) {
     return request<Suggestions>(`/tasks/${taskId}/suggestions`, {}, token);
-  },
-  ocr(token: string, image: File, language: "zh-TW" | "en") {
-    const form = new FormData();
-    form.append("image", image);
-    form.append("language", language);
-    return request<OcrResult>("/ocr", { method: "POST", body: form }, token);
-  },
-  traOcr(token: string, image: File, language: "zh-TW" | "en") {
-    const form = new FormData();
-    form.append("image", image);
-    form.append("language", language);
-    return request<TraOcrResult>("/ocr/tra", { method: "POST", body: form }, token);
   },
 };

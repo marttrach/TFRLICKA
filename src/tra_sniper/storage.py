@@ -43,6 +43,15 @@ class TaskRecord:
     last_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class MemberProfileRecord:
+    user_id: int
+    identity: str
+    member_account: str
+    member_password: str
+    updated_at: str
+
+
 class PayloadCipher:
     def __init__(self, data_dir: Path, configured_key: str | None = None) -> None:
         key = configured_key or os.getenv("TRA_ENCRYPTION_KEY")
@@ -154,7 +163,81 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_login_attempts "
                 "ON login_attempts(email, attempted_at DESC)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS member_profiles (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    payload BLOB NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             connection.execute("PRAGMA optimize")
+
+    def get_member_profile(self, user_id: int) -> MemberProfileRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT user_id, payload, updated_at FROM member_profiles WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if not row:
+            return None
+        profile = self.cipher.decrypt(row["payload"])
+        return MemberProfileRecord(
+            user_id=int(row["user_id"]),
+            identity=str(profile.get("identity", "")),
+            member_account=str(profile.get("member_account", "")),
+            member_password=str(profile.get("member_password", "")),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def save_member_profile(
+        self,
+        user_id: int,
+        *,
+        identity: str,
+        member_account: str,
+        member_password: str,
+    ) -> MemberProfileRecord:
+        now = utc_now()
+        payload = self.cipher.encrypt(
+            {
+                "identity": identity.strip(),
+                "member_account": member_account.strip(),
+                "member_password": member_password,
+            }
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO member_profiles(user_id, payload, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET payload = excluded.payload,
+                                                   updated_at = excluded.updated_at
+                """,
+                (user_id, payload, now),
+            )
+        profile = self.get_member_profile(user_id)
+        if profile is None:
+            raise RuntimeError("member profile was not persisted")
+        return profile
+
+    def delete_member_profile(self, user_id: int) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM member_profiles WHERE user_id = ?", (user_id,)
+            )
+        return cursor.rowcount == 1
+
+    def clear_member_login(self, user_id: int) -> MemberProfileRecord | None:
+        profile = self.get_member_profile(user_id)
+        if not profile:
+            return None
+        return self.save_member_profile(
+            user_id,
+            identity=profile.identity,
+            member_account="",
+            member_password="",
+        )
 
     def create_user(self, email: str, password_hash: str) -> UserRecord:
         created_at = utc_now()

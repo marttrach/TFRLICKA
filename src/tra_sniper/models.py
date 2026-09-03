@@ -26,6 +26,22 @@ class SeatPreference(str, Enum):
     TABLE = "TABLE"
 
 
+@dataclass(frozen=True, slots=True)
+class MemberLogin:
+    account: str
+    password: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MemberLogin:
+        login = cls(
+            account=str(data.get("account", "")).strip(),
+            password=str(data.get("password", "")),
+        )
+        if not login.account or not login.password:
+            raise ValueError("member_login requires both account and password")
+        return login
+
+
 # These labels mirror the official TRC booking form. Keep 23:59: it is an
 # actual option even though the regular intervals are every 30 minutes.
 BOOKING_TIME_LABELS = tuple(
@@ -92,6 +108,7 @@ class BookingRequest:
     seat_preference: SeatPreference = SeatPreference.NONE
     allow_seat_change: bool = True
     inbound: Leg | None = None
+    member_login: MemberLogin | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BookingRequest:
@@ -110,6 +127,11 @@ class BookingRequest:
             allow_seat_change=bool(data.get("allow_seat_change", True)),
             outbound=Leg.from_dict(data["outbound"]),
             inbound=Leg.from_dict(inbound_data) if inbound_data else None,
+            member_login=(
+                MemberLogin.from_dict(data["member_login"])
+                if isinstance(data.get("member_login"), dict)
+                else None
+            ),
         )
         request.validate()
         return request
@@ -137,4 +159,6 @@ class BookingRequest:
     def redacted(self) -> dict[str, Any]:
         data = asdict(self)
         data["identity"] = "***" + self.identity[-3:] if len(self.identity) >= 3 else "***"
+        if data.get("member_login"):
+            data["member_login"]["password"] = "***"
         return data

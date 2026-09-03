@@ -224,3 +224,47 @@ def test_unconfigured_tdx_keeps_api_available(tmp_path, monkeypatch) -> None:
         stations = client.get("/stations")
         assert stations.status_code == 200
         assert any(item["value"] == "1000-臺北" for item in stations.json())
+
+
+def test_member_profile_does_not_return_password_and_can_supply_task_login(tmp_path) -> None:
+    database = Database(tmp_path / "profile-api.db", encryption_key=Fernet.generate_key().decode())
+    app = create_app(database, TokenManager("t" * 32), start_scheduler=False)
+    ride_date = (datetime.now().astimezone().date() + timedelta(days=1)).strftime("%Y/%m/%d")
+    with TestClient(app) as client:
+        registered = client.post(
+            "/auth/register",
+            json={"email": "profile@example.com", "password": "very-secure-password"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        saved = client.put(
+            "/profile",
+            headers=headers,
+            json={
+                "identity": "A123456789",
+                "member_account": "A123456789",
+                "member_password": "railway-password",
+            },
+        )
+        assert saved.status_code == 200
+        assert saved.json()["has_member_password"] is True
+        assert "railway-password" not in saved.text
+        assert "railway-password" not in client.get("/profile", headers=headers).text
+
+        created = client.post(
+            "/tasks",
+            headers=headers,
+            json={
+                "scheduled_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                "use_saved_member_login": True,
+                "booking": {
+                    "identity": "",
+                    "start_station": "1000-臺北",
+                    "end_station": "3300-臺中",
+                    "outbound": {"ride_date": ride_date, "train_numbers": ["110"]},
+                },
+            },
+        )
+        assert created.status_code == 201
+        payload = database.get_task_payload(created.json()["id"], 1)
+        assert payload["identity"] == "A123456789"
+        assert payload["member_login"]["password"] == "railway-password"

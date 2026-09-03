@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, Station, Suggestions, Task, TrainCandidate, TraOcrResult, User } from "./api";
+import { api, MemberProfile, Station, Suggestions, Task, TrainCandidate, User } from "./api";
 
 const TOKEN_KEY = "tra-sniper-token";
 
@@ -48,9 +48,10 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
   return (
     <main className="auth-shell">
       <section className="auth-brand" aria-labelledby="brand-title">
-        <span className="eyebrow">HUMAN-IN-THE-LOOP BOOKING</span>
-        <h1 id="brand-title">TRA<span>/</span>Sniper</h1>
-        <p>把台鐵訂票條件、排程與人工驗證整理在同一個本機工作台。</p>
+        <img className="auth-logo" src="/favicon.svg" alt="" />
+        <span className="eyebrow">台鐵訂票小幫手</span>
+        <h1 id="brand-title">好搭車</h1>
+        <p>把常用資料、車次選擇、排程提醒整理在同一個簡單好讀的畫面。</p>
         <div className="rail-line" aria-hidden="true"><i /><i /><i /><i /></div>
       </section>
       <section className="auth-card">
@@ -70,178 +71,6 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
   );
 }
 
-function OcrWorkflow({ token }: { token: string }) {
-  const [file, setFile] = useState<File | null>(null);
-  const [language, setLanguage] = useState<"zh-TW" | "en">("zh-TW");
-  const [ocrMode, setOcrMode] = useState<"tra" | "general">("tra");
-  const [preview, setPreview] = useState("");
-  const [result, setResult] = useState("");
-  const [details, setDetails] = useState("");
-  const [copyNotice, setCopyNotice] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [traFields, setTraFields] = useState<TraOcrResult["fields"] | null>(null);
-  const [warnings, setWarnings] = useState<string[]>([]);
-
-  useEffect(() => {
-    if (!file) {
-      setPreview("");
-      return;
-    }
-    const objectUrl = URL.createObjectURL(file);
-    setPreview(objectUrl);
-    return () => URL.revokeObjectURL(objectUrl);
-  }, [file]);
-
-  async function recognize(event: FormEvent) {
-    event.preventDefault();
-    if (!file) return;
-    setBusy(true);
-    setError("");
-    setResult("");
-    setDetails("");
-    setCopyNotice("");
-    setTraFields(null);
-    setWarnings([]);
-    try {
-      if (ocrMode === "tra") {
-        const response = await api.traOcr(token, file, language);
-        setResult(response.text);
-        setDetails(`${response.width} × ${response.height} px · ${response.language}`);
-        setTraFields(response.fields);
-        setWarnings(response.warnings);
-      } else {
-        const response = await api.ocr(token, file, language);
-        setResult(response.text);
-        setDetails(`${response.width} × ${response.height} px · ${response.language}`);
-      }
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "無法辨識圖片");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function copyText(value: string, notice: string) {
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(value);
-      } else {
-        const helper = document.createElement("textarea");
-        helper.value = value;
-        helper.style.position = "fixed";
-        helper.style.opacity = "0";
-        document.body.appendChild(helper);
-        helper.select();
-        const copied = document.execCommand("copy");
-        helper.remove();
-        if (!copied) throw new Error("Copy command failed");
-      }
-      setCopyNotice(notice);
-    } catch {
-      setError("無法自動複製，請選取文字後手動複製");
-    }
-  }
-
-  async function copyResult() {
-    if (result) await copyText(result, "已複製文字");
-  }
-
-  async function copyTraSummary() {
-    if (!traFields) return;
-    const summary = [
-      traFields.route ? `路線：${traFields.route}` : "",
-      traFields.train_numbers.length ? `車次：${traFields.train_numbers.join("、")}` : "",
-      traFields.dates.length ? `日期：${traFields.dates.join("、")}` : "",
-      traFields.times.length ? `時間：${traFields.times.join("、")}` : "",
-      traFields.stations.length ? `站名：${traFields.stations.join("、")}` : "",
-    ].filter(Boolean).join("\n");
-    if (summary) await copyText(summary, "已複製台鐵摘要");
-  }
-
-  return (
-    <section className="ocr-workflow">
-      <div className="ocr-workflow-heading">
-        <div><span>TRA OCR</span><b>台鐵影像資訊辨識</b></div>
-        <small>票券／訂票結果／時刻表截圖</small>
-      </div>
-      <form className="ocr-form" onSubmit={recognize}>
-        <div className="ocr-controls">
-          <label>選擇圖片
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              onChange={(event) => {
-                const selected = event.target.files?.[0] ?? null;
-                if (selected && selected.size > 8 * 1024 * 1024) {
-                  setFile(null);
-                  setError("圖片不可超過 8 MB");
-                  event.currentTarget.value = "";
-                  return;
-                }
-                if (selected && !["image/png", "image/jpeg", "image/webp"].includes(selected.type)) {
-                  setFile(null);
-                  setError("僅支援 PNG、JPEG 與 WebP 圖片");
-                  event.currentTarget.value = "";
-                  return;
-                }
-                setFile(selected);
-                setResult("");
-                setDetails("");
-                setCopyNotice("");
-                setError("");
-                setTraFields(null);
-                setWarnings([]);
-              }}
-              required
-            />
-          </label>
-          <label>辨識語言
-            <select value={language} onChange={(event) => setLanguage(event.target.value as "zh-TW" | "en")}>
-              <option value="zh-TW">繁體中文＋英文</option>
-              <option value="en">英文</option>
-            </select>
-          </label>
-          <label>辨識模式
-            <select value={ocrMode} onChange={(event) => { setOcrMode(event.target.value as "tra" | "general"); setTraFields(null); setWarnings([]); }}>
-              <option value="tra">台鐵資訊擷取</option>
-              <option value="general">一般文字 OCR</option>
-            </select>
-          </label>
-          <button className="primary" disabled={!file || busy}>{busy ? "辨識中…" : "開始辨識"}</button>
-          <p className="ocr-hint">支援 PNG、JPEG、WebP，檔案上限 8 MB；不處理 CAPTCHA 或 reCAPTCHA。</p>
-          {error && <p className="error" role="alert">{error}</p>}
-        </div>
-        <div className="ocr-preview">
-          {preview ? <img src={preview} alt="待辨識圖片預覽" /> : <div><b>圖片預覽</b><span>選擇圖片後會顯示在這裡</span></div>}
-        </div>
-        <div className="ocr-output">
-          <div><b>辨識結果</b>{details && <span>{details}</span>}</div>
-          <textarea value={result} onChange={(event) => { setResult(event.target.value); setCopyNotice(""); }} placeholder="辨識出的文字會顯示在這裡，也可直接修正" aria-label="OCR 辨識結果" />
-          {traFields && (
-            <div className="tra-ocr-fields">
-              <b>擷取資訊</b>
-              <span>類型：{traFields.document_type === "ticket" ? "票券／訂票結果" : traFields.document_type === "timetable" ? "時刻資訊" : "未判定"}</span>
-              {traFields.route && <span>路線：{traFields.route}</span>}
-              {traFields.train_numbers.length > 0 && <span>車次：{traFields.train_numbers.join("、")}</span>}
-              {traFields.dates.length > 0 && <span>日期：{traFields.dates.join("、")}</span>}
-              {traFields.times.length > 0 && <span>時間：{traFields.times.join("、")}</span>}
-              {traFields.stations.length > 0 && <span>站名：{traFields.stations.join("、")}</span>}
-            </div>
-          )}
-          {warnings.length > 0 && <div className="tra-ocr-warning">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
-          <div className="ocr-actions">
-            <button type="button" className="copy-button" disabled={!result} onClick={copyResult}>複製文字</button>
-            <button type="button" className="copy-button secondary" disabled={!traFields} onClick={copyTraSummary}>複製摘要</button>
-            <button type="button" className="text-button" disabled={!result} onClick={() => { setResult(""); setDetails(""); setCopyNotice(""); setTraFields(null); setWarnings([]); }}>清除</button>
-            {copyNotice && <span role="status">✓ {copyNotice}</span>}
-          </div>
-        </div>
-      </form>
-    </section>
-  );
-}
-
 interface BookingFormState {
   identity: string;
   startStation: string;
@@ -255,6 +84,7 @@ interface BookingFormState {
   includeTransfers: boolean;
   quantity: number;
   scheduledAt: string;
+  useSavedMemberLogin: boolean;
 }
 
 const defaultForm: BookingFormState = {
@@ -270,7 +100,79 @@ const defaultForm: BookingFormState = {
   includeTransfers: true,
   quantity: 1,
   scheduledAt: fiveMinutesFromNow(),
+  useSavedMemberLogin: false,
 };
+
+function MemberProfilePanel({
+  token,
+  profile,
+  onSaved,
+}: {
+  token: string;
+  profile: MemberProfile;
+  onSaved: (profile: MemberProfile) => void;
+}) {
+  const [identity, setIdentity] = useState(profile.identity);
+  const [account, setAccount] = useState(profile.member_account);
+  const [password, setPassword] = useState("");
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await api.saveProfile(token, {
+        identity,
+        member_account: account,
+        member_password: password,
+      });
+      onSaved(updated);
+      setPassword("");
+      setNotice("常用資料已加密保存");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法儲存會員資料");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearLogin() {
+    setBusy(true);
+    setError("");
+    try {
+      await api.clearMemberLogin(token);
+      setAccount("");
+      setPassword("");
+      onSaved({ ...profile, member_account: "", has_member_password: false });
+      setNotice("台鐵會員帳密已清除，身分證常用資料仍保留");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法清除會員帳密");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel profile-panel">
+      <div className="panel-heading"><div><span className="step">01</span><h2>我的常用資料</h2></div><small>加密保存</small></div>
+      <form className="profile-form" onSubmit={save}>
+        <label>身分證字號<input value={identity} onChange={(event) => setIdentity(event.target.value.toUpperCase())} autoComplete="off" required /></label>
+        <label>台鐵會員帳號<input value={account} onChange={(event) => setAccount(event.target.value)} autoComplete="username" placeholder="身分證號或會員編號" /></label>
+        <label>台鐵會員密碼<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder={profile.has_member_password ? "已保存；不修改請留空" : "選填"} /></label>
+        <p className="privacy-note">帳密只會以 Fernet 加密存放在你的 NAS。官方若要求驗證，仍需由本人或可信任家人完成。</p>
+        {error && <p className="error" role="alert">{error}</p>}
+        {notice && <p className="notice" role="status">{notice}</p>}
+        <div className="profile-actions">
+          <button className="primary" disabled={busy}>{busy ? "處理中…" : "儲存常用資料"}</button>
+          {profile.has_member_password && <button type="button" className="danger" disabled={busy} onClick={clearLogin}>清除台鐵帳密</button>}
+        </div>
+      </form>
+    </section>
+  );
+}
 
 function CandidateRow({ item, onChoose }: { item: TrainCandidate; onChoose: (item: TrainCandidate) => void }) {
   return (
@@ -285,6 +187,7 @@ function CandidateRow({ item, onChoose }: { item: TrainCandidate; onChoose: (ite
 
 function Dashboard({ token, onLogout }: { token: string; onLogout: () => void }) {
   const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<MemberProfile | null>(null);
   const [stations, setStations] = useState<Station[]>([]);
   const [times, setTimes] = useState<string[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -308,9 +211,15 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }, [token, onLogout]);
 
   useEffect(() => {
-    Promise.all([api.me(token), api.stations(), api.times(), api.tasks(token)])
-      .then(([profile, stationList, timeList, taskList]) => {
-        setUser(profile);
+    Promise.all([api.me(token), api.profile(token), api.stations(), api.times(), api.tasks(token)])
+      .then(([account, savedProfile, stationList, timeList, taskList]) => {
+        setUser(account);
+        setProfile(savedProfile);
+        setForm((current) => ({
+          ...current,
+          identity: savedProfile.identity,
+          useSavedMemberLogin: savedProfile.has_member_password,
+        }));
         setStations(stationList);
         setTimes(timeList);
         setTasks(taskList);
@@ -375,6 +284,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       }
       await api.createTask(token, {
         scheduled_at: new Date(form.scheduledAt).toISOString(),
+        use_saved_member_login: form.useSavedMemberLogin,
         booking: {
           identity: form.identity,
           identity_type: "PERSON_ID",
@@ -394,7 +304,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       setNotice(candidateSuggestions || form.orderType === "BY_TRAIN_NO"
         ? "任務已排入；到點後會轉為等待人工驗證。"
         : "任務已排入，但 TDX 暫時不可用，這次未附離線候選清單。");
-      setForm((current) => ({ ...current, identity: "", trainNumber: "" }));
+      setForm((current) => ({ ...current, identity: profile?.identity ?? "", trainNumber: "" }));
       await loadTasks();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法建立任務");
@@ -422,20 +332,29 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div><strong>TRA<span>/</span>Sniper</strong><small>本機訂票任務工作台</small></div>
-        <div className="account"><span>{user?.email ?? "載入中…"}</span><button onClick={onLogout}>登出</button></div>
+        <div className="brand-lockup"><img src="/favicon.svg" alt="" /><strong>好搭車</strong><small>台鐵訂票小幫手</small></div>
+        <div className="account"><span>{user?.email ?? "載入中…"}</span><button onClick={() => document.body.classList.toggle("large-text")}>大字模式</button><button onClick={onLogout}>登出</button></div>
       </header>
       <main className="workspace">
+        <section className="welcome-card">
+          <div><span>簡單三步驟</span><h1>選車次、排時間、到點完成驗證</h1><p>常用資料只要設定一次，之後每次訂票會自動帶入。</p></div>
+          <a href="https://www.trc.com.tw/tra-tip-web/tip/tip008/tip811/memberLogin" target="_blank" rel="noreferrer">開啟台鐵會員登入</a>
+        </section>
         <section className="summary-row" aria-label="任務摘要">
           <article><span>排程中</span><strong>{scheduled}</strong><small>等待觸發時間</small></article>
           <article className={waiting ? "attention" : ""}><span>需要人工</span><strong>{waiting}</strong><small>驗證碼與最終確認</small></article>
           <article><span>全部任務</span><strong>{tasks.length}</strong><small>含取消與完成</small></article>
-          <div className="boundary"><b>安全邊界</b><p>系統不解 CAPTCHA；到點後由你核對並送出。</p></div>
+          <div className="boundary"><b>驗證協助</b><p>若官方要求驗證，可放大畫面、重新產生，或請可信任家人協助；最後仍由你確認送出。</p></div>
         </section>
 
         <div className="content-grid">
+          <div className="left-column">
+          {profile && <MemberProfilePanel token={token} profile={profile} onSaved={(saved) => {
+            setProfile(saved);
+            setForm((current) => ({ ...current, identity: saved.identity, useSavedMemberLogin: saved.has_member_password }));
+          }} />}
           <section className="panel booking-panel">
-            <div className="panel-heading"><div><span className="step">01</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
+            <div className="panel-heading"><div><span className="step">02</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
             <form className="booking-form" onSubmit={createTask}>
               <fieldset className="mode-switch wide">
                 <legend>查詢方式</legend>
@@ -443,6 +362,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 <label><input type="radio" checked={form.orderType === "BY_TIME"} onChange={() => setForm({ ...form, orderType: "BY_TIME" })} /> 依時段</label>
               </fieldset>
               <label className="wide">身分證字號<input value={form.identity} onChange={(e) => setForm({ ...form, identity: e.target.value })} autoComplete="off" required /></label>
+              {profile?.has_member_password && (
+                <label className="member-login-option wide"><input type="checkbox" checked={form.useSavedMemberLogin} onChange={(event) => setForm({ ...form, useSavedMemberLogin: event.target.checked })} /> 購票前先帶入已保存的台鐵會員帳密</label>
+              )}
               <label>出發站<select value={form.startStation} onChange={(e) => setForm({ ...form, startStation: e.target.value })}>{stations.map((station) => <option value={station.value} key={station.value}>{station.value}</option>)}</select></label>
               <button type="button" className="swap" aria-label="交換出發站與抵達站" onClick={() => setForm({ ...form, startStation: form.endStation, endStation: form.startStation })}>⇄</button>
               <label>抵達站<select value={form.endStation} onChange={(e) => setForm({ ...form, endStation: e.target.value })}>{stations.map((station) => <option value={station.value} key={station.value}>{station.value}</option>)}</select></label>
@@ -485,11 +407,11 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 ))}
               </section>
             )}
-            <OcrWorkflow token={token} />
           </section>
+          </div>
 
           <section className="panel task-panel">
-            <div className="panel-heading"><div><span className="step">02</span><h2>任務佇列</h2></div><button className="text-button" onClick={loadTasks}>重新整理</button></div>
+            <div className="panel-heading"><div><span className="step">03</span><h2>任務佇列</h2></div><button className="text-button" onClick={loadTasks}>重新整理</button></div>
             <div className="task-list">
               {tasks.length === 0 && <div className="empty"><b>尚無任務</b><p>建立第一個訂票條件後，狀態會顯示在這裡。</p></div>}
               {tasks.map((task) => (
@@ -497,7 +419,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                   <div className="task-main"><span className={`status status-${task.status}`}>{task.status === "waiting_human" ? "需要人工" : task.status === "scheduled" ? "排程中" : task.status}</span><h3>{task.route}</h3><p>{task.ride_date} · {task.order_type === "BY_TRAIN_NO" ? "依車次" : "依時段"}</p></div>
                   <div className="task-time"><span>觸發</span><b>{formatDate(task.scheduled_at)}</b></div>
                   <div className="task-actions">
-                    {task.status === "waiting_human" && <button className="primary compact" onClick={() => downloadConfig(task.id)}>下載設定</button>}
+                    {task.status === "waiting_human" && <button className="primary compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
                     {["scheduled", "waiting_human"].includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>取消</button>}
                   </div>
                   {task.status === "waiting_human" && waitingSuggestions[task.id] && (

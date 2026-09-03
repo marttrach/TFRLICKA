@@ -58,6 +58,7 @@ class UserResponse(BaseModel):
 class TaskCreate(BaseModel):
     scheduled_at: datetime
     booking: dict[str, Any]
+    use_saved_member_login: bool = False
 
 
 class TaskResponse(BaseModel):
@@ -70,6 +71,19 @@ class TaskResponse(BaseModel):
     created_at: str
     updated_at: str
     last_error: str | None
+
+
+class MemberProfileUpdate(BaseModel):
+    identity: str = Field(min_length=1, max_length=32)
+    member_account: str = Field(default="", max_length=64)
+    member_password: str = Field(default="", max_length=128)
+
+
+class MemberProfileResponse(BaseModel):
+    identity: str
+    member_account: str
+    has_member_password: bool
+    updated_at: str | None
 
 
 class OcrResponse(BaseModel):
@@ -163,8 +177,8 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.6.0",
-        description="Local membership, booking task, timetable suggestion, and image OCR API.",
+        version="0.7.0",
+        description="Accessible membership, booking task, and timetable suggestion API.",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -260,10 +274,70 @@ def create_app(
         logger.info("user tokens revoked", extra={"event": "auth.logout"})
         return Response(status_code=204)
 
+    @app.get("/profile", response_model=MemberProfileResponse)
+    def get_profile(user: CurrentUser) -> MemberProfileResponse:
+        profile = db.get_member_profile(user.id)
+        if not profile:
+            return MemberProfileResponse(
+                identity="", member_account="", has_member_password=False, updated_at=None
+            )
+        return MemberProfileResponse(
+            identity=profile.identity,
+            member_account=profile.member_account,
+            has_member_password=bool(profile.member_password),
+            updated_at=profile.updated_at,
+        )
+
+    @app.put("/profile", response_model=MemberProfileResponse)
+    def save_profile(body: MemberProfileUpdate, user: CurrentUser) -> MemberProfileResponse:
+        existing = db.get_member_profile(user.id)
+        account = body.member_account.strip()
+        password = body.member_password or (existing.member_password if existing else "")
+        if bool(account) != bool(password):
+            raise HTTPException(
+                status_code=422,
+                detail="台鐵會員帳號與密碼必須同時設定；若不使用會員登入，兩欄都留空。",
+            )
+        profile = db.save_member_profile(
+            user.id,
+            identity=body.identity,
+            member_account=account,
+            member_password=password,
+        )
+        return MemberProfileResponse(
+            identity=profile.identity,
+            member_account=profile.member_account,
+            has_member_password=bool(profile.member_password),
+            updated_at=profile.updated_at,
+        )
+
+    @app.delete("/profile", status_code=204)
+    def delete_profile(user: CurrentUser) -> Response:
+        db.delete_member_profile(user.id)
+        return Response(status_code=204)
+
+    @app.delete("/profile/member-login", status_code=204)
+    def clear_member_login(user: CurrentUser) -> Response:
+        db.clear_member_login(user.id)
+        return Response(status_code=204)
+
     @app.post("/tasks", response_model=TaskResponse, status_code=201)
     def create_task(body: TaskCreate, user: CurrentUser) -> TaskResponse:
+        booking_payload = dict(body.booking)
+        if body.use_saved_member_login:
+            profile = db.get_member_profile(user.id)
+            if not profile or not profile.member_account or not profile.member_password:
+                raise HTTPException(status_code=422, detail="尚未設定完整的台鐵會員登入資料")
+            booking_payload["member_login"] = {
+                "account": profile.member_account,
+                "password": profile.member_password,
+            }
+        if not str(booking_payload.get("identity", "")).strip():
+            profile = db.get_member_profile(user.id)
+            if profile:
+                booking_payload["identity"] = profile.identity
         try:
-            booking = BookingRequest.from_dict(body.booking)
+            booking = BookingRequest.from_dict(booking_payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         scheduled_at = body.scheduled_at
@@ -275,7 +349,7 @@ def create_app(
             user.id,
             booking,
             scheduled_at.astimezone(UTC).isoformat(),
-            body.booking,
+            booking_payload,
         )
         return _task_response(task)
 
@@ -401,7 +475,8 @@ def create_app(
         )
 
     @app.get("/tasks/{task_id}/config")
-    def task_config(task_id: str, user: CurrentUser) -> dict[str, Any]:
+    def task_config(task_id: str, user: CurrentUser, response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
         try:
             return db.get_task_payload(task_id, user.id)
         except KeyError as exc:

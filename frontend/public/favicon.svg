@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="好搭車圖示">
+  <defs>
+    <linearGradient id="g" x1="8" y1="5" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#176b9c"/>
+      <stop offset="1" stop-color="#123a5a"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#g)"/>
+  <path d="M18 16c0-4 4-7 14-7s14 3 14 7v25c0 5-4 9-9 9H27c-5 0-9-4-9-9V16Z" fill="#fff"/>
+  <path d="M23 18h18v13H23z" rx="2" fill="#9ed8f3"/>
+  <circle cx="25" cy="40" r="3" fill="#e86f2b"/>
+  <circle cx="39" cy="40" r="3" fill="#e86f2b"/>
+  <path d="m23 52-5 7m23-7 5 7M25 56h14" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+  <path d="M26 13h12" stroke="#e86f2b" stroke-width="3" stroke-linecap="round"/>
+</svg>

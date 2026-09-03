@@ -1,11 +1,20 @@
 """TRA-Sniper package."""
 
-from .models import BookingRequest, IdentityType, Leg, OrderType, SeatPreference, TripType
+from .models import (
+    BookingRequest,
+    IdentityType,
+    Leg,
+    MemberLogin,
+    OrderType,
+    SeatPreference,
+    TripType,
+)
 
 __all__ = [
     "BookingRequest",
     "IdentityType",
     "Leg",
+    "MemberLogin",
     "OrderType",
     "SeatPreference",
     "TripType",
