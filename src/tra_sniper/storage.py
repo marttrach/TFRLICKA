@@ -409,12 +409,18 @@ class Database:
         return cursor.rowcount == 1
 
     def promote_due_tasks(self, now: str | None = None) -> int:
+        return len(self.promote_due_task_records(now))
+
+    def promote_due_task_records(self, now: str | None = None) -> list[TaskRecord]:
+        updated_at = utc_now()
         with self.connect() as connection:
-            cursor = connection.execute(
+            rows = connection.execute(
                 """
                 UPDATE tasks SET status = 'waiting_human', updated_at = ?
                 WHERE status = 'scheduled' AND scheduled_at <= ?
+                RETURNING id, user_id, status, scheduled_at, route, ride_date, order_type,
+                          created_at, updated_at, last_error
                 """,
-                (utc_now(), now or utc_now()),
-            )
-        return cursor.rowcount
+                (updated_at, now or updated_at),
+            ).fetchall()
+        return [TaskRecord(**dict(row)) for row in rows]

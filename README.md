@@ -21,6 +21,7 @@
 - **無障礙介面** — 大字、高對比、全中文提示與清楚的操作步驟
 - **React 儀表板** — 建立、查看及取消訂票任務
 - **預約排程** — 到達指定時間後提醒使用者接手訂票
+- **Webhook 通知** — 任務就緒時可通知 n8n 等服務並直接開啟該任務
 - **多種行程** — 支援單程、來回、依車次或時段查詢
 - **時刻建議** — 透過 TDX 排序對號、非對號、鄰近時段與單次轉乘選項
 - **離線候選** — 建立任務時加密保存候選，等待人工處理時不必重新查詢
@@ -89,6 +90,22 @@ tra-sniper book booking.json --submit --wait-seconds 600
 `TRA_VERIFICATION_PROVIDER` 正式環境維持 `manual`。`mock` 有強制 localhost
 限制，只用來測試未來驗證交接流程；`official_api` 已保留穩定介面，但在取得
 台鐵核准的端點、認證與回應格式以前會明確回報尚未設定。
+
+## 🔔 任務就緒通知
+
+如需接到 n8n 或其他 HTTP webhook，設定以下三個環境變數：
+
+```dotenv
+TRA_WEBHOOK_URL=https://你的-webhook-網址
+TRA_WEBHOOK_SECRET=至少-32-字元的獨立隨機密鑰
+TRA_PUBLIC_URL=http://你的NAS:43124
+```
+
+只有 `TRA_WEBHOOK_URL` 與 `TRA_WEBHOOK_SECRET` 都存在時才會啟用。請求以
+`X-TRA-Signature: sha256=<hex>` 傳送 HMAC-SHA256 簽章；簽章原文是收到的原始
+JSON bytes。通知只包含任務編號、日期、路線、最多三筆時刻候選與任務連結，
+不會傳送身分證或台鐵會員帳密。通知失敗只會寫入日誌，不會阻止任務進入
+「需要人工」狀態。
 
 ## 🛡️ 免責聲明
 

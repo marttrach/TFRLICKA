@@ -180,7 +180,7 @@ def create_app(
 
     app = FastAPI(
         title="TRA-Sniper API",
-        version="0.8.0",
+        version="0.9.0",
         description="Accessible membership, booking task, and timetable suggestion API.",
         lifespan=lifespan,
     )

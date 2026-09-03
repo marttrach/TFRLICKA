@@ -9,12 +9,12 @@ class FlakyDatabase:
         self.calls = 0
         self.recovered = threading.Event()
 
-    def promote_due_tasks(self) -> int:
+    def promote_due_task_records(self) -> list[object]:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("database is locked")
         self.recovered.set()
-        return 0
+        return []
 
 
 def test_scheduler_survives_a_failed_tick(caplog) -> None:
@@ -32,8 +32,8 @@ def test_scheduler_survives_a_failed_tick(caplog) -> None:
 
 def test_scheduler_tick_returns_promoted_count() -> None:
     class DatabaseStub:
-        def promote_due_tasks(self) -> int:
-            return 3
+        def promote_due_task_records(self) -> list[object]:
+            return [object(), object(), object()]
 
     scheduler = TaskScheduler(DatabaseStub())  # type: ignore[arg-type]
     assert scheduler.tick() == 3

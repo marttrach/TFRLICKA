@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 
+from .notifications import WebhookNotifier
 from .storage import Database
 
 logger = logging.getLogger(__name__)
@@ -11,19 +12,37 @@ logger = logging.getLogger(__name__)
 class TaskScheduler:
     """Promotes due tasks to a human-action queue; it never solves CAPTCHA."""
 
-    def __init__(self, database: Database, *, interval_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        interval_seconds: float = 5.0,
+        notifier: WebhookNotifier | None = None,
+    ) -> None:
         self.database = database
         self.interval_seconds = interval_seconds
+        self.notifier = notifier or WebhookNotifier.from_env()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def tick(self) -> int:
-        promoted = self.database.promote_due_tasks()
+        promoted_tasks = self.database.promote_due_task_records()
+        promoted = len(promoted_tasks)
         if promoted:
             logger.info(
                 "scheduled tasks are ready for human action",
                 extra={"event": "scheduler.tasks_promoted", "promoted_count": promoted},
             )
+        if self.notifier.enabled:
+            for task in promoted_tasks:
+                try:
+                    payload = self.database.get_task_payload(task.id, task.user_id)
+                    self.notifier.notify(task, payload)
+                except Exception:
+                    logger.exception(
+                        "task webhook failed; task remains ready for human action",
+                        extra={"event": "notification.webhook_failed", "task_id": task.id},
+                    )
         return promoted
 
     def start(self) -> None:

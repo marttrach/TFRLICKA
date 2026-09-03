@@ -186,6 +186,10 @@ function CandidateRow({ item, onChoose }: { item: TrainCandidate; onChoose: (ite
 }
 
 function Dashboard({ token, onLogout }: { token: string; onLogout: () => void }) {
+  const linkedTaskId = useMemo(() => {
+    const match = window.location.pathname.match(/^\/tasks\/([^/]+)$/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }, []);
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<MemberProfile | null>(null);
   const [stations, setStations] = useState<Station[]>([]);
@@ -239,6 +243,11 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       .then((entries) => setWaitingSuggestions(Object.fromEntries(entries)))
       .catch(() => undefined);
   }, [tasks, token]);
+
+  useEffect(() => {
+    if (!linkedTaskId || !tasks.some((task) => task.id === linkedTaskId)) return;
+    document.getElementById(`task-${linkedTaskId}`)?.scrollIntoView({ block: "center" });
+  }, [linkedTaskId, tasks]);
 
   const waiting = useMemo(() => tasks.filter((task) => task.status === "waiting_human").length, [tasks]);
   const scheduled = useMemo(() => tasks.filter((task) => task.status === "scheduled").length, [tasks]);
@@ -415,7 +424,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             <div className="task-list">
               {tasks.length === 0 && <div className="empty"><b>尚無任務</b><p>建立第一個訂票條件後，狀態會顯示在這裡。</p></div>}
               {tasks.map((task) => (
-                <article className="task-card" key={task.id}>
+                <article id={`task-${task.id}`} className={`task-card${task.id === linkedTaskId ? " task-card-linked" : ""}`} key={task.id}>
                   <div className="task-main"><span className={`status status-${task.status}`}>{task.status === "waiting_human" ? "需要人工" : task.status === "scheduled" ? "排程中" : task.status}</span><h3>{task.route}</h3><p>{task.ride_date} · {task.order_type === "BY_TRAIN_NO" ? "依車次" : "依時段"}</p></div>
                   <div className="task-time"><span>觸發</span><b>{formatDate(task.scheduled_at)}</b></div>
                   <div className="task-actions">

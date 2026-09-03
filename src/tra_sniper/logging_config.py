@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import UTC, datetime
 
-SAFE_EXTRA_FIELDS = ("event", "promoted_count", "duration_ms")
+SAFE_EXTRA_FIELDS = ("event", "promoted_count", "duration_ms", "task_id")
 
 
 class JsonFormatter(logging.Formatter):

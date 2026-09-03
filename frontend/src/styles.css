@@ -112,6 +112,7 @@ input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb
 .task-list { display: grid; }
 .task-card { display: grid; grid-template-columns: minmax(230px, 1fr) 130px auto; gap: 1rem; align-items: center; padding: 1rem 1.2rem; border-bottom: 1px solid var(--line); }
 .task-card:last-child { border-bottom: 0; }
+.task-card-linked { outline: 3px solid var(--orange); outline-offset: -3px; background: #fffaf1; }
 .task-main h3 { margin: .35rem 0 .2rem; font-size: .95rem; color: var(--navy); }
 .task-main p { margin: 0; color: var(--muted); font-size: .76rem; }
 .status { display: inline-block; width: fit-content; padding: .18rem .45rem; font-size: .68rem; font-weight: 900; border-radius: 2px; background: #e7edf1; color: #526572; }
