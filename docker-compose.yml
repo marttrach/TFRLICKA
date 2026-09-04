@@ -17,6 +17,9 @@ services:
       TDX_CLIENT_ID: ${TDX_CLIENT_ID:-}
       TDX_CLIENT_SECRET: ${TDX_CLIENT_SECRET:-}
       TDX_CACHE_TTL_HOURS: ${TDX_CACHE_TTL_HOURS:-6}
+      # Unset this to fall back to launching a browser inside the API container
+      # (CLI behaviour). With it set, booking sessions use the sidecar.
+      TRA_BROWSER_CDP_URL: ${TRA_BROWSER_CDP_URL:-http://tra-sniper-browser:9222}
     volumes:
       - /mnt/NEW_PA9A1_2T/Truenas_App/TRA/data:/app/data
     ports:
@@ -30,6 +33,19 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # Headed Chromium + noVNC for the remote booking hand-off.
+  # NOTE: no `ports:` on purpose. CDP (9222) has no authentication and the
+  # browser holds the user's national ID and TRC credentials, so both 9222 and
+  # 6080 must stay inside this network. Access is only ever through the
+  # frontend's token-guarded /booking-session/ proxy.
+  tra-sniper-browser:
+    image: ghcr.io/marttrach/tra-sniper-browser:latest
+    container_name: tra-sniper-browser
+    shm_size: "1gb"
+    restart: unless-stopped
+    networks:
+      - default
 
   tra-sniper-frontend:
     image: ghcr.io/marttrach/tra-sniper-frontend:latest

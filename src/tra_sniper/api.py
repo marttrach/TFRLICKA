@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,6 +15,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .auth import TokenManager, hash_password, verify_password
+from .browser_session import (
+    BookingSessionManager,
+    SessionBusyError,
+    run_booking_session,
+)
 from .logging_config import configure_logging
 from .models import BOOKING_TIME_LABELS, BookingRequest
 from .ocr import MAX_IMAGE_BYTES, OcrService
@@ -32,6 +38,10 @@ DEFAULT_DEV_ORIGINS = (
     "http://127.0.0.1:3000",
 )
 LOGIN_RETRY_AFTER_SECONDS = 15 * 60
+BOOKING_SESSION_NOTICE = (
+    "表單已填妥。請在畫面上完成台鐵官方 reCAPTCHA 並自行按下訂票；"
+    "系統不會辨識驗證碼，也不會替你按送出。"
+)
 logger = logging.getLogger(__name__)
 DUMMY_PASSWORD_HASH = hash_password("not-a-real-user-password")
 
@@ -108,6 +118,20 @@ class TraOcrResponse(OcrResponse):
     warnings: list[str]
 
 
+class BookingSessionResponse(BaseModel):
+    task_id: str
+    session_url: str
+    expires_at: str
+    notice: str
+
+
+class BookingResultResponse(BaseModel):
+    task_id: str
+    status: str
+    booking_code: str | None = None
+    message: str = ""
+
+
 class SuggestionPreferences(BaseModel):
     prefer_reserved: bool = True
     include_transfers: bool = True
@@ -158,10 +182,12 @@ def create_app(
     verification_provider: VerificationProvider | None = None,
     *,
     start_scheduler: bool = True,
+    automator_factory: Any | None = None,
 ) -> FastAPI:
     db = database or Database()
     tokens = token_manager or TokenManager()
-    scheduler = TaskScheduler(db)
+    sessions = BookingSessionManager()
+    scheduler = TaskScheduler(db, session_manager=sessions)
     ocr = ocr_service or OcrService()
     tra_ocr = TraOcrService(ocr)
     tdx = tdx_client or TdxClient()
@@ -507,6 +533,126 @@ def create_app(
             "availability_known": False,
         }
 
+    def _build_automator(booking_request: BookingRequest) -> Any:
+        del booking_request
+        if automator_factory is not None:
+            return automator_factory()
+        from .automation import TRCBookingAutomator
+
+        return TRCBookingAutomator(headless=False, verification_provider=verification)
+
+    @app.post(
+        "/tasks/{task_id}/booking-session",
+        response_model=BookingSessionResponse,
+        status_code=201,
+    )
+    def start_booking_session(task_id: str, user: CurrentUser) -> BookingSessionResponse:
+        task = db.get_task(task_id, user.id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status not in {"scheduled", "waiting_human"}:
+            raise HTTPException(status_code=409, detail="Task is not open for booking")
+        try:
+            booking = BookingRequest.from_dict(db.get_task_payload(task_id, user.id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Task not found") from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        try:
+            session = sessions.acquire(task_id, user.id)
+        except SessionBusyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"另一個訂票 session 進行中（任務 {exc.active_task_id}），"
+                    f"約 {exc.remaining_seconds} 秒後釋放。一次只能解一個驗證。"
+                ),
+                headers={"Retry-After": str(exc.remaining_seconds)},
+            ) from exc
+
+        def on_finish(finished: Any) -> None:
+            sessions.release(finished.token)
+            db.update_task_status(
+                finished.task_id,
+                finished.user_id,
+                finished.status,
+                last_error=finished.message if finished.status != "completed" else None,
+                booking_code=finished.booking_code,
+            )
+            record = db.get_task(finished.task_id, finished.user_id)
+            if record and scheduler.notifier.enabled:
+                try:
+                    scheduler.notifier.notify_result(
+                        record, finished.status, finished.booking_code
+                    )
+                except Exception:
+                    logger.exception(
+                        "booking result webhook failed",
+                        extra={
+                            "event": "notification.webhook_failed",
+                            "task_id": finished.task_id,
+                        },
+                    )
+
+        threading.Thread(
+            target=run_booking_session,
+            args=(session,),
+            kwargs={
+                "automator": _build_automator(booking),
+                "request": booking,
+                "on_finish": on_finish,
+            },
+            name=f"booking-session-{task_id}",
+            daemon=True,
+        ).start()
+
+        logger.info(
+            "booking session started",
+            extra={"event": "booking_session.started", "task_id": task_id},
+        )
+        return BookingSessionResponse(
+            task_id=task_id,
+            session_url=f"/booking-session/{session.token}/",
+            expires_at=session.expires_at.isoformat(),
+            notice=BOOKING_SESSION_NOTICE,
+        )
+
+    @app.get("/booking-session/{session_token}/verify", status_code=204)
+    def verify_booking_session(session_token: str) -> Response:
+        """nginx auth_request target guarding the noVNC stream."""
+        if sessions.resolve(session_token) is None:
+            raise HTTPException(status_code=403, detail="Session is invalid or expired")
+        return Response(status_code=204)
+
+    @app.get("/tasks/{task_id}/booking-result", response_model=BookingResultResponse)
+    def booking_result(task_id: str, user: CurrentUser) -> BookingResultResponse:
+        active = sessions.active
+        if active and active.task_id == task_id and active.user_id == user.id:
+            return BookingResultResponse(
+                task_id=task_id,
+                status=active.status,
+                booking_code=active.booking_code,
+                message=active.message,
+            )
+        task = db.get_task(task_id, user.id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return BookingResultResponse(
+            task_id=task_id,
+            status=task.status,
+            booking_code=task.booking_code,
+            message=task.last_error or "",
+        )
+
+    @app.delete("/booking-session/{session_token}", status_code=204)
+    def cancel_booking_session(session_token: str, user: CurrentUser) -> Response:
+        session = sessions.resolve(session_token)
+        if session is None or session.user_id != user.id:
+            raise HTTPException(status_code=403, detail="Session is invalid or expired")
+        sessions.release(session_token)
+        return Response(status_code=204)
+
     @app.post("/tasks/{task_id}/cancel", status_code=204)
     def cancel_task(
         task_id: str,
@@ -524,6 +670,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.tdx = tdx
     app.state.verification = verification
+    app.state.booking_sessions = sessions
     return app
 
 

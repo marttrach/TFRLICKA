@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 
+from .browser_session import BookingSessionManager
 from .notifications import WebhookNotifier
 from .storage import Database
 
@@ -18,14 +19,20 @@ class TaskScheduler:
         *,
         interval_seconds: float = 5.0,
         notifier: WebhookNotifier | None = None,
+        session_manager: BookingSessionManager | None = None,
     ) -> None:
         self.database = database
         self.interval_seconds = interval_seconds
         self.notifier = notifier or WebhookNotifier.from_env()
+        # Reusing this tick as the session reaper avoids a second background
+        # thread whose only job would be to check one timestamp.
+        self.session_manager = session_manager
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def tick(self) -> int:
+        if self.session_manager is not None:
+            self.session_manager.reap()
         promoted_tasks = self.database.promote_due_task_records()
         promoted = len(promoted_tasks)
         if promoted:
