@@ -41,6 +41,7 @@ class TaskRecord:
     created_at: str
     updated_at: str
     last_error: str | None
+    booking_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,10 +139,16 @@ class Database:
                     order_type TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    last_error TEXT
+                    last_error TEXT,
+                    booking_code TEXT
                 )
                 """
             )
+            task_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "booking_code" not in task_columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN booking_code TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_user_created "
                 "ON tasks(user_id, created_at DESC)"
@@ -361,7 +368,7 @@ class Database:
             rows = connection.execute(
                 """
                 SELECT id, user_id, status, scheduled_at, route, ride_date, order_type,
-                       created_at, updated_at, last_error
+                       created_at, updated_at, last_error, booking_code
                 FROM tasks WHERE user_id = ? ORDER BY created_at DESC
                 """,
                 (user_id,),
@@ -373,7 +380,7 @@ class Database:
             row = connection.execute(
                 """
                 SELECT id, user_id, status, scheduled_at, route, ride_date, order_type,
-                       created_at, updated_at, last_error
+                       created_at, updated_at, last_error, booking_code
                 FROM tasks WHERE id = ? AND user_id = ?
                 """,
                 (task_id, user_id),
@@ -397,14 +404,18 @@ class Database:
         status: str,
         *,
         last_error: str | None = None,
+        booking_code: str | None = None,
     ) -> bool:
+        # COALESCE keeps a code that was already recorded: a later status update
+        # must never erase the one output the whole booking flow exists to produce.
         with self.connect() as connection:
             cursor = connection.execute(
                 """
-                UPDATE tasks SET status = ?, updated_at = ?, last_error = ?
+                UPDATE tasks SET status = ?, updated_at = ?, last_error = ?,
+                                 booking_code = COALESCE(?, booking_code)
                 WHERE id = ? AND user_id = ?
                 """,
-                (status, utc_now(), last_error, task_id, user_id),
+                (status, utc_now(), last_error, booking_code, task_id, user_id),
             )
         return cursor.rowcount == 1
 
@@ -419,7 +430,7 @@ class Database:
                 UPDATE tasks SET status = 'waiting_human', updated_at = ?
                 WHERE status = 'scheduled' AND scheduled_at <= ?
                 RETURNING id, user_id, status, scheduled_at, route, ride_date, order_type,
-                          created_at, updated_at, last_error
+                          created_at, updated_at, last_error, booking_code
                 """,
                 (updated_at, now or updated_at),
             ).fetchall()

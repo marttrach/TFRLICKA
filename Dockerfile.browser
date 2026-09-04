@@ -1,0 +1,34 @@
+# Headed Chromium + X11 + noVNC sidecar for the remote booking hand-off.
+#
+# This image is deliberately separate from the API image: Chromium under Xvfb
+# can peak at 0.5-1 GB, and an OOM kill here must not take down FastAPI, the
+# scheduler thread, or a SQLite write.
+#
+# The official Playwright image already ships Chromium and every system
+# dependency it needs, so we only add the display and VNC layer.
+# Keep the tag aligned with the playwright pin in pyproject.toml.
+FROM mcr.microsoft.com/playwright:v1.55.0-jammy
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        xvfb \
+        x11vnc \
+        novnc \
+        websockify \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV DISPLAY=:99 \
+    SCREEN_GEOMETRY=1280x1024x24 \
+    CDP_PORT=9222 \
+    VNC_PORT=5900 \
+    NOVNC_PORT=6080
+
+COPY docker/start-browser.sh /usr/local/bin/start-browser.sh
+RUN chmod +x /usr/local/bin/start-browser.sh
+
+# Neither port is ever published to the host. CDP has no authentication at all,
+# so reaching 9222 means full control of a browser holding the user's national
+# ID and TRC credentials. Internal compose network only.
+EXPOSE 9222 6080
+
+CMD ["/usr/local/bin/start-browser.sh"]

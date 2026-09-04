@@ -28,6 +28,11 @@ jobs:
           - name: tra-sniper-frontend
             context: ./frontend
             dockerfile: ./frontend/Dockerfile
+          # Headed Chromium + noVNC sidecar. Built from the repo root because
+          # it copies docker/start-browser.sh.
+          - name: tra-sniper-browser
+            context: .
+            dockerfile: ./Dockerfile.browser
 
     steps:
       - name: Checkout repository

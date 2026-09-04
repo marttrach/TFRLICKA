@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,11 +60,15 @@ class TRCBookingAutomator:
         slow_mo_ms: int = 0,
         booking_url: str = BOOKING_URL,
         verification_provider: VerificationProvider | None = None,
+        cdp_url: str | None = None,
     ) -> None:
         self.headless = headless
         self.slow_mo_ms = slow_mo_ms
         self.booking_url = booking_url
         self.verification = verification_provider or create_verification_provider()
+        # Unset means "launch a browser here", which keeps the CLI working on a
+        # laptop with no sidecar container in sight.
+        self.cdp_url = cdp_url or os.getenv("TRA_BROWSER_CDP_URL") or None
 
     def run(
         self,
@@ -71,6 +77,7 @@ class TRCBookingAutomator:
         submit: bool = False,
         wait_seconds: int = 600,
         screenshot: str | Path | None = None,
+        stop_event: threading.Event | None = None,
     ) -> AutomationResult:
         request.validate()
         if submit and self.headless:
@@ -85,10 +92,16 @@ class TRCBookingAutomator:
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=self.headless,
-                slow_mo=self.slow_mo_ms,
-            )
+            if self.cdp_url:
+                browser = playwright.chromium.connect_over_cdp(self.cdp_url)
+            else:
+                browser = playwright.chromium.launch(
+                    headless=self.headless,
+                    slow_mo=self.slow_mo_ms,
+                )
+            # A fresh context per session is a security requirement, not a
+            # preference: the sidecar browser outlives this booking, so a shared
+            # context would carry one member login into the next task.
             context = browser.new_context(locale="zh-TW")
             page = context.new_page()
             try:
@@ -99,7 +112,9 @@ class TRCBookingAutomator:
                         "臺鐵會員帳號與密碼已填入。請在瀏覽器確認，若官方要求驗證，"
                         "請完成官方驗證後按登入；登入完成後再前往訂票頁。"
                     )
-                    self._wait_for_member_login(page, wait_seconds=wait_seconds)
+                    self._wait_for_member_login(
+                        page, wait_seconds=wait_seconds, stop_event=stop_event
+                    )
                 page.goto(self.booking_url, wait_until="domcontentloaded", timeout=60_000)
                 self._prepare_form(page, request)
 
@@ -124,6 +139,7 @@ class TRCBookingAutomator:
                     page,
                     wait_seconds=wait_seconds,
                     screenshot_path=screenshot_path,
+                    stop_event=stop_event,
                 )
             finally:
                 context.close()
@@ -148,9 +164,13 @@ class TRCBookingAutomator:
         page.locator("#password").fill(password)
 
     @staticmethod
-    def _wait_for_member_login(page: Any, *, wait_seconds: int) -> None:
+    def _wait_for_member_login(
+        page: Any, *, wait_seconds: int, stop_event: threading.Event | None = None
+    ) -> None:
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("訂票 session 已取消；未嘗試略過官方驗證")
             if "/tip811/memberLogin" not in page.url:
                 return
             page.wait_for_timeout(1_000)
@@ -227,10 +247,17 @@ class TRCBookingAutomator:
         *,
         wait_seconds: int,
         screenshot_path: Path | None,
+        stop_event: threading.Event | None = None,
     ) -> AutomationResult:
         deadline = time.monotonic() + wait_seconds
         last_url = page.url
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return AutomationResult(
+                    status="cancelled",
+                    url=last_url,
+                    message="Booking session was cancelled before TRC returned a result.",
+                )
             page.wait_for_timeout(1_000)
             last_url = page.url
             body_text = page.locator("body").inner_text(timeout=5_000)

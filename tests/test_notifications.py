@@ -74,6 +74,32 @@ def test_webhook_signs_minimal_payload_and_excludes_secrets() -> None:
     assert sent["headers"]["X-TRA-Signature"] == f"sha256={expected}"
 
 
+def test_booking_result_payload_is_signed_and_excludes_identity() -> None:
+    sent: dict[str, Any] = {}
+
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        sent.update(url=url, body=body, headers=headers, timeout=timeout)
+
+    notifier = WebhookNotifier(
+        "https://hooks.example.test/tra",
+        "notification-secret",
+        "https://tra.example.test",
+        sender=sender,
+    )
+
+    assert notifier.notify_result(task_record(), "completed", "1234567890") is True
+
+    payload = json.loads(sent["body"])
+    assert payload["event"] == "task.booking_result"
+    assert payload["booking_code"] == "1234567890"
+    assert "A123456789" not in sent["body"].decode("utf-8")
+    assert "identity" not in payload
+
+    # R-6 keeps the existing HMAC signing rather than a static header token.
+    expected = hmac.new(b"notification-secret", sent["body"], hashlib.sha256).hexdigest()
+    assert sent["headers"]["X-TRA-Signature"] == f"sha256={expected}"
+
+
 def test_disabled_webhook_does_not_call_sender() -> None:
     called = False
 

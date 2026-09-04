@@ -11,6 +11,7 @@ from typing import Any
 from .storage import TaskRecord
 
 NOTICE = "候選僅為時刻建議，不代表有位；驗證碼與送出仍須人工完成於官方頁面"
+RESULT_NOTICE = "訂位成功，請於台鐵規定期限內完成付款取票"
 Sender = Callable[[str, bytes, dict[str, str], float], None]
 
 
@@ -86,11 +87,32 @@ class WebhookNotifier:
             "note": NOTICE,
         }
 
+    def result_payload_for(
+        self, task: TaskRecord, status: str, booking_code: str | None
+    ) -> dict[str, Any]:
+        return {
+            "event": "task.booking_result",
+            "task_id": task.id,
+            "route": task.route,
+            "ride_date": task.ride_date,
+            "status": status,
+            "booking_code": booking_code,
+            "note": RESULT_NOTICE if status == "completed" else NOTICE,
+        }
+
+    def notify_result(
+        self, task: TaskRecord, status: str, booking_code: str | None = None
+    ) -> bool:
+        return self._post(self.result_payload_for(task, status, booking_code))
+
     def notify(self, task: TaskRecord, stored_payload: dict[str, Any]) -> bool:
+        return self._post(self.payload_for(task, stored_payload))
+
+    def _post(self, payload: dict[str, Any]) -> bool:
         if not self.enabled:
             return False
         body = json.dumps(
-            self.payload_for(task, stored_payload),
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
