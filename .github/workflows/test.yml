@@ -28,3 +28,18 @@ jobs:
         working-directory: frontend
       - run: pnpm build
         working-directory: frontend
+
+      # A broken nginx.conf stops the frontend container from starting at all,
+      # which takes the dashboard down. Catch it here instead of on the NAS.
+      # The upstream names are mapped to loopback so config-load resolution
+      # succeeds; this checks the config, not the network.
+      - name: Validate nginx config
+        run: |
+          docker run --rm \
+            --add-host tra-sniper-api:127.0.0.1 \
+            --add-host tra-sniper-browser:127.0.0.1 \
+            -v "$PWD/frontend/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            nginx:1.29-alpine nginx -t
+
+      - name: Check the browser sidecar start script
+        run: bash -n docker/start-browser.sh
