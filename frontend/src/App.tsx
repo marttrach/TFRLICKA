@@ -73,8 +73,14 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
 
 interface BookingFormState {
   travelerId: number | null;
+  startCounty: string;
+  endCounty: string;
   startStation: string;
   endStation: string;
+  mode: "monitor_only" | "book_when_available";
+  startNow: boolean;
+  pollIntervalMinutes: number;
+  monitorUntil: string;
   rideDate: string;
   trainNumber: string;
   orderType: "BY_TRAIN_NO" | "BY_TIME";
@@ -89,8 +95,14 @@ interface BookingFormState {
 
 const defaultForm: BookingFormState = {
   travelerId: null,
+  startCounty: "臺北市",
+  endCounty: "臺中市",
   startStation: "1000-臺北",
   endStation: "3300-臺中",
+  mode: "book_when_available",
+  startNow: true,
+  pollIntervalMinutes: 5,
+  monitorUntil: "",
   rideDate: tomorrow(),
   trainNumber: "",
   orderType: "BY_TRAIN_NO",
@@ -191,6 +203,129 @@ function TravelerPanel({
   );
 }
 
+// Status is never conveyed by colour alone: each one carries its own words.
+const STATUS_TEXT: Record<string, string> = {
+  scheduled: "尚未啟動",
+  monitoring: "監控中",
+  waiting_human: "待你完成驗證",
+  completed: "已訂位",
+  cancelled: "已取消",
+  failed: "訂票失敗",
+  timeout: "逾時未完成",
+  expired: "監控已截止",
+};
+
+// Exactly one obvious button per state, so nobody has to guess.
+const PRIMARY_ACTION: Record<string, { label: string; kind: "session" | "result" | "cancel" }> = {
+  scheduled: { label: "立即開啟訂票頁", kind: "session" },
+  monitoring: { label: "立即開啟訂票頁", kind: "session" },
+  waiting_human: { label: "開啟驗證畫面", kind: "session" },
+  completed: { label: "查看訂位結果", kind: "result" },
+  failed: { label: "查看訂位結果", kind: "result" },
+  timeout: { label: "查看訂位結果", kind: "result" },
+};
+
+function nextCheckText(task: Task): string {
+  if (!task.next_check_at) return "不再查詢";
+  if (["completed", "cancelled", "expired", "failed", "timeout"].includes(task.status)) {
+    return "不再查詢";
+  }
+  if (task.status === "waiting_human") return "等待驗證中，暫停查詢";
+  return formatDate(task.next_check_at);
+}
+
+const OTHER_COUNTY = "其他";
+
+function countyOf(station: Station): string {
+  return station.county || OTHER_COUNTY;
+}
+
+function StationPicker({
+  legend,
+  stations,
+  county,
+  station,
+  searchAll,
+  onChange,
+}: {
+  legend: string;
+  stations: Station[];
+  county: string;
+  station: string;
+  searchAll: boolean;
+  onChange: (next: { county: string; station: string }) => void;
+}) {
+  // Counties come from the station data, so a county with no TRA station can
+  // never appear as an empty choice.
+  const counties = useMemo(() => {
+    const seen = new Map<string, number>();
+    stations.forEach((item) => seen.set(countyOf(item), (seen.get(countyOf(item)) ?? 0) + 1));
+    return [...seen.keys()].sort((a, b) => a.localeCompare(b, "zh-Hant"));
+  }, [stations]);
+
+  const inCounty = useMemo(
+    () => stations.filter((item) => countyOf(item) === county),
+    [stations, county],
+  );
+
+  if (searchAll) {
+    return (
+      <fieldset className="station-picker">
+        <legend>{legend}</legend>
+        <label className="wide">車站
+          <select
+            value={station}
+            onChange={(event) => {
+              const picked = stations.find((item) => item.value === event.target.value);
+              onChange({ county: picked ? countyOf(picked) : county, station: event.target.value });
+            }}
+            required
+          >
+            <option value="">請選擇車站</option>
+            {stations.map((item) => (
+              <option value={item.value} key={item.value}>{item.label}（{countyOf(item)}）</option>
+            ))}
+          </select>
+        </label>
+      </fieldset>
+    );
+  }
+
+  return (
+    <fieldset className="station-picker">
+      <legend>{legend}</legend>
+      <label>縣市
+        <select
+          value={county}
+          onChange={(event) => {
+            const nextCounty = event.target.value;
+            // Never keep a station that does not belong to the new county:
+            // a silently wrong station would be booked without the user seeing.
+            const stillValid = stations.some(
+              (item) => item.value === station && countyOf(item) === nextCounty,
+            );
+            onChange({ county: nextCounty, station: stillValid ? station : "" });
+          }}
+        >
+          {counties.map((name) => <option value={name} key={name}>{name}</option>)}
+        </select>
+      </label>
+      <label>車站
+        <select
+          value={station}
+          onChange={(event) => onChange({ county, station: event.target.value })}
+          required
+        >
+          <option value="">請選擇車站</option>
+          {inCounty.map((item) => (
+            <option value={item.value} key={item.value}>{item.label}</option>
+          ))}
+        </select>
+      </label>
+    </fieldset>
+  );
+}
+
 function maskIdentity(value: string): string {
   return value.length <= 3 ? "***" : `${value.slice(0, 1)}****${value.slice(-3)}`;
 }
@@ -282,6 +417,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<MemberProfile | null>(null);
   const [travelers, setTravelers] = useState<Traveler[]>([]);
+  const [searchAllStations, setSearchAllStations] = useState(false);
   const [stations, setStations] = useState<Station[]>([]);
   const [times, setTimes] = useState<string[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -383,9 +519,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         }
       }
       await api.createTask(token, {
-        scheduled_at: new Date(form.scheduledAt).toISOString(),
+        scheduled_at: new Date(form.startNow ? Date.now() : new Date(form.scheduledAt)).toISOString(),
         use_saved_member_login: form.useSavedMemberLogin,
         traveler_id: form.travelerId,
+        mode: form.mode,
+        poll_interval_seconds: form.pollIntervalMinutes * 60,
+        monitor_until: form.monitorUntil ? new Date(form.monitorUntil).toISOString() : null,
         booking: {
           identity_type: "PERSON_ID",
           start_station: form.startStation,
@@ -410,6 +549,27 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       setError(reason instanceof Error ? reason.message : "無法建立任務");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function runPrimaryAction(task: Task) {
+    const action = PRIMARY_ACTION[task.status];
+    if (!action) return;
+    setError("");
+    try {
+      if (action.kind === "session") {
+        const session = await api.startBookingSession(token, task.id);
+        setNotice(session.notice);
+        window.open(session.session_url, "_blank", "noreferrer");
+      } else {
+        const result = await api.bookingResult(token, task.id);
+        setNotice(result.booking_code
+          ? `訂位代碼 ${result.booking_code}`
+          : `狀態：${STATUS_TEXT[result.status] ?? result.status}${result.message ? `／${result.message}` : ""}`);
+      }
+      await loadTasks();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法完成操作");
     }
   }
 
@@ -460,10 +620,10 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           }} />
           {profile && <MemberProfilePanel token={token} profile={profile} onSaved={(saved) => {
             setProfile(saved);
-            setForm((current) => ({ ...current, identity: saved.identity, useSavedMemberLogin: saved.has_member_password }));
+            setForm((current) => ({ ...current, useSavedMemberLogin: saved.has_member_password }));
           }} />}
           <section className="panel booking-panel">
-            <div className="panel-heading"><div><span className="step">02</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
+            <div className="panel-heading"><div><span className="step">03</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
             <form className="booking-form" onSubmit={createTask}>
               <fieldset className="mode-switch wide">
                 <legend>查詢方式</legend>
@@ -480,9 +640,40 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               {profile?.has_member_password && (
                 <label className="member-login-option wide"><input type="checkbox" checked={form.useSavedMemberLogin} onChange={(event) => setForm({ ...form, useSavedMemberLogin: event.target.checked })} /> 購票前先帶入已保存的台鐵會員帳密</label>
               )}
-              <label>出發站<select value={form.startStation} onChange={(e) => setForm({ ...form, startStation: e.target.value })}>{stations.map((station) => <option value={station.value} key={station.value}>{station.value}</option>)}</select></label>
-              <button type="button" className="swap" aria-label="交換出發站與抵達站" onClick={() => setForm({ ...form, startStation: form.endStation, endStation: form.startStation })}>⇄</button>
-              <label>抵達站<select value={form.endStation} onChange={(e) => setForm({ ...form, endStation: e.target.value })}>{stations.map((station) => <option value={station.value} key={station.value}>{station.value}</option>)}</select></label>
+              <div className="wide station-block">
+                <label className="search-all-toggle">
+                  <input type="checkbox" checked={searchAllStations} onChange={(e) => setSearchAllStations(e.target.checked)} />
+                  搜尋全部車站（熟悉站名時不必先選縣市）
+                </label>
+                <StationPicker
+                  legend="出發"
+                  stations={stations}
+                  county={form.startCounty}
+                  station={form.startStation}
+                  searchAll={searchAllStations}
+                  onChange={({ county, station }) => setForm({ ...form, startCounty: county, startStation: station })}
+                />
+                <button
+                  type="button"
+                  className="swap wide"
+                  aria-label="交換出發與抵達"
+                  onClick={() => setForm({
+                    ...form,
+                    startCounty: form.endCounty,
+                    startStation: form.endStation,
+                    endCounty: form.startCounty,
+                    endStation: form.startStation,
+                  })}
+                >⇄ 交換出發／抵達</button>
+                <StationPicker
+                  legend="抵達"
+                  stations={stations}
+                  county={form.endCounty}
+                  station={form.endStation}
+                  searchAll={searchAllStations}
+                  onChange={({ county, station }) => setForm({ ...form, endCounty: county, endStation: station })}
+                />
+              </div>
               <label>乘車日期<input type="date" value={form.rideDate} onChange={(e) => setForm({ ...form, rideDate: e.target.value })} required /></label>
               {form.orderType === "BY_TRAIN_NO" ? (
                 <label>車次<input inputMode="numeric" pattern="[0-9]+" value={form.trainNumber} onChange={(e) => setForm({ ...form, trainNumber: e.target.value })} placeholder="例如 110" required /></label>
@@ -498,7 +689,31 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 </>
               )}
               <label>一般座票數<select value={form.quantity} onChange={(e) => setForm({ ...form, quantity: Number(e.target.value) })}>{[1, 2, 3, 4, 5, 6].map((value) => <option key={value}>{value}</option>)}</select></label>
-              <label className="wide">排程觸發時間<input type="datetime-local" value={form.scheduledAt} onChange={(e) => setForm({ ...form, scheduledAt: e.target.value })} required /></label>
+              <fieldset className="mode-switch wide">
+                <legend>執行模式</legend>
+                <label><input type="radio" checked={form.mode === "monitor_only"} onChange={() => setForm({ ...form, mode: "monitor_only" })} /> 只監控，到點提醒我</label>
+                <label><input type="radio" checked={form.mode === "book_when_available"} onChange={() => setForm({ ...form, mode: "book_when_available" })} /> 到點就準備訂票頁</label>
+              </fieldset>
+              <fieldset className="mode-switch wide">
+                <legend>開始時間</legend>
+                <label><input type="radio" checked={form.startNow} onChange={() => setForm({ ...form, startNow: true })} /> 立即開始</label>
+                <label><input type="radio" checked={!form.startNow} onChange={() => setForm({ ...form, startNow: false })} /> 指定時間</label>
+              </fieldset>
+              {!form.startNow && (
+                <label className="wide">開始監控時間<input type="datetime-local" value={form.scheduledAt} onChange={(e) => setForm({ ...form, scheduledAt: e.target.value })} required /></label>
+              )}
+              <label>查詢間隔
+                <select value={form.pollIntervalMinutes} onChange={(e) => setForm({ ...form, pollIntervalMinutes: Number(e.target.value) })}>
+                  {[1, 3, 5, 10, 15, 30, 60].map((minutes) => (
+                    <option value={minutes} key={minutes}>{minutes} 分鐘</option>
+                  ))}
+                </select>
+              </label>
+              <label>監控截止時間<input type="datetime-local" value={form.monitorUntil} onChange={(e) => setForm({ ...form, monitorUntil: e.target.value })} /></label>
+              <p className="wide privacy-note">
+                系統<strong>無法得知任何車次是否有位</strong>：台鐵餘票沒有可用的官方開放資料來源。
+                監控只負責在你設定的時間把訂票頁準備好，是否訂得到仍取決於當下的實際餘位。
+              </p>
               {error && <p className="error wide" role="alert">{error}</p>}
               {notice && <p className="notice wide" role="status">{notice}</p>}
               <button className="primary wide" disabled={busy}>{busy ? "建立中…" : "加入任務佇列"}</button>
@@ -526,16 +741,36 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           </div>
 
           <section className="panel task-panel">
-            <div className="panel-heading"><div><span className="step">03</span><h2>任務佇列</h2></div><button className="text-button" onClick={loadTasks}>重新整理</button></div>
+            <div className="panel-heading"><div><span className="step">04</span><h2>任務佇列</h2></div><button className="text-button" onClick={loadTasks}>重新整理</button></div>
             <div className="task-list">
               {tasks.length === 0 && <div className="empty"><b>尚無任務</b><p>建立第一個訂票條件後，狀態會顯示在這裡。</p></div>}
               {tasks.map((task) => (
                 <article id={`task-${task.id}`} className={`task-card${task.id === linkedTaskId ? " task-card-linked" : ""}`} key={task.id}>
-                  <div className="task-main"><span className={`status status-${task.status}`}>{task.status === "waiting_human" ? "需要人工" : task.status === "scheduled" ? "排程中" : task.status}</span><h3>{task.route}</h3><p>{task.ride_date} · {task.order_type === "BY_TRAIN_NO" ? "依車次" : "依時段"}</p></div>
-                  <div className="task-time"><span>觸發</span><b>{formatDate(task.scheduled_at)}</b></div>
+                  <div className="task-main">
+                    <span className={`status status-${task.status}`}>{STATUS_TEXT[task.status] ?? task.status}</span>
+                    <h3>{task.route}</h3>
+                    <p>{task.ride_date} · {task.order_type === "BY_TRAIN_NO" ? "依車次" : "依時段"} · {task.mode === "monitor_only" ? "只監控" : "到點準備訂票"}</p>
+                    {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
+                  </div>
+                  <dl className="task-time">
+                    <div><dt>開始監控</dt><dd>{formatDate(task.monitor_start_at)}</dd></div>
+                    <div><dt>上次查詢</dt><dd>{task.last_checked_at ? formatDate(task.last_checked_at) : "尚未查詢"}</dd></div>
+                    <div><dt>下次查詢</dt><dd>{nextCheckText(task)}</dd></div>
+                    <div><dt>餘票資料</dt><dd className="unknown">未提供</dd></div>
+                  </dl>
                   <div className="task-actions">
-                    {task.status === "waiting_human" && <button className="primary compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
-                    {["scheduled", "waiting_human"].includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>取消</button>}
+                    <button className="primary" onClick={() => runPrimaryAction(task)} disabled={!PRIMARY_ACTION[task.status]}>
+                      {PRIMARY_ACTION[task.status]?.label ?? "無可用操作"}
+                    </button>
+                    <details className="task-details">
+                      <summary>查看詳情</summary>
+                      <p>查詢間隔：每 {Math.round(task.poll_interval_seconds / 60)} 分鐘</p>
+                      <p>監控截止：{task.monitor_until ? formatDate(task.monitor_until) : "未設定（單次執行）"}</p>
+                      <p className="unknown">{task.availability_note}</p>
+                      {task.last_error && <p className="error">最近錯誤：{task.last_error}</p>}
+                      {task.status === "waiting_human" && <button className="compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
+                      {["scheduled", "monitoring", "waiting_human"].includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>停止並取消任務</button>}
+                    </details>
                   </div>
                   {task.status === "waiting_human" && waitingSuggestions[task.id] && (
                     <div className="offline-candidates">

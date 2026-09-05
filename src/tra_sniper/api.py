@@ -24,7 +24,15 @@ from .logging_config import configure_logging
 from .models import BOOKING_TIME_LABELS, BookingRequest
 from .ocr import MAX_IMAGE_BYTES, OcrService
 from .scheduler import TaskScheduler
-from .storage import Database, TaskRecord, UserRecord
+from .storage import (
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    MIN_POLL_INTERVAL_SECONDS,
+    MODE_BOOK_WHEN_AVAILABLE,
+    TASK_MODES,
+    Database,
+    TaskRecord,
+    UserRecord,
+)
 from .suggestions import SuggestionService
 from .tdx import TdxClient, TdxError
 from .tra_ocr import TraOcrService
@@ -67,12 +75,20 @@ class UserResponse(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    # When monitoring starts. Named scheduled_at since before monitoring
+    # existed; it has always been a start time, never an interval.
     scheduled_at: datetime
     booking: dict[str, Any]
     use_saved_member_login: bool = False
     # Preferred over sending the identity in `booking`: the number is looked up
     # server-side so it never has to round-trip through the browser.
     traveler_id: int | None = None
+    mode: str = MODE_BOOK_WHEN_AVAILABLE
+    poll_interval_seconds: int = Field(
+        default=DEFAULT_POLL_INTERVAL_SECONDS, ge=MIN_POLL_INTERVAL_SECONDS, le=86_400
+    )
+    # Omitted means the old one-shot behaviour: fire once, never repeat.
+    monitor_until: datetime | None = None
 
 
 class TravelerCreate(BaseModel):
@@ -91,12 +107,24 @@ class TaskResponse(BaseModel):
     id: str
     status: str
     scheduled_at: str
+    monitor_start_at: str
     route: str
     ride_date: str
     order_type: str
     created_at: str
     updated_at: str
     last_error: str | None
+    booking_code: str | None = None
+    mode: str = MODE_BOOK_WHEN_AVAILABLE
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    monitor_until: str | None = None
+    last_checked_at: str | None = None
+    next_check_at: str | None = None
+    # No authorised TRA seat-availability source exists (PLAN.md 7.1), so this
+    # is always "unknown". It is a field rather than a silence so the UI has to
+    # say so out loud instead of implying a seat was found.
+    availability: str = "unknown"
+    availability_note: str = "餘票資料來源尚未提供，系統無法得知是否有位"
 
 
 class MemberProfileUpdate(BaseModel):
@@ -163,26 +191,30 @@ class SuggestionRequest(BaseModel):
     preferences: SuggestionPreferences = Field(default_factory=SuggestionPreferences)
 
 
+# Offline fallback used when TDX has never been reachable. Counties are filled
+# in so the two-level picker still works without credentials.
 POPULAR_STATIONS = [
-    {"value": "0900-基隆", "label": "基隆"},
-    {"value": "1000-臺北", "label": "臺北"},
-    {"value": "1020-板橋", "label": "板橋"},
-    {"value": "1080-桃園", "label": "桃園"},
-    {"value": "1210-新竹", "label": "新竹"},
-    {"value": "3340-新烏日", "label": "新烏日"},
-    {"value": "3300-臺中", "label": "臺中"},
-    {"value": "3360-彰化", "label": "彰化"},
-    {"value": "4080-嘉義", "label": "嘉義"},
-    {"value": "4220-臺南", "label": "臺南"},
-    {"value": "4340-新左營", "label": "新左營"},
-    {"value": "4400-高雄", "label": "高雄"},
-    {"value": "7000-花蓮", "label": "花蓮"},
-    {"value": "6000-臺東", "label": "臺東"},
+    {"value": "0900-基隆", "label": "基隆", "county": "基隆市"},
+    {"value": "1000-臺北", "label": "臺北", "county": "臺北市"},
+    {"value": "1020-板橋", "label": "板橋", "county": "新北市"},
+    {"value": "1080-桃園", "label": "桃園", "county": "桃園市"},
+    {"value": "1210-新竹", "label": "新竹", "county": "新竹市"},
+    {"value": "3340-新烏日", "label": "新烏日", "county": "臺中市"},
+    {"value": "3300-臺中", "label": "臺中", "county": "臺中市"},
+    {"value": "3360-彰化", "label": "彰化", "county": "彰化縣"},
+    {"value": "4080-嘉義", "label": "嘉義", "county": "嘉義市"},
+    {"value": "4220-臺南", "label": "臺南", "county": "臺南市"},
+    {"value": "4340-新左營", "label": "新左營", "county": "高雄市"},
+    {"value": "4400-高雄", "label": "高雄", "county": "高雄市"},
+    {"value": "7000-花蓮", "label": "花蓮", "county": "花蓮縣"},
+    {"value": "6000-臺東", "label": "臺東", "county": "臺東縣"},
 ]
 
 
 def _task_response(task: TaskRecord) -> TaskResponse:
-    return TaskResponse(**asdict(task))
+    data = asdict(task)
+    data.pop("check_failures", None)
+    return TaskResponse(monitor_start_at=task.scheduled_at, **data)
 
 
 def _cors_origins() -> list[str]:
@@ -441,11 +473,28 @@ def create_app(
             raise HTTPException(status_code=422, detail="scheduled_at must include a timezone")
         if scheduled_at.astimezone(UTC) < datetime.now(UTC):
             raise HTTPException(status_code=422, detail="scheduled_at cannot be in the past")
+        if body.mode not in TASK_MODES:
+            raise HTTPException(
+                status_code=422, detail=f"mode must be one of: {', '.join(sorted(TASK_MODES))}"
+            )
+        monitor_until = body.monitor_until
+        if monitor_until is not None:
+            if monitor_until.tzinfo is None:
+                raise HTTPException(
+                    status_code=422, detail="monitor_until must include a timezone"
+                )
+            if monitor_until <= scheduled_at:
+                raise HTTPException(
+                    status_code=422, detail="monitor_until must be after the start time"
+                )
         task = db.create_task(
             user.id,
             booking,
             scheduled_at.astimezone(UTC).isoformat(),
             booking_payload,
+            mode=body.mode,
+            poll_interval_seconds=body.poll_interval_seconds,
+            monitor_until=monitor_until.astimezone(UTC).isoformat() if monitor_until else None,
         )
         return _task_response(task)
 
@@ -639,6 +688,12 @@ def create_app(
                 last_error=finished.message if finished.status != "completed" else None,
                 booking_code=finished.booking_code,
             )
+            # Only an abandoned attempt goes back in the poll loop. "failed" and
+            # "timeout" both mean the official result is unconfirmed, and
+            # resuming would risk booking the same seat twice; the person
+            # restarts those after checking on the official site.
+            if finished.status == "cancelled":
+                db.resume_monitoring(finished.task_id, finished.user_id)
             record = db.get_task(finished.task_id, finished.user_id)
             if record and scheduler.notifier.enabled:
                 try:

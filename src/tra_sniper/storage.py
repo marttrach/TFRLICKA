@@ -29,6 +29,30 @@ class UserRecord:
     token_version: int
 
 
+# Monitoring is a poll loop, not a promise of seats: TDX exposes no TRA seat
+# availability (PLAN.md 7.1), so a check can report a timetable change or that a
+# task is ready for a person, never "there is a seat". See PLAN.md section 13.
+MODE_MONITOR_ONLY = "monitor_only"
+MODE_BOOK_WHEN_AVAILABLE = "book_when_available"
+TASK_MODES = frozenset({MODE_MONITOR_ONLY, MODE_BOOK_WHEN_AVAILABLE})
+
+DEFAULT_POLL_INTERVAL_SECONDS = 300
+MIN_POLL_INTERVAL_SECONDS = 60
+MAX_BACKOFF_MULTIPLIER = 8
+
+# Statuses the poll loop may claim from. Everything else — a live booking
+# session, a finished task — is deliberately excluded so polling can never
+# reopen a browser behind the person's back.
+POLLABLE_STATUSES = ("scheduled", "monitoring")
+
+TASK_COLUMNS = (
+    "id, user_id, status, scheduled_at, route, ride_date, order_type, "
+    "created_at, updated_at, last_error, booking_code, mode, "
+    "poll_interval_seconds, monitor_until, last_checked_at, next_check_at, "
+    "check_failures"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class TaskRecord:
     id: str
@@ -42,6 +66,17 @@ class TaskRecord:
     updated_at: str
     last_error: str | None
     booking_code: str | None = None
+    mode: str = MODE_BOOK_WHEN_AVAILABLE
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    monitor_until: str | None = None
+    last_checked_at: str | None = None
+    next_check_at: str | None = None
+    check_failures: int = 0
+
+    @property
+    def monitor_start_at(self) -> str:
+        """`scheduled_at` has always meant "when to start"; this names it."""
+        return self.scheduled_at
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +193,26 @@ class Database:
             }
             if "booking_code" not in task_columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN booking_code TEXT")
+            # Monitoring columns. `scheduled_at` keeps its original meaning as
+            # the start time, so existing one-shot tasks stay correct: they get
+            # a NULL monitor_until and simply stop after their first check.
+            for column, ddl in (
+                ("mode", f"TEXT NOT NULL DEFAULT '{MODE_BOOK_WHEN_AVAILABLE}'"),
+                (
+                    "poll_interval_seconds",
+                    f"INTEGER NOT NULL DEFAULT {DEFAULT_POLL_INTERVAL_SECONDS}",
+                ),
+                ("monitor_until", "TEXT"),
+                ("last_checked_at", "TEXT"),
+                ("next_check_at", "TEXT"),
+                ("check_failures", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in task_columns:
+                    connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ddl}")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_next_check "
+                "ON tasks(next_check_at) WHERE status IN ('scheduled', 'monitoring')"
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_user_created "
                 "ON tasks(user_id, created_at DESC)"
@@ -483,6 +538,10 @@ class Database:
         request: BookingRequest,
         scheduled_at: str,
         payload: dict[str, Any],
+        *,
+        mode: str = MODE_BOOK_WHEN_AVAILABLE,
+        poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
+        monitor_until: str | None = None,
     ) -> TaskRecord:
         task_id = str(uuid.uuid4())
         now = utc_now()
@@ -492,8 +551,9 @@ class Database:
                 """
                 INSERT INTO tasks(
                     id, user_id, status, scheduled_at, payload, route, ride_date,
-                    order_type, created_at, updated_at
-                ) VALUES (?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?)
+                    order_type, created_at, updated_at,
+                    mode, poll_interval_seconds, monitor_until, next_check_at
+                ) VALUES (?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -505,6 +565,11 @@ class Database:
                     request.order_type.value,
                     now,
                     now,
+                    mode,
+                    max(int(poll_interval_seconds), MIN_POLL_INTERVAL_SECONDS),
+                    monitor_until,
+                    # The first check is due when monitoring starts, not now.
+                    scheduled_at if monitor_until else None,
                 ),
             )
         task = self.get_task(task_id, user_id)
@@ -515,11 +580,8 @@ class Database:
     def list_tasks(self, user_id: int) -> list[TaskRecord]:
         with self.connect() as connection:
             rows = connection.execute(
-                """
-                SELECT id, user_id, status, scheduled_at, route, ride_date, order_type,
-                       created_at, updated_at, last_error, booking_code
-                FROM tasks WHERE user_id = ? ORDER BY created_at DESC
-                """,
+                                f"SELECT {TASK_COLUMNS} FROM tasks "
+                "WHERE user_id = ? ORDER BY created_at DESC",
                 (user_id,),
             ).fetchall()
         return [TaskRecord(**dict(row)) for row in rows]
@@ -527,11 +589,7 @@ class Database:
     def get_task(self, task_id: str, user_id: int) -> TaskRecord | None:
         with self.connect() as connection:
             row = connection.execute(
-                """
-                SELECT id, user_id, status, scheduled_at, route, ride_date, order_type,
-                       created_at, updated_at, last_error, booking_code
-                FROM tasks WHERE id = ? AND user_id = ?
-                """,
+                                f"SELECT {TASK_COLUMNS} FROM tasks WHERE id = ? AND user_id = ?",
                 (task_id, user_id),
             ).fetchone()
         return TaskRecord(**dict(row)) if row else None
@@ -568,18 +626,140 @@ class Database:
             )
         return cursor.rowcount == 1
 
+    def claim_due_checks(self, now: str | None = None, *, limit: int = 20) -> list[TaskRecord]:
+        """Take ownership of every task due for a check, atomically.
+
+        The same statement that selects a task also pushes `next_check_at`
+        forward, so a second caller arriving concurrently matches nothing. That
+        is what stops a task from being checked twice at once, and it holds
+        across a restart because the guard lives in the row, not in memory.
+        """
+        moment = now or utc_now()
+        # Timestamps are computed here rather than with SQLite's datetime(),
+        # which returns "YYYY-MM-DD HH:MM:SS" with no offset. Mixing that with
+        # the ISO-8601 strings the rest of the schema stores makes the string
+        # comparisons in the WHERE clause silently wrong.
+        base = datetime.fromisoformat(moment)
+        claimed: list[TaskRecord] = []
+        with self.connect() as connection:
+            candidates = connection.execute(
+                f"""
+                SELECT {TASK_COLUMNS} FROM tasks
+                WHERE status IN ('scheduled', 'monitoring')
+                  AND scheduled_at <= ?
+                  AND (next_check_at IS NULL OR next_check_at <= ?)
+                  AND monitor_until IS NOT NULL
+                  AND monitor_until > ?
+                ORDER BY next_check_at
+                LIMIT ?
+                """,
+                (moment, moment, moment, limit),
+            ).fetchall()
+            for row in candidates:
+                interval = int(row["poll_interval_seconds"])
+                following = (base + timedelta(seconds=interval)).isoformat()
+                # Compare-and-swap: the UPDATE repeats the claim condition, so a
+                # caller that lost the race updates nothing and skips the task.
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'monitoring', last_checked_at = ?, next_check_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status IN ('scheduled', 'monitoring')
+                      AND (next_check_at IS NULL OR next_check_at <= ?)
+                    """,
+                    (moment, following, moment, row["id"], moment),
+                )
+                if cursor.rowcount == 1:
+                    data = dict(row)
+                    data.update(
+                        status="monitoring", last_checked_at=moment, next_check_at=following
+                    )
+                    claimed.append(TaskRecord(**data))
+        return claimed
+
+    def record_check_failure(self, task_id: str, user_id: int, error: str) -> int:
+        """Back off exponentially so a broken upstream is not hammered."""
+        now = utc_now()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT check_failures, poll_interval_seconds FROM tasks "
+                "WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            ).fetchone()
+            if row is None:
+                return 0
+            failures = min(int(row["check_failures"]) + 1, MAX_BACKOFF_MULTIPLIER)
+            delay = int(row["poll_interval_seconds"]) * (2**failures)
+            connection.execute(
+                "UPDATE tasks SET check_failures = ?, last_error = ?, next_check_at = ?, "
+                "updated_at = ? WHERE id = ? AND user_id = ?",
+                (
+                    failures,
+                    error[:500],
+                    (datetime.fromisoformat(now) + timedelta(seconds=delay)).isoformat(),
+                    now,
+                    task_id,
+                    user_id,
+                ),
+            )
+        return failures
+
+    def clear_check_failures(self, task_id: str, user_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET check_failures = 0 WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            )
+
+    def expire_finished_monitors(self, now: str | None = None) -> list[TaskRecord]:
+        """Stop tasks whose monitor window has closed."""
+        moment = now or utc_now()
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                UPDATE tasks SET status = 'expired', updated_at = ?
+                WHERE status IN ('scheduled', 'monitoring')
+                  AND monitor_until IS NOT NULL AND monitor_until <= ?
+                RETURNING {TASK_COLUMNS}
+                """,
+                (moment, moment),
+            ).fetchall()
+        return [TaskRecord(**dict(row)) for row in rows]
+
+    def pause_monitoring(self, task_id: str, user_id: int, status: str) -> bool:
+        """Move a task out of the pollable states so no check can claim it."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND status IN ('scheduled', 'monitoring')",
+                (status, utc_now(), task_id, user_id),
+            )
+        return cursor.rowcount == 1
+
+    def resume_monitoring(self, task_id: str, user_id: int) -> bool:
+        """Put a task back in the poll loop after an abandoned attempt."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET status = 'monitoring', next_check_at = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND monitor_until > ?",
+                (utc_now(), utc_now(), task_id, user_id, utc_now()),
+            )
+        return cursor.rowcount == 1
+
     def promote_due_tasks(self, now: str | None = None) -> int:
         return len(self.promote_due_task_records(now))
 
     def promote_due_task_records(self, now: str | None = None) -> list[TaskRecord]:
+        """One-shot promotion, kept for tasks created before monitoring existed."""
         updated_at = utc_now()
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 UPDATE tasks SET status = 'waiting_human', updated_at = ?
                 WHERE status = 'scheduled' AND scheduled_at <= ?
-                RETURNING id, user_id, status, scheduled_at, route, ride_date, order_type,
-                          created_at, updated_at, last_error, booking_code
+                      AND next_check_at IS NULL AND monitor_until IS NULL
+                RETURNING {TASK_COLUMNS}
                 """,
                 (updated_at, now or updated_at),
             ).fetchall()

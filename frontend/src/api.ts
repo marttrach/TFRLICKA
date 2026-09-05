@@ -7,18 +7,38 @@ export interface User {
 export interface Station {
   value: string;
   label: string;
+  county: string;
 }
+
+export type TaskStatus =
+  | "scheduled"
+  | "monitoring"
+  | "waiting_human"
+  | "cancelled"
+  | "completed"
+  | "failed"
+  | "timeout"
+  | "expired";
 
 export interface Task {
   id: string;
-  status: "scheduled" | "waiting_human" | "cancelled" | "completed" | "failed";
+  status: TaskStatus;
   scheduled_at: string;
+  monitor_start_at: string;
   route: string;
   ride_date: string;
   order_type: string;
   created_at: string;
   updated_at: string;
   last_error: string | null;
+  booking_code: string | null;
+  mode: "monitor_only" | "book_when_available";
+  poll_interval_seconds: number;
+  monitor_until: string | null;
+  last_checked_at: string | null;
+  next_check_at: string | null;
+  availability: string;
+  availability_note: string;
 }
 
 export interface MemberProfile {
@@ -141,6 +161,14 @@ export const api = {
   },
   createTask(token: string, payload: unknown) {
     return request<Task>("/tasks", { method: "POST", body: JSON.stringify(payload) }, token);
+  },
+  startBookingSession(token: string, taskId: string) {
+    return request<{ task_id: string; session_url: string; expires_at: string; notice: string }>(
+      `/tasks/${taskId}/booking-session`, { method: "POST" }, token);
+  },
+  bookingResult(token: string, taskId: string) {
+    return request<{ task_id: string; status: string; booking_code: string | null; message: string }>(
+      `/tasks/${taskId}/booking-result`, {}, token);
   },
   cancelTask(token: string, taskId: string) {
     return request<void>(`/tasks/${taskId}/cancel`, { method: "POST" }, token);

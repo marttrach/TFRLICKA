@@ -16,7 +16,20 @@ class FakeTransport:
             assert form["client_secret"] == "secret"
             return {"access_token": "token", "expires_in": 3600}
         if url.endswith("/Station"):
-            return {"Stations": [{"StationID": "1000", "StationName": {"Zh_tw": "臺北"}}]}
+            return {
+                "Stations": [
+                    {
+                        "StationID": "1000",
+                        "StationName": {"Zh_tw": "臺北"},
+                        "LocationCity": "臺北市",
+                    },
+                    {
+                        "StationID": "1020",
+                        "StationName": {"Zh_tw": "板橋"},
+                        "StationAddress": "新北市板橋區縣民大道二段7號",
+                    },
+                ]
+            }
         if self.timetable_failures:
             self.timetable_failures -= 1
             raise HttpError(429)
@@ -60,9 +73,16 @@ def test_station_cache_and_unconfigured_fallback(tmp_path) -> None:
         data_dir=tmp_path,
         transport=transport,
     )
-    assert client.fetch_stations() == [{"value": "1000-臺北", "label": "臺北"}]
-    assert json.loads((tmp_path / "stations.json").read_text(encoding="utf-8"))[0]["label"] == "臺北"
+    fetched = client.fetch_stations()
+    assert fetched == [
+        {"value": "1000-臺北", "label": "臺北", "county": "臺北市"},
+        # No LocationCity, so the county comes from the address prefix.
+        {"value": "1020-板橋", "label": "板橋", "county": "新北市"},
+    ]
+    cached = json.loads((tmp_path / "stations.json").read_text(encoding="utf-8"))
+    assert cached[0]["label"] == "臺北"
+    assert cached[0]["county"] == "臺北市"
 
-    fallback = [{"value": "3300-臺中", "label": "臺中"}]
+    fallback = [{"value": "3300-臺中", "label": "臺中", "county": "臺中市"}]
     offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path / "empty")
     assert offline.stations(fallback) == fallback

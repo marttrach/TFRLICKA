@@ -56,6 +56,21 @@ class UrllibTransport:
             raise TdxError("TDX is temporarily unavailable") from exc
 
 
+def _county_of(record: dict[str, Any]) -> str:
+    """Read the station's county from TDX, falling back to its address prefix."""
+    city = record.get("LocationCity")
+    if isinstance(city, str) and city.strip():
+        return city.strip()
+    address = record.get("StationAddress")
+    if isinstance(address, str):
+        # Addresses start with the county, e.g. "臺北市中正區黎明里...".
+        for width in (3, 4):
+            head = address.strip()[:width]
+            if head.endswith(("市", "縣")):
+                return head
+    return ""
+
+
 @dataclass(slots=True)
 class CacheEntry:
     value: Any
@@ -172,7 +187,17 @@ class TdxClient:
             name_value = record.get("StationName", {})
             name = name_value.get("Zh_tw", "") if isinstance(name_value, dict) else ""
             if station_id and name:
-                stations.append({"value": f"{station_id}-{name}", "label": str(name)})
+                stations.append(
+                    {
+                        "value": f"{station_id}-{name}",
+                        "label": str(name),
+                        # Grouping comes from the source, never guessed from the
+                        # station name: "臺北" is in 臺北市 but "新烏日" is not in
+                        # 新北市. Blank when TDX omits it, and the UI then files
+                        # the station under "其他".
+                        "county": _county_of(record),
+                    }
+                )
         if not stations:
             raise TdxError("TDX returned an empty station list")
         stations.sort(key=lambda item: item["value"])
@@ -189,8 +214,14 @@ class TdxClient:
             return []
         if not isinstance(payload, list):
             return []
+        # A cache written before counties existed simply has no "county" key;
+        # it stays usable and those stations group under "其他".
         return [
-            {"value": str(item["value"]), "label": str(item["label"])}
+            {
+                "value": str(item["value"]),
+                "label": str(item["label"]),
+                "county": str(item.get("county", "")),
+            }
             for item in payload
             if isinstance(item, dict) and item.get("value") and item.get("label")
         ]

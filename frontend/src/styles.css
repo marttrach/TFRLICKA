@@ -162,3 +162,71 @@ input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb
   .welcome-card { align-items: stretch; flex-direction: column; }
   .welcome-card a { text-align: center; }
 }
+
+/* ---------------------------------------------------------------------------
+   Mobile-first hardening. Acceptance: no horizontal page scroll at 360, 390 and
+   430 CSS px, 44px touch targets, and 16px inputs so iOS does not zoom on focus.
+   --------------------------------------------------------------------------- */
+
+.station-picker { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; border: 1px solid var(--line); padding: .7rem .8rem 1rem; margin: 0 0 .6rem; }
+.station-picker legend { font-size: .78rem; color: var(--muted); padding: 0 .3rem; }
+.station-block { display: block; }
+.search-all-toggle { display: flex; align-items: center; gap: .5rem; margin-bottom: .7rem; font-size: .82rem; }
+.search-all-toggle input { width: auto; min-height: 0; }
+
+.task-time { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .45rem .8rem; margin: 0; }
+.task-time div { min-width: 0; }
+.task-time dt { font-size: .68rem; color: var(--muted); }
+.task-time dd { margin: 0; font-size: .8rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.task-time dd.unknown, .unknown { color: var(--muted); font-style: italic; }
+.booking-code b { font-variant-numeric: tabular-nums; letter-spacing: .04em; }
+.task-details { margin-top: .6rem; font-size: .8rem; }
+.task-details summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; color: var(--blue); }
+.task-details p { margin: .3rem 0; }
+
+@media (max-width: 760px) {
+  /* Single column everywhere; nothing may exceed the viewport. */
+  .workspace { padding-left: 1rem; padding-right: 1rem; }
+  .content-grid, .left-column, .booking-form, .station-picker { grid-template-columns: 1fr; }
+  .summary-row { grid-template-columns: 1fr; }
+  .summary-row article:nth-child(3) { grid-column: auto; }
+
+  /* Cards, not a shrunken table. */
+  .task-card { display: block; padding: 1rem; }
+  .task-card > * + * { margin-top: .75rem; }
+  .task-time { grid-template-columns: 1fr 1fr; }
+  .task-actions { display: flex; flex-direction: column; align-items: stretch; gap: .5rem; }
+  .task-actions .primary { width: 100%; }
+
+  /* Touch targets and a font size iOS will not zoom into. */
+  button, input, select, .task-details summary { min-height: 44px; }
+  input, select, textarea { font-size: 16px; width: 100%; }
+  button { min-width: 44px; font-size: 15px; }
+
+  .swap { width: 100%; transform: none; }
+  .traveler-list li { flex-direction: column; align-items: stretch; gap: .6rem; }
+  .traveler-actions button { flex: 1; }
+}
+
+/* Long station names and codes must wrap rather than widen the page. */
+.task-card, .panel, .welcome-card { overflow-wrap: anywhere; }
+.workspace, .content-grid, .task-list { max-width: 100%; min-width: 0; }
+
+/* Home-screen and notched devices: keep the last control clear of the bar. */
+body { padding-bottom: env(safe-area-inset-bottom); }
+.workspace { padding-left: max(1rem, env(safe-area-inset-left)); padding-right: max(1rem, env(safe-area-inset-right)); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+/* Radio and checkbox controls default to about 13px, far under the 44px touch
+   target. The control itself is enlarged and its label is made a full-height
+   tap area, since clicking a label activates its control. */
+.mode-switch label, .member-login-option, .search-all-toggle {
+  display: flex; align-items: center; gap: .65rem; min-height: 44px;
+}
+.mode-switch input[type="radio"], input[type="checkbox"] {
+  width: 24px; height: 24px; min-height: 24px; flex: none; accent-color: var(--blue);
+}
+.mode-switch { display: grid; gap: .2rem; }

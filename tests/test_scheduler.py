@@ -4,7 +4,17 @@ import threading
 from tra_sniper.scheduler import TaskScheduler
 
 
-class FlakyDatabase:
+class QuietMonitorMixin:
+    """The monitoring queries a tick makes beyond promotion."""
+
+    def expire_finished_monitors(self) -> list[object]:
+        return []
+
+    def claim_due_checks(self) -> list[object]:
+        return []
+
+
+class FlakyDatabase(QuietMonitorMixin):
     def __init__(self) -> None:
         self.calls = 0
         self.recovered = threading.Event()
@@ -31,7 +41,7 @@ def test_scheduler_survives_a_failed_tick(caplog) -> None:
 
 
 def test_scheduler_tick_returns_promoted_count() -> None:
-    class DatabaseStub:
+    class DatabaseStub(QuietMonitorMixin):
         def promote_due_task_records(self) -> list[object]:
             return [object(), object(), object()]
 
