@@ -215,6 +215,19 @@ const STATUS_TEXT: Record<string, string> = {
   expired: "監控已截止",
 };
 
+// The four statuses browser_session.FINISHED_STATUSES can end a session with.
+const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled"];
+
+interface BookingSession {
+  taskId: string;
+  route: string;
+  url: string;
+  sessionToken: string;
+  status: string;
+  bookingCode: string | null;
+  message: string;
+}
+
 // Exactly one obvious button per state, so nobody has to guess.
 const PRIMARY_ACTION: Record<string, { label: string; kind: "session" | "result" | "cancel" }> = {
   scheduled: { label: "立即開啟訂票頁", kind: "session" },
@@ -238,6 +251,13 @@ const OTHER_COUNTY = "其他";
 
 function countyOf(station: Station): string {
   return station.county || OTHER_COUNTY;
+}
+
+// With no county data every station lands in one "其他" group, and the picker
+// falls back to the flat list. The toggle then switches between two identical
+// lists, so hide it rather than offer a control that does nothing.
+function countyGroupingAvailable(stations: Station[]): boolean {
+  return stations.some((item) => item.county);
 }
 
 function StationPicker({
@@ -268,11 +288,7 @@ function StationPicker({
     [stations, county],
   );
 
-  // If no station carries a county, a two-level picker offers one useless
-  // "其他" group. Fall back to the flat list rather than a dead-end menu.
-  const countyDataUsable = counties.length > 1 || counties[0] !== OTHER_COUNTY;
-
-  if (searchAll || !countyDataUsable) {
+  if (searchAll || !countyGroupingAvailable(stations)) {
     return (
       <fieldset className="station-picker">
         <legend>{legend}</legend>
@@ -433,6 +449,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [suggestions, setSuggestions] = useState<Suggestions | null>(null);
   const [suggestionKey, setSuggestionKey] = useState("");
   const [waitingSuggestions, setWaitingSuggestions] = useState<Record<string, Suggestions>>({});
+  const [booking, setBooking] = useState<BookingSession | null>(null);
 
   const currentSuggestionKey = [form.startStation, form.endStation, form.rideDate, form.startTime, form.endTime, form.preferReserved, form.includeTransfers].join("|");
 
@@ -479,6 +496,24 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     if (!linkedTaskId || !tasks.some((task) => task.id === linkedTaskId)) return;
     document.getElementById(`task-${linkedTaskId}`)?.scrollIntoView({ block: "center" });
   }, [linkedTaskId, tasks]);
+
+  // While the person solves the CAPTCHA in the frame, poll for the outcome so
+  // the booking code appears without them hunting for a button.
+  useEffect(() => {
+    if (!booking || FINISHED_STATUSES.includes(booking.status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const result = await api.bookingResult(token, booking.taskId);
+        setBooking((current) => current && current.taskId === result.task_id
+          ? { ...current, status: result.status, bookingCode: result.booking_code, message: result.message }
+          : current);
+        if (FINISHED_STATUSES.includes(result.status)) await loadTasks();
+      } catch {
+        // A dropped poll is not worth interrupting the person mid-verification.
+      }
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [booking, token, loadTasks]);
 
   const waiting = useMemo(() => tasks.filter((task) => task.status === "waiting_human").length, [tasks]);
   const scheduled = useMemo(() => tasks.filter((task) => task.status === "scheduled").length, [tasks]);
@@ -564,7 +599,16 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       if (action.kind === "session") {
         const session = await api.startBookingSession(token, task.id);
         setNotice(session.notice);
-        window.open(session.session_url, "_blank", "noreferrer");
+        setBooking({
+          taskId: task.id,
+          route: task.route,
+          url: session.session_url,
+          // session_url is "/booking-session/<token>/"; DELETE needs the token.
+          sessionToken: session.session_url.split("/")[2] ?? "",
+          status: "waiting_verification",
+          bookingCode: null,
+          message: "",
+        });
       } else {
         const result = await api.bookingResult(token, task.id);
         setNotice(result.booking_code
@@ -579,6 +623,16 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
 
   async function cancelTask(taskId: string) {
     await api.cancelTask(token, taskId);
+    await loadTasks();
+  }
+
+  async function closeBooking(session: BookingSession) {
+    // Closing before the official result is in means abandoning the attempt, so
+    // release the browser instead of leaving it holding the single session lock.
+    if (!FINISHED_STATUSES.includes(session.status)) {
+      await api.cancelBookingSession(token, session.sessionToken).catch(() => undefined);
+    }
+    setBooking(null);
     await loadTasks();
   }
 
@@ -645,10 +699,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 <label className="member-login-option wide"><input type="checkbox" checked={form.useSavedMemberLogin} onChange={(event) => setForm({ ...form, useSavedMemberLogin: event.target.checked })} /> 購票前先帶入已保存的台鐵會員帳密</label>
               )}
               <div className="wide station-block">
-                <label className="search-all-toggle">
-                  <input type="checkbox" checked={searchAllStations} onChange={(e) => setSearchAllStations(e.target.checked)} />
-                  搜尋全部車站（熟悉站名時不必先選縣市）
-                </label>
+                {countyGroupingAvailable(stations) && (
+                  <label className="search-all-toggle">
+                    <input type="checkbox" checked={searchAllStations} onChange={(e) => setSearchAllStations(e.target.checked)} />
+                    搜尋全部車站（熟悉站名時不必先選縣市）
+                  </label>
+                )}
                 <StationPicker
                   legend="出發"
                   stations={stations}
@@ -789,6 +845,33 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           </section>
         </div>
       </main>
+      {booking && <BookingScreen session={booking} onClose={() => void closeBooking(booking)} />}
+    </div>
+  );
+}
+
+function BookingScreen({ session, onClose }: { session: BookingSession; onClose: () => void }) {
+  const finished = FINISHED_STATUSES.includes(session.status);
+  return (
+    <div className="booking-screen" role="dialog" aria-modal="true" aria-label="訂票驗證畫面">
+      <header>
+        <div>
+          <strong>{session.route}</strong>
+          <small>{finished ? "已結束" : "請在下方畫面完成官方驗證，然後自行按下訂票"}</small>
+        </div>
+        <button onClick={onClose}>{finished ? "關閉" : "放棄這次訂票"}</button>
+      </header>
+      {finished ? (
+        <div className={`booking-outcome ${session.status}`}>
+          <b>{STATUS_TEXT[session.status] ?? session.status}</b>
+          {session.bookingCode && <p className="booking-code">訂位代碼 {session.bookingCode}</p>}
+          {session.message && <p>{session.message}</p>}
+          <p className="boundary-note">請至台鐵官網或超商於期限內完成付款取票。</p>
+        </div>
+      ) : (
+        <iframe title="台鐵訂票畫面" src={session.url} allow="clipboard-write" />
+      )}
+      <footer>驗證碼與送出都由你本人完成；系統只負責把已填好的畫面送到你面前，並在拿到訂位代碼後記錄結果。</footer>
     </div>
   );
 }

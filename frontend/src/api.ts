@@ -170,6 +170,9 @@ export const api = {
     return request<{ task_id: string; status: string; booking_code: string | null; message: string }>(
       `/tasks/${taskId}/booking-result`, {}, token);
   },
+  cancelBookingSession(token: string, sessionToken: string) {
+    return request<void>(`/booking-session/${sessionToken}`, { method: "DELETE" }, token);
+  },
   cancelTask(token: string, taskId: string) {
     return request<void>(`/tasks/${taskId}/cancel`, { method: "POST" }, token);
   },

@@ -84,6 +84,9 @@ def test_booking_session_starts_and_guards_the_stream(tmp_path) -> None:
             assert started.status_code == 201
             body = started.json()
             token = body["session_url"].strip("/").split("/")[-1]
+            # The dashboard slices the token out of this path to cancel the
+            # session, so the shape is part of the contract, not a detail.
+            assert body["session_url"] == f"/booking-session/{token}/"
 
             # The response must tell the user they still solve and submit.
             assert "不會辨識驗證碼" in body["notice"]

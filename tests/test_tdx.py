@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 
-from tra_sniper.tdx import HttpError, TdxClient
+from tra_sniper.api import POPULAR_STATIONS
+from tra_sniper.tdx import STATION_COUNTIES, HttpError, TdxClient
 
 
 class FakeTransport:
@@ -88,31 +89,54 @@ def test_station_cache_and_unconfigured_fallback(tmp_path) -> None:
     assert offline.stations(fallback) == fallback
 
 
-def test_cache_without_counties_is_refetched(tmp_path) -> None:
-    """The reported bug: an old cache made every county show as 其他.
+def test_county_less_cache_is_grouped_without_reaching_tdx(tmp_path) -> None:
+    """The reported bug: every station fell into 其他 and the picker died.
 
-    stations.json has no TTL, so a cache written before counties existed would
-    otherwise be served forever and the picker would never recover.
+    A cache written before counties existed, plus credentials that are unset or
+    broken, used to serve blank counties forever. The frontend then filed every
+    station under 其他, which collapsed the two-level picker into the same flat
+    list as the "search all stations" toggle, so that toggle did nothing.
     """
-    stale = [{"value": "1000-臺北", "label": "臺北"}]
-    (tmp_path / "stations.json").write_text(json.dumps(stale), encoding="utf-8")
-
-    transport = FakeTransport()
-    client = TdxClient(
-        client_id="id", client_secret="secret", data_dir=tmp_path, transport=transport
-    )
-    resolved = client.stations([])
-
-    assert {item["county"] for item in resolved} == {"臺北市", "新北市"}
-    # And the refreshed cache is what gets served next time, without refetching.
-    offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path)
-    assert {item["county"] for item in offline.stations([])} == {"臺北市", "新北市"}
-
-
-def test_stale_cache_is_still_served_when_refetch_is_impossible(tmp_path) -> None:
-    """Ungrouped stations beat no stations at all."""
-    stale = [{"value": "1000-臺北", "label": "臺北"}]
+    stale = [{"value": "1000-臺北", "label": "臺北"}, {"value": "4400-高雄", "label": "高雄"}]
     (tmp_path / "stations.json").write_text(json.dumps(stale), encoding="utf-8")
 
     offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path)
-    assert offline.stations([]) == [{"value": "1000-臺北", "label": "臺北", "county": ""}]
+    assert offline.stations([]) == [
+        {"value": "1000-臺北", "label": "臺北", "county": "臺北市"},
+        {"value": "4400-高雄", "label": "高雄", "county": "高雄市"},
+    ]
+
+
+def test_shipped_county_wins_over_tdx(tmp_path) -> None:
+    """TDX renaming or emptying its county field cannot break the picker."""
+    cache = [{"value": "1000-臺北", "label": "臺北", "county": ""}]
+    (tmp_path / "stations.json").write_text(json.dumps(cache), encoding="utf-8")
+
+    offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path)
+    assert offline.stations([])[0]["county"] == "臺北市"
+
+
+def test_station_opened_after_the_table_keeps_the_tdx_county(tmp_path) -> None:
+    cache = [{"value": "9999-新站", "label": "新站", "county": "宜蘭縣"}]
+    (tmp_path / "stations.json").write_text(json.dumps(cache), encoding="utf-8")
+
+    offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path)
+    assert offline.stations([])[0]["county"] == "宜蘭縣"
+
+
+def test_shipped_counties_match_the_hand_written_ones() -> None:
+    """The shipped table is scraped data, so anchor it to values written by hand.
+
+    These fourteen span every region, so a mis-parsed table cannot pass.
+    """
+    for station in POPULAR_STATIONS:
+        station_id = station["value"].split("-", 1)[0]
+        assert STATION_COUNTIES[station_id] == station["county"], station["label"]
+
+
+def test_shipped_counties_are_well_formed() -> None:
+    assert len(STATION_COUNTIES) > 200
+    assert all(key.isdigit() and len(key) == 4 for key in STATION_COUNTIES)
+    # Taiwan has 22 divisions; the four with no TRA line must not appear.
+    assert all(value.endswith(("市", "縣")) for value in STATION_COUNTIES.values())
+    assert not {"南投縣", "澎湖縣", "金門縣", "連江縣"} & set(STATION_COUNTIES.values())

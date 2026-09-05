@@ -230,3 +230,38 @@ body { padding-bottom: env(safe-area-inset-bottom); }
   width: 24px; height: 24px; min-height: 24px; flex: none; accent-color: var(--blue);
 }
 .mode-switch { display: grid; gap: .2rem; }
+
+/* The remote browser is a 1280x1024 desktop screen, so it needs the whole
+   viewport rather than a box inside the task card, especially on a phone. */
+.booking-screen {
+  position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column;
+  background: #0d1b2a; color: #fff;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.booking-screen header {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: .8rem max(1rem, env(safe-area-inset-left));
+  background: rgba(255, 255, 255, .08);
+}
+.booking-screen header strong { display: block; font-size: 1.05rem; }
+.booking-screen header small { color: #c9d6e4; }
+.booking-screen header button {
+  min-height: 44px; flex: none; background: #fff; color: #0d1b2a;
+  border: 0; border-radius: 8px; padding: 0 1rem; font-weight: 600;
+}
+.booking-screen iframe { flex: 1; width: 100%; border: 0; background: #000; }
+.booking-screen footer {
+  padding: .7rem max(1rem, env(safe-area-inset-left)); font-size: .85rem; color: #c9d6e4;
+}
+.booking-outcome {
+  flex: 1; display: flex; flex-direction: column; justify-content: center;
+  gap: .8rem; padding: 2rem max(1rem, env(safe-area-inset-left)); text-align: center;
+}
+.booking-outcome b { font-size: 1.6rem; }
+.booking-outcome.completed b { color: #7ee787; }
+.booking-outcome.failed b, .booking-outcome.timeout b { color: #ffb4a2; }
+.booking-code {
+  font-size: 1.8rem; font-weight: 700; letter-spacing: .12em;
+  overflow-wrap: anywhere;
+}
+.boundary-note { color: #c9d6e4; font-size: .9rem; }

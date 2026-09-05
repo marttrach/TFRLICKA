@@ -14,6 +14,17 @@ from typing import Any, Protocol
 TOKEN_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
 API_ROOT = "https://tdx.transportdata.tw/api/basic/v3/Rail/TRA"
 
+# Which county a station sits in never changes, so it is shipped rather than
+# fetched: reading it from TDX made the picker depend on credentials being set,
+# on a cache being fresh, and on a field name we could not verify, and any one
+# of those failing silently emptied every county. Derived from
+# https://zh.wikipedia.org/wiki/臺灣鐵路車站列表 on 2026-09-05 and cross-checked
+# against POPULAR_STATIONS by test_shipped_counties_match_the_hand_written_ones.
+# Regenerate only when a new station opens.
+STATION_COUNTIES: dict[str, str] = json.loads(
+    (Path(__file__).with_name("station_counties.json")).read_text(encoding="utf-8")
+)
+
 
 class TdxError(RuntimeError):
     """A safe, credential-free error exposed to callers."""
@@ -228,18 +239,27 @@ class TdxClient:
 
     def stations(self, fallback: list[dict[str, str]]) -> list[dict[str, str]]:
         cached = self.load_cached_stations()
-        # A cache written before counties existed carries no county at all, and
-        # this file has no TTL, so serving it would leave the county picker
-        # showing nothing but "其他" forever. Treat that as stale and refetch.
-        if cached and any(item["county"] for item in cached):
-            return _popular_first(cached, fallback)
+        if cached:
+            return _popular_first(_with_counties(cached), fallback)
         if self.configured:
             try:
-                return _popular_first(self.fetch_stations(), fallback)
+                return _popular_first(_with_counties(self.fetch_stations()), fallback)
             except TdxError:
                 pass
-        # Refetching was impossible. An ungrouped cache still beats no stations.
-        return _popular_first(cached, fallback) if cached else list(fallback)
+        return list(fallback)
+
+
+def _with_counties(stations: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Apply the shipped county for every station whose id we know.
+
+    The shipped table wins over whatever TDX said, so a cache written by older
+    code, or a TDX response with a renamed field, cannot empty the picker.
+    Stations opened after the table was generated keep the TDX value.
+    """
+    return [
+        {**item, "county": STATION_COUNTIES.get(item["value"].split("-", 1)[0], item["county"])}
+        for item in stations
+    ]
 
 
 def _popular_first(
