@@ -573,7 +573,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         }
       }
       await api.createTask(token, {
-        scheduled_at: new Date(form.startNow ? Date.now() : new Date(form.scheduledAt)).toISOString(),
+        // "Start now" sends no time at all: stamping this clock and having the
+        // server compare it to its own only ever measured the gap between them.
+        scheduled_at: form.startNow ? null : new Date(form.scheduledAt).toISOString(),
         use_saved_member_login: form.useSavedMemberLogin,
         traveler_id: form.travelerId,
         mode: form.mode,

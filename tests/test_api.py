@@ -268,3 +268,80 @@ def test_member_profile_does_not_return_password_and_can_supply_task_login(tmp_p
         payload = database.get_task_payload(created.json()["id"], 1)
         assert payload["identity"] == "A123456789"
         assert payload["member_login"]["password"] == "railway-password"
+
+
+def _booking_for(days_ahead: int = 1) -> dict:
+    return {
+        "identity": "TEST-ID",
+        "start_station": "1000-臺北",
+        "end_station": "3300-臺中",
+        "outbound": {
+            "ride_date": (
+                datetime.now().astimezone().date() + timedelta(days=days_ahead)
+            ).strftime("%Y/%m/%d"),
+            "train_numbers": ["110"],
+        },
+    }
+
+
+def _register(client) -> dict[str, str]:
+    registered = client.post(
+        "/auth/register",
+        json={"email": "clock@example.com", "password": "very-secure-password"},
+    )
+    return {"Authorization": f"Bearer {registered.json()['access_token']}"}
+
+
+def test_omitting_scheduled_at_starts_now(tmp_path) -> None:
+    """"Start now" must not depend on the browser clock matching the server's.
+
+    The dashboard used to stamp Date.now() and send it, but validation compares
+    against the server's clock after the request has travelled and been parsed,
+    so any latency at all made the timestamp already past and the task was
+    refused with "scheduled_at cannot be in the past".
+    """
+    _, app = _new_app(tmp_path)
+    with TestClient(app) as client:
+        headers = _register(client)
+        before = datetime.now(UTC)
+        created = client.post("/tasks", headers=headers, json={"booking": _booking_for()})
+
+        assert created.status_code == 201
+        stamped = datetime.fromisoformat(created.json()["scheduled_at"])
+        assert before <= stamped <= datetime.now(UTC)
+
+
+def test_a_start_time_within_the_current_minute_is_accepted(tmp_path) -> None:
+    """The picker is a datetime-local, which cannot express seconds.
+
+    Choosing the current minute therefore yields a time up to 59 seconds past,
+    and refusing it would reject a choice the person cannot avoid making.
+    """
+    _, app = _new_app(tmp_path)
+    with TestClient(app) as client:
+        headers = _register(client)
+        created = client.post(
+            "/tasks",
+            headers=headers,
+            json={
+                "scheduled_at": (datetime.now(UTC) - timedelta(seconds=59)).isoformat(),
+                "booking": _booking_for(),
+            },
+        )
+        assert created.status_code == 201
+
+
+def test_a_clearly_past_start_time_is_still_refused(tmp_path) -> None:
+    _, app = _new_app(tmp_path)
+    with TestClient(app) as client:
+        headers = _register(client)
+        created = client.post(
+            "/tasks",
+            headers=headers,
+            json={
+                "scheduled_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                "booking": _booking_for(),
+            },
+        )
+        assert created.status_code == 422
+        assert "past" in created.json()["detail"]

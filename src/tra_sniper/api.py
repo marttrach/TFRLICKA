@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
@@ -74,10 +74,18 @@ class UserResponse(BaseModel):
     created_at: str
 
 
+# The start-time picker is a datetime-local, which cannot express seconds, so
+# choosing the current minute yields a time up to 59 seconds past. Refusing that
+# would reject a choice the person had no way to avoid making.
+START_TIME_GRACE = timedelta(minutes=1)
+
+
 class TaskCreate(BaseModel):
     # When monitoring starts. Named scheduled_at since before monitoring
     # existed; it has always been a start time, never an interval.
-    scheduled_at: datetime
+    # Omitted means "start now", stamped here rather than by the caller: a
+    # caller's clock is not this clock, and the difference is not knowable.
+    scheduled_at: datetime | None = None
     booking: dict[str, Any]
     use_saved_member_login: bool = False
     # Preferred over sending the identity in `booking`: the number is looked up
@@ -469,9 +477,11 @@ def create_app(
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         scheduled_at = body.scheduled_at
-        if scheduled_at.tzinfo is None:
+        if scheduled_at is None:
+            scheduled_at = datetime.now(UTC)
+        elif scheduled_at.tzinfo is None:
             raise HTTPException(status_code=422, detail="scheduled_at must include a timezone")
-        if scheduled_at.astimezone(UTC) < datetime.now(UTC):
+        elif scheduled_at.astimezone(UTC) < datetime.now(UTC) - START_TIME_GRACE:
             raise HTTPException(status_code=422, detail="scheduled_at cannot be in the past")
         if body.mode not in TASK_MODES:
             raise HTTPException(
