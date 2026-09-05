@@ -14,6 +14,12 @@ TRANSFER_NOTICE = (
 RESERVED_TYPE_CODES = {"1", "2", "3"}
 RESERVED_TYPE_NAMES = ("自強", "普悠瑪", "太魯閣")
 
+# Transfers are normally capped at 1.5x the fastest direct train. When a route
+# has no direct service at all there is nothing to compare against, and that is
+# exactly when a transfer is the only way to make the trip, so fall back to an
+# absolute ceiling rather than discarding every option.
+NO_DIRECT_MAX_MINUTES = 8 * 60
+
 # Ordered major hubs on the western trunk line. Only points strictly between
 # the selected stations are considered, so branch and eastern routes degrade
 # to direct suggestions instead of inventing a transfer path.
@@ -156,13 +162,18 @@ def pair_transfers(
     buffer_minutes: int = 10,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    maximum = direct_fastest_minutes * 1.5
+    maximum = direct_fastest_minutes * 1.5 if direct_fastest_minutes else NO_DIRECT_MAX_MINUTES
     for first in first_legs:
         first_departure = time_minutes(first.departure_time)
         first_arrival = time_minutes(first.arrival_time)
         if first_arrival < first_departure:
             first_arrival += 24 * 60
         for second in second_legs:
+            # A through train that stops at the hub appears in both OD queries,
+            # so pairing it with itself would suggest "changing" to the seat the
+            # passenger is already in, at the price of a second ticket.
+            if first.train_no and second.train_no == first.train_no:
+                continue
             second_departure = time_minutes(second.departure_time)
             while second_departure < first_arrival:
                 second_departure += 24 * 60
@@ -219,7 +230,9 @@ class SuggestionService:
         transfers: list[dict[str, Any]] = []
         all_direct = candidates_from_records(direct_records, "00:00", "23:59")
         fastest = min((item.duration_minutes for item in all_direct), default=0)
-        if include_transfers and fastest:
+        # Deliberately not gated on `fastest`: a route with no direct service is
+        # the case that needs a transfer most.
+        if include_transfers:
             for hub_id, hub_name in transfer_hubs(start_id, end_id):
                 try:
                     first = candidates_from_records(

@@ -70,3 +70,48 @@ def test_transfer_rejects_no_buffer_and_excess_duration() -> None:
     )
     assert no_buffer == []
     assert too_slow == []
+
+
+def test_same_through_train_is_not_offered_as_a_transfer() -> None:
+    """A train stopping at the hub appears in both OD queries; it is not a transfer."""
+    hub = {"value": "3300-臺中", "label": "臺中"}
+    # Train 109 reaches the hub at 09:30 and leaves it at 09:45: a long dwell,
+    # which clears the 10 minute buffer and would otherwise pair with itself.
+    first = candidate("109", "08:00", "09:30", 90)
+    same_train = candidate("109", "09:45", "11:00", 75)
+    other_train = candidate("155", "09:45", "11:00", 75)
+
+    paired = pair_transfers(
+        [first],
+        [same_train, other_train],
+        transfer_station=hub,
+        direct_fastest_minutes=200,
+    )
+
+    assert [item["second_leg"]["train_no"] for item in paired] == ["155"]
+
+
+def test_transfers_are_offered_when_no_direct_train_exists() -> None:
+    """No direct service is exactly when a transfer is the only way to travel."""
+    hub = {"value": "3300-臺中", "label": "臺中"}
+    paired = pair_transfers(
+        [candidate("109", "08:00", "10:00", 120)],
+        [candidate("155", "10:20", "13:00", 160)],
+        transfer_station=hub,
+        direct_fastest_minutes=0,
+    )
+
+    assert len(paired) == 1
+    assert paired[0]["duration_minutes"] == 300
+
+
+def test_absolute_ceiling_still_applies_without_a_direct_baseline() -> None:
+    hub = {"value": "3300-臺中", "label": "臺中"}
+    paired = pair_transfers(
+        [candidate("109", "06:00", "08:00", 120)],
+        [candidate("155", "08:30", "20:00", 690)],
+        transfer_station=hub,
+        direct_fastest_minutes=0,
+    )
+
+    assert paired == [], "a 14 hour itinerary is not a usable suggestion"
