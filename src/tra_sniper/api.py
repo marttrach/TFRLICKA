@@ -87,7 +87,8 @@ class TaskCreate(BaseModel):
     # caller's clock is not this clock, and the difference is not knowable.
     scheduled_at: datetime | None = None
     booking: dict[str, Any]
-    use_saved_member_login: bool = False
+    # Accepted for older clients; booking no longer logs into a TRC account.
+    use_saved_member_login: bool = Field(default=False, deprecated=True)
     # Preferred over sending the identity in `booking`: the number is looked up
     # server-side so it never has to round-trip through the browser.
     traveler_id: int | None = None
@@ -462,19 +463,12 @@ def create_app(
     @app.post("/tasks", response_model=TaskResponse, status_code=201)
     def create_task(body: TaskCreate, user: CurrentUser) -> TaskResponse:
         booking_payload = dict(body.booking)
+        booking_payload.pop("member_login", None)
         if body.traveler_id is not None:
             traveler = db.get_traveler(body.traveler_id, user.id)
             if traveler is None:
                 raise HTTPException(status_code=404, detail="常用資料不存在")
             booking_payload["identity"] = traveler.identity
-        if body.use_saved_member_login:
-            profile = db.get_member_profile(user.id)
-            if not profile or not profile.member_account or not profile.member_password:
-                raise HTTPException(status_code=422, detail="尚未設定完整的台鐵會員登入資料")
-            booking_payload["member_login"] = {
-                "account": profile.member_account,
-                "password": profile.member_password,
-            }
         if not str(booking_payload.get("identity", "")).strip():
             profile = db.get_member_profile(user.id)
             if profile:
@@ -524,15 +518,15 @@ def create_app(
     def suggestions(body: SuggestionRequest, user: CurrentUser) -> dict[str, Any]:
         del user
         if body.start_time not in BOOKING_TIME_LABELS or body.end_time not in BOOKING_TIME_LABELS:
-            raise HTTPException(status_code=422, detail="Invalid booking time label")
+            raise HTTPException(status_code=422, detail="請選擇有效的開始與結束時段")
         if body.start_time >= body.end_time:
-            raise HTTPException(status_code=422, detail="start_time must precede end_time")
+            raise HTTPException(status_code=422, detail="開始時段必須早於結束時段，請調整後重新查詢")
         if body.start_station == body.end_station:
-            raise HTTPException(status_code=422, detail="start_station and end_station must differ")
+            raise HTTPException(status_code=422, detail="出發站與抵達站不可相同，請重新選擇")
         try:
             date.fromisoformat(body.ride_date.replace("/", "-"))
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail="Invalid ride_date") from exc
+            raise HTTPException(status_code=422, detail="乘車日期格式不正確，請重新選擇日期") from exc
         try:
             return suggestion_service.suggest(
                 start_station=body.start_station,
@@ -546,7 +540,7 @@ def create_app(
         except TdxError as exc:
             raise HTTPException(
                 status_code=503,
-                detail="TDX timetable suggestions are temporarily unavailable; use train-number mode or try again later",
+                detail="TDX 時刻表暫時不可用，請稍後重試，或改用「直接輸入車次」",
             ) from exc
 
     @app.post("/ocr", response_model=OcrResponse)
@@ -686,6 +680,7 @@ def create_app(
             raise HTTPException(status_code=409, detail="Task is not open for booking")
         try:
             payload = db.get_task_payload(task_id, user_id)
+            payload.pop("member_login", None)  # Older tasks may still contain saved credentials.
             booking = BookingRequest.from_dict(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Task not found") from exc

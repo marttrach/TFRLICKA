@@ -97,7 +97,6 @@ interface BookingFormState {
   includeTransfers: boolean;
   quantity: number;
   scheduledAt: string;
-  useSavedMemberLogin: boolean;
 }
 
 const defaultForm: BookingFormState = {
@@ -121,7 +120,6 @@ const defaultForm: BookingFormState = {
   includeTransfers: true,
   quantity: 1,
   scheduledAt: fiveMinutesFromNow(),
-  useSavedMemberLogin: false,
 };
 
 function TravelerPanel({
@@ -426,12 +424,12 @@ function MemberProfilePanel({
   }
 
   return (
-    <section className="panel profile-panel">
-      <div className="panel-heading"><div><span className="step">02</span><h2>台鐵會員登入</h2></div><small>選填 · 加密保存</small></div>
+    <details className="panel profile-panel">
+      <summary className="panel-heading">台鐵會員資料（訂票不使用）</summary>
       <form className="profile-form" onSubmit={save}>
         <label>台鐵會員帳號<input value={account} onChange={(event) => setAccount(event.target.value)} autoComplete="username" placeholder="身分證號或會員編號" /></label>
         <label>台鐵會員密碼<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder={profile.has_member_password ? "已保存；不修改請留空" : "選填"} /></label>
-        <p className="privacy-note">帳密只會以 Fernet 加密存放在你的 NAS。官方若要求驗證，仍需由本人或可信任家人完成。</p>
+        <p className="privacy-note">已保存的帳密仍加密存放在 NAS，但訂票不會使用。系統直接填寫訂票表單；後續付款等操作請至台鐵官網自行辦理。</p>
         {error && <p className="error" role="alert">{error}</p>}
         {notice && <p className="notice" role="status">{notice}</p>}
         <div className="profile-actions">
@@ -439,7 +437,7 @@ function MemberProfilePanel({
           {profile.has_member_password && <button type="button" className="danger" disabled={busy} onClick={clearLogin}>清除台鐵帳密</button>}
         </div>
       </form>
-    </section>
+    </details>
   );
 }
 
@@ -509,7 +507,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         setForm((current) => ({
           ...current,
           travelerId: travelerList[0]?.id ?? null,
-          useSavedMemberLogin: savedProfile.has_member_password,
         }));
         setStations(stationList);
         setTimes(timeList);
@@ -592,7 +589,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         // "Start now" sends no time at all: stamping this clock and having the
         // server compare it to its own only ever measured the gap between them.
         scheduled_at: form.startNow ? null : new Date(form.scheduledAt).toISOString(),
-        use_saved_member_login: form.useSavedMemberLogin,
         traveler_id: form.travelerId,
         mode: form.mode,
         train_label: form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`,
@@ -720,10 +716,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 : refreshed[0]?.id ?? null,
             }));
           }} />
-          {profile && <MemberProfilePanel token={token} profile={profile} onSaved={(saved) => {
-            setProfile(saved);
-            setForm((current) => ({ ...current, useSavedMemberLogin: saved.has_member_password }));
-          }} />}
+          {profile && <MemberProfilePanel token={token} profile={profile} onSaved={setProfile} />}
           <section className="panel booking-panel">
             <div className="panel-heading"><div><span className="step">03</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
             <form className="booking-form" onSubmit={createTask}>
@@ -739,9 +732,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                       {travelers.map((traveler) => <option value={traveler.id} key={traveler.id}>{traveler.label}（{maskIdentity(traveler.identity)}）</option>)}
                     </select>}
               </label>
-              {profile?.has_member_password && (
-                <label className="member-login-option wide"><input type="checkbox" checked={form.useSavedMemberLogin} onChange={(event) => setForm({ ...form, useSavedMemberLogin: event.target.checked })} /> 購票前先帶入已保存的台鐵會員帳密</label>
-              )}
+              <p className="wide muted">直接以乘車人資料訂票，不先登入台鐵會員。</p>
               <div className="wide station-block">
                 {countyGroupingAvailable(stations) && (
                   <label className="search-all-toggle">
@@ -799,8 +790,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     type="button"
                     className="primary wide"
                     disabled={suggestionBusy}
-                    onClick={() => void querySuggestions().catch(() => setError(
-                      "查不到車次建議（TDX 時刻表暫時不可用）。改用上方「直接輸入車次」即可繼續。"
+                    onClick={() => void querySuggestions().catch((reason) => setError(
+                      reason instanceof TypeError ? "無法連線至服務，請確認網路後重試。"
+                        : reason instanceof Error ? reason.message : "查詢失敗，請稍後重試。"
                     ))}
                   >{suggestionBusy ? "查詢中…" : "① 查詢車次建議"}</button>
                 </>

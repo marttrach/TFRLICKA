@@ -5,7 +5,9 @@ assert the selectors and values we send, not a live page: CI installs no
 browser, and the point is to catch a silent drift from that contract.
 """
 
-from unittest.mock import Mock
+import sys
+from types import ModuleType
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -147,3 +149,27 @@ def test_by_time_is_refused_rather_than_silently_wrong():
             order_type="BY_TIME",
             outbound={"ride_date": "2026/09/25", "start_time": "08:00", "end_time": "12:00"},
         )
+
+
+def test_legacy_member_credentials_never_open_a_login_page(monkeypatch):
+    # No browser dependency in CI: drive the real run() with a recording page.
+    page = FakePage()
+    page.goto = Mock()
+    automator = TRCBookingAutomator(headless=True)
+    automator.cdp_url = None
+    page.url = automator.booking_url
+    playwright = MagicMock()
+    browser = playwright.chromium.launch.return_value
+    context = browser.new_context.return_value
+    context.new_page.return_value = page
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = MagicMock()
+    sync_api.sync_playwright.return_value.__enter__.return_value = playwright
+    monkeypatch.setitem(sys.modules, "playwright", ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    result = automator.run(booking(member_login={"account": "saved", "password": "secret"}))
+    assert result.status == "prepared"
+    page.goto.assert_called_once_with(automator.booking_url, wait_until="domcontentloaded", timeout=60_000)
+    assert not any(selector in {"#username", "#password"} for selector, _, _ in page.calls)
+    context.close.assert_called_once()

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from tra_sniper import storage
 from tra_sniper.api import create_app
 from tra_sniper.auth import TokenManager
+from tra_sniper.models import BookingRequest
 from tra_sniper.storage import Database
 
 
@@ -31,6 +32,33 @@ class _Result:
         self.status = status
         self.booking_code = booking_code
         self.message = message
+
+
+def test_existing_task_drops_legacy_member_login_before_starting(tmp_path, monkeypatch):
+    release = threading.Event()
+    captured = threading.Event()
+    database, app = _app(tmp_path, release)
+    original_run = HeldAutomator.run
+
+    def run(self, request, **kwargs):
+        assert request.member_login is None
+        captured.set()
+        return original_run(self, request, **kwargs)
+
+    monkeypatch.setattr(HeldAutomator, "run", run)
+    try:
+        with TestClient(app) as client:
+            headers = _register(client)
+            payload = _booking()
+            task = database.create_task(
+                1, BookingRequest.from_dict(payload), datetime.now(UTC).isoformat(),
+                {**payload, "member_login": {"account": "old-account", "password": ""}},
+            )
+            response = client.post(f"/tasks/{task.id}/booking-session", headers=headers)
+            assert response.status_code == 201
+            assert captured.wait(1)
+    finally:
+        release.set()
 
 
 def _booking():

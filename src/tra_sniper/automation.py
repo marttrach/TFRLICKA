@@ -15,7 +15,6 @@ from .models import BookingRequest, Leg, OrderType, TripType
 from .verification import VerificationMode, VerificationProvider, create_verification_provider
 
 BOOKING_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query"
-MEMBER_LOGIN_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip008/tip811/memberLogin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,8 +94,6 @@ class TRCBookingAutomator:
         request.validate()
         if submit and self.headless:
             raise ValueError("Submission requires a headed browser for manual reCAPTCHA")
-        if request.member_login and self.headless:
-            raise ValueError("Member login requires a headed browser for official verification")
 
         from playwright.sync_api import sync_playwright
 
@@ -119,19 +116,8 @@ class TRCBookingAutomator:
             context = browser.new_context(locale="zh-TW")
             page = context.new_page()
             try:
-                if request.member_login:
-                    page.goto(MEMBER_LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-                    self._prepare_member_login(page, request.member_login.account, request.member_login.password)
-                    if on_ready:
-                        on_ready()
-                    print(
-                        "臺鐵會員帳號與密碼已填入。請在瀏覽器確認，若官方要求驗證，"
-                        "請完成官方驗證後按登入；登入完成後再前往訂票頁。"
-                    )
-                    self._wait_for_member_login(
-                        page, wait_seconds=max(0, int(deadline - time.monotonic())),
-                        stop_event=stop_event,
-                    )
+                # Booking starts directly, including legacy requests carrying
+                # member_login. Logging in first adds an unnecessary challenge.
                 page.goto(self.booking_url, wait_until="domcontentloaded", timeout=60_000)
                 self._prepare_form(page, request)
 
@@ -176,24 +162,6 @@ class TRCBookingAutomator:
                 "the adapter and target contract do not match"
             )
         field.fill(token)
-
-    def _prepare_member_login(self, page: Any, account: str, password: str) -> None:
-        self._accept_cookie_notice(page)
-        page.locator("#username").fill(account)
-        page.locator("#password").fill(password)
-
-    @staticmethod
-    def _wait_for_member_login(
-        page: Any, *, wait_seconds: int, stop_event: threading.Event | None = None
-    ) -> None:
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                raise RuntimeError("訂票 session 已取消；未嘗試略過官方驗證")
-            if "/tip811/memberLogin" not in page.url:
-                return
-            page.wait_for_timeout(1_000)
-        raise RuntimeError("等待台鐵會員登入逾時；未嘗試略過官方驗證")
 
     def _prepare_form(self, page: Any, request: BookingRequest) -> None:
         # The official site splits 依車次/依時段 and 單程/雙行程 across four

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -6,6 +7,7 @@ from fastapi.testclient import TestClient
 from tra_sniper.api import create_app
 from tra_sniper.auth import TokenManager
 from tra_sniper.storage import Database
+from tra_sniper.tdx import TdxError
 
 
 class FakeTdx:
@@ -226,7 +228,7 @@ def test_unconfigured_tdx_keeps_api_available(tmp_path, monkeypatch) -> None:
         assert any(item["value"] == "1000-臺北" for item in stations.json())
 
 
-def test_member_profile_does_not_return_password_and_can_supply_task_login(tmp_path) -> None:
+def test_member_profile_is_retained_but_no_longer_supplies_task_login(tmp_path) -> None:
     database = Database(tmp_path / "profile-api.db", encryption_key=Fernet.generate_key().decode())
     app = create_app(database, TokenManager("t" * 32), start_scheduler=False)
     ride_date = (datetime.now().astimezone().date() + timedelta(days=1)).strftime("%Y/%m/%d")
@@ -260,6 +262,7 @@ def test_member_profile_does_not_return_password_and_can_supply_task_login(tmp_p
                     "identity": "",
                     "start_station": "1000-臺北",
                     "end_station": "3300-臺中",
+                    "member_login": {"account": "legacy", "password": "legacy-password"},
                     "outbound": {"ride_date": ride_date, "train_numbers": ["110"]},
                 },
             },
@@ -267,7 +270,35 @@ def test_member_profile_does_not_return_password_and_can_supply_task_login(tmp_p
         assert created.status_code == 201
         payload = database.get_task_payload(created.json()["id"], 1)
         assert payload["identity"] == "A123456789"
-        assert payload["member_login"]["password"] == "railway-password"
+        assert "member_login" not in payload
+        assert database.get_member_profile(1).member_password == "railway-password"
+
+
+def test_suggestion_errors_distinguish_invalid_input_from_tdx_outage(tmp_path) -> None:
+    database = Database(tmp_path / "suggestion-errors.db", encryption_key=Fernet.generate_key().decode())
+    tdx = FakeTdx()
+    tdx.daily_timetable = Mock(side_effect=TdxError("service unavailable"))
+    app = create_app(database, TokenManager("t" * 32), tdx_client=tdx, start_scheduler=False)
+    with TestClient(app) as client:
+        registered = client.post("/auth/register", json={
+            "email": "suggestions@example.com", "password": "very-secure-password",
+        })
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        payload = {
+            "start_station": "1000-臺北", "end_station": "3300-臺中",
+            "ride_date": "2026-09-25", "start_time": "18:00", "end_time": "08:00",
+        }
+        invalid = client.post("/suggestions", headers=headers, json=payload)
+        assert invalid.status_code == 422
+        assert "開始時段必須早於結束時段" in invalid.json()["detail"]
+        assert "TDX" not in invalid.json()["detail"]
+        tdx.daily_timetable.assert_not_called()
+
+        payload["start_time"] = "06:00"
+        outage = client.post("/suggestions", headers=headers, json=payload)
+        assert outage.status_code == 503
+        assert "TDX 時刻表暫時不可用" in outage.json()["detail"]
+        assert "直接輸入車次" in outage.json()["detail"]
 
 
 def _booking_for(days_ahead: int = 1) -> dict:
