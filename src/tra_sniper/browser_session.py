@@ -69,12 +69,11 @@ class BookingSessionManager:
 
     def acquire(self, task_id: str, user_id: int) -> BookingSession:
         now = datetime.now(UTC)
-        stale: BookingSession | None = None
         with self._lock:
             active = self._active
-            if active is not None and not active.is_expired(now):
+            # Only the worker can release the slot, after its context closes.
+            if active is not None:
                 raise SessionBusyError(active.task_id, active.remaining_seconds(now))
-            stale = active
             session = BookingSession(
                 token=secrets.token_urlsafe(TOKEN_BYTES),
                 task_id=task_id,
@@ -82,8 +81,6 @@ class BookingSessionManager:
                 expires_at=now + timedelta(seconds=self.ttl_seconds),
             )
             self._active = session
-        if stale is not None:
-            stale.stop.set()
         return session
 
     def resolve(self, token: str) -> BookingSession | None:
@@ -94,7 +91,7 @@ class BookingSessionManager:
                 return None
             if not hmac.compare_digest(active.token, token):
                 return None
-            if active.is_expired() or active.status in FINISHED_STATUSES:
+            if active.stop.is_set() or active.is_expired() or active.status in FINISHED_STATUSES:
                 return None
             return active
 
@@ -109,15 +106,14 @@ class BookingSessionManager:
         return active
 
     def reap(self) -> BookingSession | None:
-        """Release an expired session. Called from the scheduler tick."""
+        """Stop an expired session; its worker releases the slot after cleanup."""
         with self._lock:
             active = self._active
-            if active is None or not active.is_expired():
+            if active is None or not active.is_expired() or active.stop.is_set():
                 return None
-            self._active = None
         active.stop.set()
         logger.info(
-            "booking session expired and was released",
+            "booking session expired; waiting for browser cleanup",
             extra={"event": "booking_session.reaped", "task_id": active.task_id},
         )
         return active
@@ -134,27 +130,46 @@ def run_booking_session(
     automator: object,
     request: object,
     on_finish: Callable[[BookingSession], None],
+    on_ready: Callable[[BookingSession], None] | None = None,
 ) -> None:
     """Drive one booking to its official outcome. Runs in a worker thread.
 
     The browser stops at the official verification and waits for the person;
     nothing here inspects, solves, or submits the reCAPTCHA.
     """
-    try:
+    def ready() -> None:
+        # Login and booking can both need a person. Notify once for this session,
+        # even if the automator reports both handoff points or the webhook fails.
+        if session.status != "preparing" or session.stop.is_set() or session.is_expired():
+            return
         session.status = "waiting_verification"
+        if on_ready:
+            try:
+                on_ready(session)
+            except Exception:
+                logger.exception("booking handoff notification failed")
+
+    try:
         result = automator.run(  # type: ignore[attr-defined]
             request,
             submit=True,
             wait_seconds=session.remaining_seconds(),
             stop_event=session.stop,
+            on_ready=ready,
         )
         session.status = result.status
+        if session.status == "cancelled" and session.is_expired():
+            session.status = "timeout"
         session.booking_code = result.booking_code
         session.message = result.message
     except Exception as exc:
         # The worker must never die silently: the person is staring at a browser
         # waiting for an outcome, and the session lock has to be released.
         session.status = "failed"
+        if session.is_expired():
+            session.status = "timeout"
+        elif session.stop.is_set():
+            session.status = "cancelled"
         session.message = str(exc)
         logger.exception(
             "booking session failed",

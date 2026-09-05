@@ -1,5 +1,6 @@
 import logging
 import threading
+from types import SimpleNamespace
 
 from tra_sniper.scheduler import TaskScheduler
 
@@ -19,7 +20,7 @@ class FlakyDatabase(QuietMonitorMixin):
         self.calls = 0
         self.recovered = threading.Event()
 
-    def promote_due_task_records(self) -> list[object]:
+    def claim_due_checks(self) -> list[object]:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("database is locked")
@@ -42,8 +43,14 @@ def test_scheduler_survives_a_failed_tick(caplog) -> None:
 
 def test_scheduler_tick_returns_promoted_count() -> None:
     class DatabaseStub(QuietMonitorMixin):
-        def promote_due_task_records(self) -> list[object]:
-            return [object(), object(), object()]
+        def claim_due_checks(self) -> list[object]:
+            return [SimpleNamespace(id=str(i), user_id=1, mode="monitor_only") for i in range(3)]
+
+        def clear_check_failures(self, task_id, user_id):
+            pass
+
+        def pause_monitoring(self, task_id, user_id, status):
+            return True
 
     scheduler = TaskScheduler(DatabaseStub())  # type: ignore[arg-type]
     assert scheduler.tick() == 3

@@ -74,6 +74,10 @@ def test_expired_session_is_rejected_and_reaped() -> None:
     reaped = manager.reap()
     assert reaped is session
     assert session.stop.is_set(), "reaping must signal the worker to close the browser"
+    assert manager.active is session
+    with pytest.raises(SessionBusyError):
+        manager.acquire("task-2", 2)
+    manager.release(session.token)  # Worker has closed the browser.
     assert manager.active is None
 
 
@@ -165,3 +169,27 @@ def test_remaining_seconds_never_goes_negative() -> None:
 
     assert session.remaining_seconds() == 0
     assert session.is_expired()
+
+
+def test_login_and_booking_handoffs_notify_once_even_when_notification_fails() -> None:
+    manager = BookingSessionManager()
+    session = manager.acquire("task-1", 1)
+    notifications = []
+
+    def notify(ready):
+        notifications.append(ready.status)
+        raise OSError("webhook unavailable")
+
+    class ReadyTwice:
+        def run(self, request, **kwargs):
+            assert session.status == "preparing"
+            kwargs["on_ready"]()  # Member login needs a person.
+            kwargs["on_ready"]()  # Booking form later needs the same person.
+            assert session.status == "waiting_verification"
+            return FakeResult()
+
+    run_booking_session(session, automator=ReadyTwice(), request={},
+                        on_ready=notify, on_finish=lambda finished: manager.release(finished.token))
+    assert notifications == ["waiting_verification"]
+    assert session.status == "completed"
+    assert manager.active is None

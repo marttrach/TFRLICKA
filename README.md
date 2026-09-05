@@ -84,24 +84,28 @@ docker compose up -d
 | 欄位 | 意義 | 預設 |
 |---|---|---|
 | `scheduled_at`／`monitor_start_at` | 何時**開始**監控 | 立即 |
-| `poll_interval_seconds` | 開始後**多久查一次** | 300 秒（5 分鐘） |
+| `poll_interval_seconds` | 瀏覽器忙碌時，多久重試準備頁面 | 300 秒（5 分鐘） |
 | `monitor_until` | 監控**截止**時間 | 未設定＝單次執行 |
 
-執行模式：`monitor_only`（只到點提醒）或 `book_when_available`（到點把訂票頁準備好）。
+執行模式：`monitor_only`（到點提醒一次）或 `book_when_available`（到點自動開頁填表）。
+兩者都在交接後暫停，不會每個間隔重新通知。
 
-> **系統無法得知任何車次是否有位。** TDX 沒有台鐵餘票資料（九個端點實測全部 404，
-> 見 PLAN.md 7.1），而輪詢台鐵訂票網站違反開發約束第 4、6 條。任務回應中的
-> `availability` 恆為 `unknown`。監控只負責在你設定的時間把訂票頁準備好，
-> 是否訂得到仍取決於當下實際餘位。
+> **通知代表需要你接手，不代表有位。** 任務回應中的 `availability` 恆為 `unknown`。
+> 會員登入需要人工操作，或訂票表單填妥時，保留同一個瀏覽器頁面，
+> 每次 session 只嘗試發送一次 `task.waiting_human` 通知。
+> 開啟通知中的任務連結並登入，再按「開啟驗證畫面」即可接回原頁面。
+> 即使沒有顯示驗證碼，送出仍由本人確認操作；自動判讀無位後重送尚未啟用。
 
 防重複與退避規則：
 
 - 同一任務不會同時執行兩次查詢（資料庫層 compare-and-swap，重啟後依然有效）
 - 訂票 session 進行中會離開可輪詢狀態，**不會每 5 分鐘再開一個瀏覽器**
-- 查詢失敗逐次延長間隔（上限 2⁸ 倍），成功後歸零
+- 瀏覽器忙碌時等下一個設定間隔；頁面準備失敗則停止並記錄錯誤
 - 訂位成功、使用者取消、監控截止後立即停止
-- 訂票 `failed`／`timeout` **不自動恢復監控**：官方結果未確認，自動重試有重複訂位風險，
-  需人工確認後再重新啟動；只有使用者主動放棄（`cancelled`）才會回到監控
+- 頁面保留最長 15 分鐘，且不超過 `monitor_until`；逾時後關閉頁面
+- `failed`／`timeout`／`cancelled` **都不自動恢復監控**；需要再試時自行建立新任務
+- 取消或逾時先停止 session，等原瀏覽器 context 關閉後才開放下一個任務
+- 通知失敗只記錄日誌，不重開頁面或重複通知；結束時另發一次訂票結果事件
 
 ## 🧰 CLI 模式
 
@@ -156,7 +160,7 @@ Header Auth credential。
 
 | 事件 | 觸發時機 |
 |---|---|
-| `task.waiting_human` | 排程到期，任務轉為等待人工 |
+| `task.waiting_human` | 頁面可供人工接手時一次；純提醒模式則為排程到期時一次 |
 | `task.booking_result` | 訂票 session 結束 |
 
 `task.booking_result` 的 `status` 可能是 `completed`、`failed`、`timeout`、

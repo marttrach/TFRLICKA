@@ -264,11 +264,11 @@ const PRIMARY_ACTION: Record<string, { label: string; kind: "session" | "result"
 };
 
 function nextCheckText(task: Task): string {
+  if (task.status === "waiting_human") return "等待你接手，已暫停";
   if (!task.next_check_at) return "不再查詢";
   if (["completed", "cancelled", "expired", "failed", "timeout"].includes(task.status)) {
     return "不再查詢";
   }
-  if (task.status === "waiting_human") return "等待驗證中，暫停查詢";
   return formatDate(task.next_check_at);
 }
 
@@ -614,7 +614,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           },
         },
       });
-      setNotice("任務已排入；每個間隔會自動查一次，有位時才會通知你去完成驗證。");
+      setNotice("任務已排入；需要你接手時只通知一次並暫停，請完成官方驗證與送出。通知不代表有位。");
       setForm((current) => ({ ...current, trainNumber: "", chosenTrain: null }));
       await loadTasks();
     } catch (reason) {
@@ -812,7 +812,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               {!form.startNow && (
                 <label className="wide">開始監控時間<input type="datetime-local" value={form.scheduledAt} onChange={(e) => setForm({ ...form, scheduledAt: e.target.value })} required /></label>
               )}
-              <label>查詢間隔
+                <label>瀏覽器忙碌時的重試間隔
                 <select value={form.pollIntervalMinutes} onChange={(e) => setForm({ ...form, pollIntervalMinutes: Number(e.target.value) })}>
                   {[1, 3, 5, 10, 15, 30, 60].map((minutes) => (
                     <option value={minutes} key={minutes}>{minutes} 分鐘</option>
@@ -822,7 +822,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               <label>監控截止時間<input type="datetime-local" value={form.monitorUntil} onChange={(e) => setForm({ ...form, monitorUntil: e.target.value })} /></label>
               <p className="wide privacy-note">
                 系統<strong>無法得知任何車次是否有位</strong>：台鐵餘票沒有可用的官方開放資料來源。
-                監控只負責在你設定的時間把訂票頁準備好，是否訂得到仍取決於當下的實際餘位。
+                到點準備頁面，遇驗證或需要確認送出時暫停並通知一次；等候最長 15 分鐘，且不超過監控截止時間。取消或逾時後不自動重開。
               </p>
               {error && <p className="error wide" role="alert">{error}</p>}
               {notice && <p className="notice wide" role="status">{notice}</p>}
@@ -863,7 +863,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <span className={`status status-${task.status}`}>{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
                     <p className="task-train">{task.train_label ?? "未指定車次"}</p>
-                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "只監控" : "自動巡檢至訂到"}</p>
+                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "自動準備，等待人工接手"}</p>
                     {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
                   </div>
                   <dl className="task-time">

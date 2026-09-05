@@ -5,6 +5,7 @@ import re
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ class TRCBookingAutomator:
         wait_seconds: int = 600,
         screenshot: str | Path | None = None,
         stop_event: threading.Event | None = None,
+        on_ready: Callable[[], None] | None = None,
     ) -> AutomationResult:
         request.validate()
         if submit and self.headless:
@@ -101,6 +103,7 @@ class TRCBookingAutomator:
         screenshot_path = Path(screenshot).resolve() if screenshot else None
         if screenshot_path:
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + wait_seconds
 
         with sync_playwright() as playwright:
             if self.cdp_url:
@@ -119,12 +122,15 @@ class TRCBookingAutomator:
                 if request.member_login:
                     page.goto(MEMBER_LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
                     self._prepare_member_login(page, request.member_login.account, request.member_login.password)
+                    if on_ready:
+                        on_ready()
                     print(
                         "臺鐵會員帳號與密碼已填入。請在瀏覽器確認，若官方要求驗證，"
                         "請完成官方驗證後按登入；登入完成後再前往訂票頁。"
                     )
                     self._wait_for_member_login(
-                        page, wait_seconds=wait_seconds, stop_event=stop_event
+                        page, wait_seconds=max(0, int(deadline - time.monotonic())),
+                        stop_event=stop_event,
                     )
                 page.goto(self.booking_url, wait_until="domcontentloaded", timeout=60_000)
                 self._prepare_form(page, request)
@@ -146,9 +152,11 @@ class TRCBookingAutomator:
                 )
                 if self.verification.capabilities.mode is not VerificationMode.MANUAL:
                     self._prepare_provider_handoff(page)
+                if on_ready:
+                    on_ready()
                 return self._wait_for_human_verification(
                     page,
-                    wait_seconds=wait_seconds,
+                    wait_seconds=max(0, int(deadline - time.monotonic())),
                     screenshot_path=screenshot_path,
                     stop_event=stop_event,
                 )
@@ -225,7 +233,9 @@ class TRCBookingAutomator:
         # rideDate is a <select> of roughly the next 30 days. Reading the
         # options first turns "date is past the booking window" into a message
         # that says so, instead of Playwright's opaque strict-mode failure.
-        available = page.locator("#rideDate0 option").all_attribute_values("value")
+        available = page.locator("#rideDate0 option").evaluate_all(
+            "options => options.map(option => option.value)"
+        )
         if leg.ride_date not in available:
             window = f"{available[0]} 至 {available[-1]}" if available else "（頁面未提供日期選項）"
             raise ValueError(

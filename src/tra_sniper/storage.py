@@ -663,8 +663,7 @@ class Database:
                 WHERE status IN ('scheduled', 'monitoring')
                   AND scheduled_at <= ?
                   AND (next_check_at IS NULL OR next_check_at <= ?)
-                  AND monitor_until IS NOT NULL
-                  AND monitor_until > ?
+                  AND (monitor_until IS NULL OR monitor_until > ?)
                 ORDER BY next_check_at
                 LIMIT ?
                 """,
@@ -746,19 +745,11 @@ class Database:
         """Move a task out of the pollable states so no check can claim it."""
         with self.connect() as connection:
             cursor = connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? "
-                "WHERE id = ? AND user_id = ? AND status IN ('scheduled', 'monitoring')",
-                (status, utc_now(), task_id, user_id),
-            )
-        return cursor.rowcount == 1
-
-    def resume_monitoring(self, task_id: str, user_id: int) -> bool:
-        """Put a task back in the poll loop after an abandoned attempt."""
-        with self.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE tasks SET status = 'monitoring', next_check_at = ?, updated_at = ? "
-                "WHERE id = ? AND user_id = ? AND monitor_until > ?",
-                (utc_now(), utc_now(), task_id, user_id, utc_now()),
+                "UPDATE tasks SET status = ?, updated_at = ?, next_check_at = NULL "
+                "WHERE id = ? AND user_id = ? "
+                "AND status IN ('scheduled', 'monitoring', 'waiting_human') "
+                "AND (monitor_until IS NULL OR monitor_until > ?)",
+                (status, utc_now(), task_id, user_id, utc_now()),
             )
         return cursor.rowcount == 1
 

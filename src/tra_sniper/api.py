@@ -47,7 +47,7 @@ DEFAULT_DEV_ORIGINS = (
 )
 LOGIN_RETRY_AFTER_SECONDS = 15 * 60
 BOOKING_SESSION_NOTICE = (
-    "表單已填妥。請在畫面上完成台鐵官方 reCAPTCHA 並自行按下訂票；"
+    "正在準備或等待你接手。請在畫面上完成台鐵官方驗證並自行按下訂票；"
     "系統不會辨識驗證碼，也不會替你按送出。"
 )
 logger = logging.getLogger(__name__)
@@ -264,6 +264,9 @@ def create_app(
             yield
         finally:
             scheduler.stop()
+            active = sessions.active
+            if active is not None:
+                active.stop.set()
 
     app = FastAPI(
         title="TRA-Sniper API",
@@ -664,51 +667,60 @@ def create_app(
 
         return TRCBookingAutomator(headless=False, verification_provider=verification)
 
-    @app.post(
-        "/tasks/{task_id}/booking-session",
-        response_model=BookingSessionResponse,
-        status_code=201,
-    )
-    def start_booking_session(task_id: str, user: CurrentUser) -> BookingSessionResponse:
-        task = db.get_task(task_id, user.id)
+    def _start_booking(task_id: str, user_id: int) -> BookingSessionResponse:
+        task = db.get_task(task_id, user_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        if task.status not in {"scheduled", "waiting_human"}:
+        active = sessions.active
+        if (
+            active is not None and active.task_id == task_id and active.user_id == user_id
+            and sessions.resolve(active.token) is not None
+        ):
+            return BookingSessionResponse(
+                task_id=task_id,
+                session_url=f"/booking-session/{active.token}/",
+                expires_at=active.expires_at.isoformat(),
+                notice=BOOKING_SESSION_NOTICE,
+            )
+        if task.status not in {"scheduled", "monitoring", "waiting_human"}:
             raise HTTPException(status_code=409, detail="Task is not open for booking")
         try:
-            booking = BookingRequest.from_dict(db.get_task_payload(task_id, user.id))
+            payload = db.get_task_payload(task_id, user_id)
+            booking = BookingRequest.from_dict(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Task not found") from exc
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        automator = _build_automator(booking)
+        session = sessions.acquire(task_id, user_id)
         try:
-            session = sessions.acquire(task_id, user.id)
-        except SessionBusyError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"另一個訂票 session 進行中（任務 {exc.active_task_id}），"
-                    f"約 {exc.remaining_seconds} 秒後釋放。一次只能解一個驗證。"
-                ),
-                headers={"Retry-After": str(exc.remaining_seconds)},
-            ) from exc
+            if task.monitor_until:
+                session.expires_at = min(session.expires_at, datetime.fromisoformat(task.monitor_until))
+            if not db.pause_monitoring(task_id, user_id, "waiting_human"):
+                raise HTTPException(status_code=409, detail="Task was cancelled or its window ended")
+        except Exception:
+            sessions.release(session.token)
+            raise
+
+        def on_ready(ready: Any) -> None:
+            record = db.get_task(ready.task_id, ready.user_id)
+            if record and record.status == "waiting_human" and scheduler.notifier.enabled:
+                scheduler.notifier.notify(record, payload)
 
         def on_finish(finished: Any) -> None:
-            sessions.release(finished.token)
-            db.update_task_status(
-                finished.task_id,
-                finished.user_id,
-                finished.status,
-                last_error=finished.message if finished.status != "completed" else None,
-                booking_code=finished.booking_code,
-            )
-            # Only an abandoned attempt goes back in the poll loop. "failed" and
-            # "timeout" both mean the official result is unconfirmed, and
-            # resuming would risk booking the same seat twice; the person
-            # restarts those after checking on the official site.
-            if finished.status == "cancelled":
-                db.resume_monitoring(finished.task_id, finished.user_id)
+            try:
+                db.update_task_status(
+                    finished.task_id,
+                    finished.user_id,
+                    finished.status,
+                    last_error=finished.message if finished.status != "completed" else None,
+                    booking_code=finished.booking_code,
+                )
+            finally:
+                sessions.release(finished.token)
+            # Cancellation also stops polling. Reopening automatically would
+            # create another handoff notification after the person dismissed it.
             record = db.get_task(finished.task_id, finished.user_id)
             if record and scheduler.notifier.enabled:
                 try:
@@ -724,17 +736,24 @@ def create_app(
                         },
                     )
 
-        threading.Thread(
-            target=run_booking_session,
-            args=(session,),
-            kwargs={
-                "automator": _build_automator(booking),
-                "request": booking,
-                "on_finish": on_finish,
-            },
-            name=f"booking-session-{task_id}",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=run_booking_session,
+                args=(session,),
+                kwargs={
+                    "automator": automator,
+                    "request": booking,
+                    "on_finish": on_finish,
+                    "on_ready": on_ready,
+                },
+                name=f"booking-session-{task_id}",
+                daemon=True,
+            ).start()
+        except Exception:
+            session.status = "failed"
+            session.message = "無法啟動訂票工作"
+            on_finish(session)
+            raise
 
         logger.info(
             "booking session started",
@@ -746,6 +765,29 @@ def create_app(
             expires_at=session.expires_at.isoformat(),
             notice=BOOKING_SESSION_NOTICE,
         )
+
+    def prepare_scheduled_booking(task: TaskRecord) -> None:
+        _start_booking(task.id, task.user_id)
+
+    scheduler.prepare_booking = prepare_scheduled_booking
+
+    @app.post(
+        "/tasks/{task_id}/booking-session",
+        response_model=BookingSessionResponse,
+        status_code=201,
+    )
+    def start_booking_session(task_id: str, user: CurrentUser) -> BookingSessionResponse:
+        try:
+            return _start_booking(task_id, user.id)
+        except SessionBusyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"另一個訂票 session 進行中（任務 {exc.active_task_id}），"
+                    f"約 {exc.remaining_seconds} 秒後釋放。一次只能解一個驗證。"
+                ),
+                headers={"Retry-After": str(max(1, exc.remaining_seconds))},
+            ) from exc
 
     @app.get("/booking-session/{session_token}/verify", status_code=204)
     def verify_booking_session(session_token: str) -> Response:
@@ -779,7 +821,7 @@ def create_app(
         session = sessions.resolve(session_token)
         if session is None or session.user_id != user.id:
             raise HTTPException(status_code=403, detail="Session is invalid or expired")
-        sessions.release(session_token)
+        session.stop.set()
         return Response(status_code=204)
 
     @app.delete("/tasks/{task_id}", status_code=204)
@@ -788,7 +830,7 @@ def create_app(
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         active = sessions.active
-        if active is not None and active.task_id == task_id and not active.is_expired():
+        if active is not None and active.task_id == task_id:
             raise HTTPException(
                 status_code=409,
                 detail="這個任務正在訂票中；請先關閉訂票畫面再刪除。",
@@ -809,6 +851,9 @@ def create_app(
         if task.status not in {"scheduled", "monitoring", "waiting_human"}:
             raise HTTPException(status_code=409, detail="Task cannot be cancelled")
         db.update_task_status(task_id, user.id, "cancelled")
+        active = sessions.active
+        if active is not None and active.task_id == task_id and active.user_id == user.id:
+            active.stop.set()
         return Response(status_code=204)
 
     app.state.database = db

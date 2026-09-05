@@ -5,6 +5,8 @@ assert the selectors and values we send, not a live page: CI installs no
 browser, and the point is to catch a silent drift from that contract.
 """
 
+from unittest.mock import Mock
+
 import pytest
 
 from tra_sniper.automation import TRCBookingAutomator, station_code
@@ -31,8 +33,8 @@ class FakeLocator:
     def check(self):
         self._record("check", None)
 
-    def all_attribute_values(self, name):
-        assert name == "value"
+    def evaluate_all(self, expression):
+        assert expression == "options => options.map(option => option.value)"
         return list(self.ride_dates)
 
     def count(self):
@@ -92,6 +94,17 @@ def test_form_drives_the_official_select_controls():
     assert ("#seatPref0", "select_option", "NONE") in calls
     assert ("#chgSeat0", "select_option", "true") in calls
     assert ("#pid", "fill", "A123456789") in calls
+
+
+def test_form_uses_real_playwright_locator_methods():
+    # The browser extra is optional; checking its API needs no browser process.
+    playwright = pytest.importorskip("playwright.sync_api")
+    page = FakePage()
+    page.locator = Mock(side_effect=lambda selector: Mock(
+        spec_set=playwright.Locator,
+        wraps=FakeLocator(page.calls, selector, page.ride_dates),
+    ))
+    prepared(page)
 
 
 def test_order_type_and_trip_type_are_never_clicked():

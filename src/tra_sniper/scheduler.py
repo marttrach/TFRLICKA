@@ -2,22 +2,17 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 
-from .browser_session import BookingSessionManager
+from .browser_session import BookingSessionManager, SessionBusyError
 from .notifications import WebhookNotifier
-from .storage import MODE_MONITOR_ONLY, Database
+from .storage import MODE_MONITOR_ONLY, POLLABLE_STATUSES, Database, TaskRecord
 
 logger = logging.getLogger(__name__)
 
 
 class TaskScheduler:
-    """Runs the monitoring poll loop; it never solves CAPTCHA.
-
-    A "check" cannot report seat availability: TDX publishes no TRA seat data
-    (PLAN.md 7.1) and polling the booking site is forbidden by development
-    constraints 4 and 6. A check reports that a task's monitoring window is
-    open and, in book_when_available mode, hands it to a person to verify.
-    """
+    """Prepare due bookings, then pause for one human handoff notification."""
 
     def __init__(
         self,
@@ -26,6 +21,7 @@ class TaskScheduler:
         interval_seconds: float = 5.0,
         notifier: WebhookNotifier | None = None,
         session_manager: BookingSessionManager | None = None,
+        prepare_booking: Callable[[TaskRecord], None] | None = None,
     ) -> None:
         self.database = database
         self.interval_seconds = interval_seconds
@@ -33,6 +29,7 @@ class TaskScheduler:
         # Reusing this tick as the session reaper avoids a second background
         # thread whose only job would be to check one timestamp.
         self.session_manager = session_manager
+        self.prepare_booking = prepare_booking
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -48,12 +45,30 @@ class TaskScheduler:
                 extra={"event": "monitor.expired", "task_id": expired.id},
             )
 
-        promoted_tasks = self.database.promote_due_task_records()
+        promoted_tasks = []
+        promoted = 0
         for task in self.database.claim_due_checks():
-            self._run_check(task)
-            promoted_tasks.append(task)
+            try:
+                if self._run_check(task):
+                    promoted_tasks.append(task)
+                promoted += 1
+            except SessionBusyError:
+                # The claim already schedules another attempt at the interval.
+                continue
+            except Exception:
+                record = self.database.get_task(task.id, task.user_id)
+                if record is None or record.status not in POLLABLE_STATUSES:
+                    continue
+                self.database.update_task_status(
+                    task.id, task.user_id, "failed", last_error="無法準備訂票頁，請確認設定後重建任務"
+                )
+                logger.exception("scheduled booking preparation failed")
+                if self.notifier.enabled:
+                    try:
+                        self.notifier.notify_result(task, "failed")
+                    except Exception:
+                        logger.exception("booking failure notification failed")
 
-        promoted = len(promoted_tasks)
         if promoted:
             logger.info(
                 "tasks are ready for human action",
@@ -71,22 +86,13 @@ class TaskScheduler:
                     )
         return promoted
 
-    def _run_check(self, task) -> None:  # type: ignore[no-untyped-def]
-        """Record one monitoring check.
-
-        There is nothing to query yet: no authorised seat-availability source
-        exists, so a check cannot decide "there is a seat". It records that the
-        window is open and, in book_when_available mode, moves the task to
-        waiting_human so the person can open a booking session. Claiming the
-        task already pushed next_check_at forward, so a check that finds
-        nothing simply waits for the next interval.
-        """
+    def _run_check(self, task: TaskRecord) -> bool:
+        """Return whether to notify now; browser workers notify when ready."""
         self.database.clear_check_failures(task.id, task.user_id)
-        if task.mode == MODE_MONITOR_ONLY:
-            return
-        # Leaving the pollable statuses is what stops the loop from opening a
-        # second browser while the first one is still waiting for a person.
-        self.database.pause_monitoring(task.id, task.user_id, "waiting_human")
+        if task.mode != MODE_MONITOR_ONLY and self.prepare_booking is not None:
+            self.prepare_booking(task)
+            return False
+        return self.database.pause_monitoring(task.id, task.user_id, "waiting_human")
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
