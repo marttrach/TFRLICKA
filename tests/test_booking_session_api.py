@@ -303,7 +303,7 @@ def test_preparation_failure_stops_without_a_ready_notification(tmp_path, monkey
         notifier.notify_result.assert_called_once()
 
 
-def test_expired_worker_keeps_slot_until_cleanup_and_does_not_restart(tmp_path, monkeypatch):
+def test_expired_worker_keeps_slot_until_cleanup_then_requeues(tmp_path, monkeypatch):
     cleanup = threading.Event()
     finished = threading.Event()
     database, app = _app(tmp_path, threading.Event())
@@ -332,7 +332,9 @@ def test_expired_worker_keeps_slot_until_cleanup_and_does_not_restart(tmp_path, 
             assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 409
             cleanup.set()
             assert finished.wait(1)
-            assert database.get_task(task_id, 1).status == "timeout"
+            # Nobody took over in time, so the task waits for its next round
+            # rather than dying; the slot is still freed first.
+            assert database.get_task(task_id, 1).status == "monitoring"
             assert app.state.booking_sessions.active is None
             assert app.state.scheduler.tick() == 0
     finally:

@@ -46,12 +46,12 @@ class TaskScheduler:
             )
 
         promoted_tasks = []
-        promoted = 0
+        claimed = 0
         for task in self.database.claim_due_checks():
             try:
                 if self._run_check(task):
                     promoted_tasks.append(task)
-                promoted += 1
+                claimed += 1
             except SessionBusyError:
                 # The claim already schedules another attempt at the interval.
                 continue
@@ -69,10 +69,13 @@ class TaskScheduler:
                     except Exception:
                         logger.exception("booking failure notification failed")
 
-        if promoted:
+        # Claimed, not handed off: a task prepared in a browser is not ready
+        # for anyone until its worker says so, and it is counted here anyway
+        # because the caller uses this to know the tick did something.
+        if claimed:
             logger.info(
-                "tasks are ready for human action",
-                extra={"event": "scheduler.tasks_promoted", "promoted_count": promoted},
+                "due tasks claimed",
+                extra={"event": "scheduler.tasks_claimed", "claimed_count": claimed},
             )
         if self.notifier.enabled:
             for task in promoted_tasks:
@@ -84,7 +87,7 @@ class TaskScheduler:
                         "task webhook failed; task remains ready for human action",
                         extra={"event": "notification.webhook_failed", "task_id": task.id},
                     )
-        return promoted
+        return claimed
 
     def _run_check(self, task: TaskRecord) -> bool:
         """Return whether to notify now; browser workers notify when ready."""

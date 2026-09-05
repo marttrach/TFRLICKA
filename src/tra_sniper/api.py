@@ -719,8 +719,20 @@ def create_app(
                 )
             finally:
                 sessions.release(finished.token)
-            # Cancellation also stops polling. Reopening automatically would
-            # create another handoff notification after the person dismissed it.
+            # A round that produced no booking code means this attempt did not
+            # get there, so the task goes back in the poll loop and prepares
+            # again one interval later. Cancellation is the person saying stop,
+            # and a booking code means there is nothing left to retry.
+            if (
+                finished.handed_off
+                and finished.status in {"failed", "timeout"}
+                and not finished.booking_code
+            ):
+                db.resume_monitoring(
+                    finished.task_id,
+                    finished.user_id,
+                    delay_seconds=task.poll_interval_seconds,
+                )
             record = db.get_task(finished.task_id, finished.user_id)
             if record and scheduler.notifier.enabled:
                 try:

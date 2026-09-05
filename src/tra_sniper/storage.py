@@ -741,6 +741,24 @@ class Database:
             ).fetchall()
         return [TaskRecord(**dict(row)) for row in rows]
 
+    def resume_monitoring(self, task_id: str, user_id: int, delay_seconds: int = 0) -> bool:
+        """Put a task back in the poll loop after a round nobody finished.
+
+        Only reached when the session ended with no booking code, so there is
+        nothing to book twice. A closed monitor window still wins.
+        """
+        now = utc_now()
+        following = (datetime.fromisoformat(now) + timedelta(seconds=delay_seconds)).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET status = 'monitoring', next_check_at = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ? "
+                "AND status IN ('waiting_human', 'failed', 'timeout') "
+                "AND (monitor_until IS NULL OR monitor_until > ?)",
+                (following, now, task_id, user_id, now),
+            )
+        return cursor.rowcount == 1
+
     def pause_monitoring(self, task_id: str, user_id: int, status: str) -> bool:
         """Move a task out of the pollable states so no check can claim it."""
         with self.connect() as connection:
@@ -752,21 +770,3 @@ class Database:
                 (status, utc_now(), task_id, user_id, utc_now()),
             )
         return cursor.rowcount == 1
-
-    def promote_due_tasks(self, now: str | None = None) -> int:
-        return len(self.promote_due_task_records(now))
-
-    def promote_due_task_records(self, now: str | None = None) -> list[TaskRecord]:
-        """One-shot promotion, kept for tasks created before monitoring existed."""
-        updated_at = utc_now()
-        with self.connect() as connection:
-            rows = connection.execute(
-                f"""
-                UPDATE tasks SET status = 'waiting_human', updated_at = ?
-                WHERE status = 'scheduled' AND scheduled_at <= ?
-                      AND next_check_at IS NULL AND monitor_until IS NULL
-                RETURNING {TASK_COLUMNS}
-                """,
-                (updated_at, now or updated_at),
-            ).fetchall()
-        return [TaskRecord(**dict(row)) for row in rows]

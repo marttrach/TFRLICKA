@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 SESSION_TTL_SECONDS = 15 * 60
 TOKEN_BYTES = 32
+# How long a signalled worker gets to close its browser context before the
+# slot is taken back. Without this a worker that never reaches on_finish
+# blocks every future session until the API restarts.
+CLEANUP_GRACE_SECONDS = 60
 
 # Terminal states never resolve a token again; the browser context is gone.
 FINISHED_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled"})
@@ -38,6 +42,11 @@ class BookingSession:
     booking_code: str | None = None
     message: str = ""
     stop: threading.Event = field(default_factory=threading.Event)
+    stopped_at: datetime | None = None
+    # Whether the browser ever reached a point a person could take over.
+    # A round that never got there failed structurally, and retrying it
+    # would just hammer a page we cannot fill.
+    handed_off: bool = False
 
     def __repr__(self) -> str:
         # The token must never reach a log line, an exception, or a repr in a
@@ -106,11 +115,28 @@ class BookingSessionManager:
         return active
 
     def reap(self) -> BookingSession | None:
-        """Stop an expired session; its worker releases the slot after cleanup."""
+        """Stop an expired session, then take its slot back if it never cleans up."""
+        now = datetime.now(UTC)
         with self._lock:
             active = self._active
-            if active is None or not active.is_expired() or active.stop.is_set():
+            if active is None or not active.is_expired(now):
                 return None
+            if active.stop.is_set():
+                stopped_at = active.stopped_at
+                if stopped_at is None:
+                    return None
+                if (now - stopped_at).total_seconds() < CLEANUP_GRACE_SECONDS:
+                    return None
+                self._active = None
+                logger.warning(
+                    "booking session slot force-released; its worker never finished",
+                    extra={
+                        "event": "booking_session.force_released",
+                        "task_id": active.task_id,
+                    },
+                )
+                return active
+            active.stopped_at = now
         active.stop.set()
         logger.info(
             "booking session expired; waiting for browser cleanup",
@@ -143,6 +169,7 @@ def run_booking_session(
         if session.status != "preparing" or session.stop.is_set() or session.is_expired():
             return
         session.status = "waiting_verification"
+        session.handed_off = True
         if on_ready:
             try:
                 on_ready(session)

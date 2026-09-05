@@ -186,19 +186,19 @@ def test_backoff_is_capped(tmp_path) -> None:
     assert database.get_task(task.id, user.id).check_failures == 8
 
 
-def test_one_shot_tasks_created_before_monitoring_still_promote(tmp_path) -> None:
-    """A task with no monitor window keeps the original fire-once behaviour."""
+def test_a_task_without_a_deadline_is_still_claimed(tmp_path) -> None:
+    """No monitor_until means "keep going until I book it or cancel"."""
     database = _db(tmp_path)
     user = database.create_user("a@example.com", "hash")
     now = datetime.now(UTC)
     task = _task(database, user.id, start=now - timedelta(minutes=1), until=None)
 
     assert task.monitor_until is None
-    promoted = database.promote_due_task_records()
-    assert [item.id for item in promoted] == [task.id]
-    assert database.get_task(task.id, user.id).status == "waiting_human"
-    # And it is not also picked up by the poll loop.
-    assert database.claim_due_checks(now.isoformat()) == []
+    # A task with no deadline is still claimed; the loop stops when it is booked
+    # or the person cancels, which is what "until I get it" means.
+    claimed = database.claim_due_checks(now.isoformat())
+    assert [item.id for item in claimed] == [task.id]
+    assert database.get_task(task.id, user.id).status == "monitoring"
 
 
 def test_monitor_start_at_is_the_start_not_the_interval(tmp_path) -> None:

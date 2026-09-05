@@ -35,8 +35,9 @@ def test_task_payload_is_encrypted_and_due_task_is_promoted(tmp_path) -> None:
 
     assert database.get_task_payload(task.id, user.id)["identity"] == "TEST-ID"
     assert "TEST-ID" not in (tmp_path / "app.db").read_bytes().decode("latin1")
-    assert database.promote_due_tasks((datetime.now(UTC) + timedelta(minutes=6)).isoformat()) == 1
-    assert database.get_task(task.id, user.id).status == "waiting_human"
+    claimed = database.claim_due_checks((datetime.now(UTC) + timedelta(minutes=6)).isoformat())
+    assert [item.id for item in claimed] == [task.id]
+    assert database.get_task(task.id, user.id).status == "monitoring"
 
 
 def test_existing_database_is_migrated_without_losing_users(tmp_path) -> None:

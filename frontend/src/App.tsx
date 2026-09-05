@@ -614,7 +614,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           },
         },
       });
-      setNotice("任務已排入；需要你接手時只通知一次並暫停，請完成官方驗證與送出。通知不代表有位。");
+      setNotice("任務已排入；每個間隔會自動備好訂票頁並通知你接手，直到訂到或超過截止時間。通知不代表有位。");
       setForm((current) => ({ ...current, trainNumber: "", chosenTrain: null }));
       await loadTasks();
     } catch (reason) {
@@ -812,7 +812,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               {!form.startNow && (
                 <label className="wide">開始監控時間<input type="datetime-local" value={form.scheduledAt} onChange={(e) => setForm({ ...form, scheduledAt: e.target.value })} required /></label>
               )}
-                <label>瀏覽器忙碌時的重試間隔
+              <label>重試間隔
                 <select value={form.pollIntervalMinutes} onChange={(e) => setForm({ ...form, pollIntervalMinutes: Number(e.target.value) })}>
                   {[1, 3, 5, 10, 15, 30, 60].map((minutes) => (
                     <option value={minutes} key={minutes}>{minutes} 分鐘</option>
@@ -822,7 +822,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               <label>監控截止時間<input type="datetime-local" value={form.monitorUntil} onChange={(e) => setForm({ ...form, monitorUntil: e.target.value })} /></label>
               <p className="wide privacy-note">
                 系統<strong>無法得知任何車次是否有位</strong>：台鐵餘票沒有可用的官方開放資料來源。
-                到點準備頁面，遇驗證或需要確認送出時暫停並通知一次；等候最長 15 分鐘，且不超過監控截止時間。取消或逾時後不自動重開。
+                每個間隔自動備好訂票頁並通知你接手，每輪最多等你 15 分鐘。驗證與送出一律由你本人完成。沒完成就等下一輪，直到訂到、你取消，或超過監控截止時間。
               </p>
               {error && <p className="error wide" role="alert">{error}</p>}
               {notice && <p className="notice wide" role="status">{notice}</p>}
@@ -863,7 +863,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <span className={`status status-${task.status}`}>{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
                     <p className="task-train">{task.train_label ?? "未指定車次"}</p>
-                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "自動準備，等待人工接手"}</p>
+                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "每輪自動備頁，等你接手"}</p>
                     {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
                   </div>
                   <dl className="task-time">
