@@ -89,7 +89,7 @@ docker compose up -d
 |---|---|---|
 | `scheduled_at`／`monitor_start_at` | 何時**開始**監控 | 立即 |
 | `poll_interval_seconds` | 沒訂成時，多久再備一次訂票頁 | 300 秒（5 分鐘） |
-| `monitor_until` | 監控**截止**時間 | 未設定＝單次執行 |
+| `monitor_until` | 監控**截止**時間 | 未設定＝直到訂到或取消 |
 
 執行模式：`monitor_only`（到點提醒一次）或 `book_when_available`（每個間隔自動開頁填表）。
 
@@ -112,7 +112,10 @@ docker compose up -d
 - 使用者取消（`cancelled`）不重試：那是本人喊停
 - 逾時重試有極小的重複訂位風險：若你已按下訂票但官方結果未被辨識，下一輪會再備一次頁；
   接手前請先確認官方訂位紀錄
-- 取消或逾時先停止 session，等原瀏覽器 context 關閉後才開放下一個任務
+- 取消或逾時會撤銷正在連線的 VNC；原瀏覽器 context 與舊連線都關閉後才開放下一個任務
+- 停止超過 60 秒仍未清理時，會嘗試重啟專用瀏覽器 sidecar；無法確認恢復則保留鎖，不讓兩個任務共用桌面
+- 每輪結果與重試排程分開顯示；本輪結束後關閉舊畫面，下一輪從任務重新開啟
+- 修改日期、站點或查詢時段後，從時刻建議選取的車次會解除鎖定，必須重新選擇
 - 通知失敗只記錄日誌，不重開頁面或重複通知；結束時另發一次訂票結果事件
 
 ## 🧰 CLI 模式
@@ -139,6 +142,15 @@ tra-sniper book booking.json --submit --wait-seconds 600
 `TRA_VERIFICATION_PROVIDER` 正式環境維持 `manual`。`mock` 有強制 localhost
 限制，只用來測試未來驗證交接流程；`official_api` 已保留穩定介面，但在取得
 台鐵核准的端點、認證與回應格式以前會明確回報尚未設定。
+
+### 開發回歸測試
+
+一般測試執行 `pytest`。瀏覽器回歸測試使用已安裝的 `[browser]` extra 與 Chromium：
+先在 `frontend` 執行 `pnpm dev`，再於專案根目錄執行
+`TRA_TEST_FRONTEND_URL=http://127.0.0.1:5173 pytest tests/test_dashboard_browser.py`。
+測試只使用本機假資料，不會向台鐵送出訂票。
+
+VNC 修正需要同步更新 **API 與 frontend** 容器；瀏覽器容器仍沿用既有映像與重啟政策。
 
 ## 🔔 任務就緒通知
 

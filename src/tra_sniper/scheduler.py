@@ -91,7 +91,6 @@ class TaskScheduler:
 
     def _run_check(self, task: TaskRecord) -> bool:
         """Return whether to notify now; browser workers notify when ready."""
-        self.database.clear_check_failures(task.id, task.user_id)
         if task.mode != MODE_MONITOR_ONLY and self.prepare_booking is not None:
             self.prepare_booking(task)
             return False

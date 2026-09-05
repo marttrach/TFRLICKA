@@ -8,8 +8,20 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Response,
+    UploadFile,
+    WebSocket,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -37,6 +49,7 @@ from .suggestions import SuggestionService
 from .tdx import TdxClient, TdxError
 from .tra_ocr import TraOcrService
 from .verification import VerificationProvider, create_verification_provider
+from .vnc_proxy import relay_vnc
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 DEFAULT_DEV_ORIGINS = (
@@ -99,7 +112,7 @@ class TaskCreate(BaseModel):
     poll_interval_seconds: int = Field(
         default=DEFAULT_POLL_INTERVAL_SECONDS, ge=MIN_POLL_INTERVAL_SECONDS, le=86_400
     )
-    # Omitted means the old one-shot behaviour: fire once, never repeat.
+    # Omitted means retry until booked or cancelled (monitor_only still reminds once).
     monitor_until: datetime | None = None
 
 
@@ -267,7 +280,7 @@ def create_app(
             scheduler.stop()
             active = sessions.active
             if active is not None:
-                active.stop.set()
+                active.request_stop()
 
     app = FastAPI(
         title="TRA-Sniper API",
@@ -703,15 +716,35 @@ def create_app(
             if record and record.status == "waiting_human" and scheduler.notifier.enabled:
                 scheduler.notifier.notify(record, payload)
 
+        finish_lock = threading.RLock()
+        finish_done = False
+
         def on_finish(finished: Any) -> None:
+            nonlocal finish_done
+            with finish_lock:
+                if finish_done:
+                    record = db.get_task(finished.task_id, finished.user_id)
+                    # Recovery may unblock cleanup after a code was already
+                    # read. Keep that late real result, but never retry twice.
+                    if not finished.booking_code or not record or record.booking_code:
+                        return
+                finish_done = True
+                finish_once(finished)
+
+        def finish_once(finished: Any) -> None:
             try:
-                db.update_task_status(
+                updated = db.update_task_status(
                     finished.task_id,
                     finished.user_id,
                     finished.status,
                     last_error=finished.message if finished.status != "completed" else None,
                     booking_code=finished.booking_code,
                 )
+                if not updated:
+                    record = db.get_task(finished.task_id, finished.user_id)
+                    if record:
+                        finished.status = record.status
+                        finished.booking_code = record.booking_code
             finally:
                 sessions.release(finished.token)
             # A round that produced no booking code means this attempt did not
@@ -729,6 +762,10 @@ def create_app(
                     delay_seconds=task.poll_interval_seconds,
                 )
             record = db.get_task(finished.task_id, finished.user_id)
+            active = sessions.active
+            if (finished.booking_code and active is not None
+                    and active.task_id == finished.task_id and active.token != finished.token):
+                active.request_stop()
             if record and scheduler.notifier.enabled:
                 try:
                     scheduler.notifier.notify_result(
@@ -742,6 +779,20 @@ def create_app(
                             "task_id": finished.task_id,
                         },
                     )
+
+        def recover() -> None:
+            # A stopped Python thread cannot be killed safely. Reset its actual
+            # browser first; a late worker callback must not finish a new round.
+            with finish_lock:
+                if finish_done:
+                    return
+                automator.reset_browser()
+                if not session.booking_code:
+                    session.status = "cancelled" if session.cancelled_by_user else "timeout"
+                    session.message = "瀏覽器未正常退出，已重新啟動並結束本輪。"
+                on_finish(session)
+
+        session.recover = recover
 
         try:
             threading.Thread(
@@ -803,19 +854,36 @@ def create_app(
             raise HTTPException(status_code=403, detail="Session is invalid or expired")
         return Response(status_code=204)
 
+    @app.websocket("/booking-session/{session_token}/websockify")
+    async def booking_stream(websocket: WebSocket, session_token: str) -> None:
+        host = urlsplit(os.getenv("TRA_BROWSER_CDP_URL", "")).hostname
+        if not host:
+            await websocket.close(code=1011)
+            return
+        await relay_vnc(websocket, sessions, session_token, host)
+
     @app.get("/tasks/{task_id}/booking-result", response_model=BookingResultResponse)
-    def booking_result(task_id: str, user: CurrentUser) -> BookingResultResponse:
+    def booking_result(
+        task_id: str, user: CurrentUser,
+        session_token: Annotated[str | None, Header(alias="X-Booking-Session")] = None,
+    ) -> BookingResultResponse:
+        task = db.get_task(task_id, user.id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
         active = sessions.active
-        if active and active.task_id == task_id and active.user_id == user.id:
+        if (active and active.task_id == task_id and active.user_id == user.id
+                and (session_token is None or session_token == active.token)):
             return BookingResultResponse(
                 task_id=task_id,
                 status=active.status,
                 booking_code=active.booking_code,
                 message=active.message,
             )
-        task = db.get_task(task_id, user.id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not found")
+        if session_token and task.status in {"scheduled", "monitoring", "waiting_human"}:
+            return BookingResultResponse(
+                task_id=task_id, status="ended", booking_code=None,
+                message="本輪已結束，請關閉畫面；下一輪就緒後可從任務重新開啟。",
+            )
         return BookingResultResponse(
             task_id=task_id,
             status=task.status,
@@ -828,7 +896,8 @@ def create_app(
         session = sessions.resolve(session_token)
         if session is None or session.user_id != user.id:
             raise HTTPException(status_code=403, detail="Session is invalid or expired")
-        session.stop.set()
+        db.update_task_status(session.task_id, user.id, "cancelled")
+        session.request_stop()
         return Response(status_code=204)
 
     @app.delete("/tasks/{task_id}", status_code=204)
@@ -857,10 +926,11 @@ def create_app(
         # and the patrol loop makes it the state a task spends most time in.
         if task.status not in {"scheduled", "monitoring", "waiting_human"}:
             raise HTTPException(status_code=409, detail="Task cannot be cancelled")
-        db.update_task_status(task_id, user.id, "cancelled")
+        if not db.update_task_status(task_id, user.id, "cancelled"):
+            raise HTTPException(status_code=409, detail="Task has already finished")
         active = sessions.active
         if active is not None and active.task_id == task_id and active.user_id == user.id:
-            active.stop.set()
+            active.request_stop()
         return Response(status_code=204)
 
     app.state.database = db

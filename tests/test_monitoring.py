@@ -144,48 +144,6 @@ def test_a_live_booking_session_pauses_the_poll_loop(tmp_path) -> None:
     assert database.claim_due_checks((now + timedelta(hours=1)).isoformat()) == []
 
 
-def test_failures_back_off_and_success_resets(tmp_path) -> None:
-    database = _db(tmp_path)
-    user = database.create_user("a@example.com", "hash")
-    now = datetime.now(UTC)
-    task = _task(
-        database,
-        user.id,
-        start=now - timedelta(minutes=1),
-        until=now + timedelta(days=1),
-        interval=60,
-    )
-    database.claim_due_checks(now.isoformat())
-
-    assert database.record_check_failure(task.id, user.id, "upstream 429") == 1
-    first_gap = _gap_from_now(database, task, user)
-    assert database.record_check_failure(task.id, user.id, "upstream 429") == 2
-    second_gap = _gap_from_now(database, task, user)
-    assert second_gap > first_gap, "a repeated failure must wait longer, not the same"
-
-    database.clear_check_failures(task.id, user.id)
-    assert database.get_task(task.id, user.id).check_failures == 0
-
-
-def _gap_from_now(database, task, user) -> float:
-    stored = database.get_task(task.id, user.id)
-    return (
-        datetime.fromisoformat(stored.next_check_at) - datetime.now(UTC)
-    ).total_seconds()
-
-
-def test_backoff_is_capped(tmp_path) -> None:
-    database = _db(tmp_path)
-    user = database.create_user("a@example.com", "hash")
-    now = datetime.now(UTC)
-    task = _task(
-        database, user.id, start=now - timedelta(minutes=1), until=now + timedelta(days=9), interval=60
-    )
-    for _ in range(20):
-        database.record_check_failure(task.id, user.id, "still broken")
-    assert database.get_task(task.id, user.id).check_failures == 8
-
-
 def test_a_task_without_a_deadline_is_still_claimed(tmp_path) -> None:
     """No monitor_until means "keep going until I book it or cancel"."""
     database = _db(tmp_path)

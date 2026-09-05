@@ -220,10 +220,11 @@ const STATUS_TEXT: Record<string, string> = {
   failed: "訂票失敗",
   timeout: "逾時未完成",
   expired: "監控已截止",
+  ended: "本輪已結束",
 };
 
 // The four statuses browser_session.FINISHED_STATUSES can end a session with.
-const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled"];
+const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled", "expired", "ended"];
 
 interface BookingSession {
   taskId: string;
@@ -490,6 +491,13 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
 
   const currentSuggestionKey = [form.startStation, form.endStation, form.rideDate, form.startTime, form.endTime, form.preferReserved, form.includeTransfers].join("|");
 
+  useEffect(() => {
+    // Only invalidate a timetable selection, not a manually entered number.
+    setNotice("");
+    setForm((current) => current.chosenTrain
+      ? { ...current, trainNumber: "", chosenTrain: null } : current);
+  }, [currentSuggestionKey]);
+
   const loadTasks = useCallback(async () => {
     try {
       setTasks(await api.tasks(token));
@@ -539,7 +547,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     if (!booking || FINISHED_STATUSES.includes(booking.status)) return;
     const timer = window.setInterval(async () => {
       try {
-        const result = await api.bookingResult(token, booking.taskId);
+        const result = await api.bookingResult(token, booking.taskId, booking.sessionToken);
         setBooking((current) => current && current.taskId === result.task_id
           ? { ...current, status: result.status, bookingCode: result.booking_code, message: result.message }
           : current);
@@ -585,6 +593,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     setError("");
     setNotice("");
     try {
+      if (form.chosenTrain && suggestionKey !== currentSuggestionKey) {
+        throw new Error("查詢條件已變更，請重新查詢並選擇車次。");
+      }
       await api.createTask(token, {
         // "Start now" sends no time at all: stamping this clock and having the
         // server compare it to its own only ever measured the gap between them.
@@ -883,7 +894,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <details className="task-details">
                       <summary>查看詳情</summary>
                       <p>查詢間隔：每 {Math.round(task.poll_interval_seconds / 60)} 分鐘</p>
-                      <p>監控截止：{task.monitor_until ? formatDate(task.monitor_until) : "未設定（單次執行）"}</p>
+                      <p>監控截止：{task.monitor_until ? formatDate(task.monitor_until) : task.mode === "monitor_only" ? "未設定（提醒一次）" : "未設定（直到訂到或取消）"}</p>
                       <p className="unknown">{task.availability_note}</p>
                       {task.last_error && <p className="error">最近錯誤：{task.last_error}</p>}
                       {task.status === "waiting_human" && <button className="compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
@@ -925,7 +936,7 @@ function BookingScreen({ session, onClose }: { session: BookingSession; onClose:
           <b>{STATUS_TEXT[session.status] ?? session.status}</b>
           {session.bookingCode && <p className="booking-code">訂位代碼 {session.bookingCode}</p>}
           {session.message && <p>{session.message}</p>}
-          <p className="boundary-note">請至台鐵官網或超商於期限內完成付款取票。</p>
+          {session.bookingCode && <p className="boundary-note">請至台鐵官網或超商於期限內完成付款取票。</p>}
         </div>
       ) : (
         <iframe title="台鐵訂票畫面" src={viewerUrl(session.sessionToken)} allow="clipboard-write" />

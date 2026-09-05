@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 SESSION_TTL_SECONDS = 15 * 60
 TOKEN_BYTES = 32
 # How long a signalled worker gets to close its browser context before the
-# slot is taken back. Without this a worker that never reaches on_finish
-# blocks every future session until the API restarts.
+# browser is recovered. Never reuse the desktop before cleanup succeeds.
 CLEANUP_GRACE_SECONDS = 60
 
 # Terminal states never resolve a token again; the browser context is gone.
@@ -47,6 +46,16 @@ class BookingSession:
     # A round that never got there failed structurally, and retrying it
     # would just hammer a page we cannot fill.
     handed_off: bool = False
+    cancelled_by_user: bool = False
+    worker_done: bool = False
+    streams: int = 0
+    recover: Callable[[], None] | None = field(default=None, repr=False)
+
+    def request_stop(self, *, cancelled: bool = True) -> None:
+        if cancelled:
+            self.cancelled_by_user = True
+        self.stopped_at = self.stopped_at or datetime.now(UTC)
+        self.stop.set()
 
     def __repr__(self) -> str:
         # The token must never reach a log line, an exception, or a repr in a
@@ -73,7 +82,7 @@ class BookingSessionManager:
 
     def __init__(self, ttl_seconds: int = SESSION_TTL_SECONDS) -> None:
         self.ttl_seconds = ttl_seconds
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._active: BookingSession | None = None
 
     def acquire(self, task_id: str, user_id: int) -> BookingSession:
@@ -105,43 +114,56 @@ class BookingSessionManager:
             return active
 
     def release(self, token: str) -> BookingSession | None:
-        """Drop the session so its token stops resolving, and signal its worker."""
+        """Revoke access; reuse the slot only after worker AND streams close."""
         with self._lock:
             active = self._active
             if active is None or not hmac.compare_digest(active.token, token):
                 return None
-            self._active = None
-        active.stop.set()
+            active.worker_done = True
+            active.request_stop(cancelled=False)
+            if active.streams == 0:
+                self._active = None
         return active
 
+    def attach_stream(self, token: str) -> BookingSession | None:
+        with self._lock:
+            session = self.resolve(token)
+            if session is not None:
+                session.streams += 1
+            return session
+
+    def detach_stream(self, session: BookingSession) -> None:
+        with self._lock:
+            session.streams -= 1
+            if self._active is session and session.worker_done and session.streams == 0:
+                self._active = None
+
     def reap(self) -> BookingSession | None:
-        """Stop an expired session, then take its slot back if it never cleans up."""
+        """Stop expired sessions and recover stuck workers, including cancellations."""
         now = datetime.now(UTC)
         with self._lock:
             active = self._active
-            if active is None or not active.is_expired(now):
+            if active is None or active.worker_done:
                 return None
             if active.stop.is_set():
-                stopped_at = active.stopped_at
-                if stopped_at is None:
+                # Also cover older callers that signalled the event directly.
+                active.stopped_at = active.stopped_at or now
+                if (now - active.stopped_at).total_seconds() < CLEANUP_GRACE_SECONDS:
                     return None
-                if (now - stopped_at).total_seconds() < CLEANUP_GRACE_SECONDS:
-                    return None
-                self._active = None
-                logger.warning(
-                    "booking session slot force-released; its worker never finished",
-                    extra={
-                        "event": "booking_session.force_released",
-                        "task_id": active.task_id,
-                    },
-                )
+                recover = active.recover
+            elif active.is_expired(now):
+                active.request_stop(cancelled=False)
                 return active
-            active.stopped_at = now
-        active.stop.set()
-        logger.info(
-            "booking session expired; waiting for browser cleanup",
-            extra={"event": "booking_session.reaped", "task_id": active.task_id},
-        )
+            else:
+                return None
+        # Recovery may perform network I/O and call release(). Do not hold the
+        # manager lock here. Failure leaves the slot closed, never shared.
+        if recover is None:
+            return None
+        try:
+            recover()
+        except Exception:
+            logger.exception("browser recovery failed; session remains locked")
         return active
 
     @property
@@ -185,7 +207,9 @@ def run_booking_session(
             on_ready=ready,
         )
         session.status = result.status
-        if session.status == "cancelled" and session.is_expired():
+        if session.cancelled_by_user and not result.booking_code:
+            session.status = "cancelled"
+        elif session.status == "cancelled" and session.is_expired():
             session.status = "timeout"
         session.booking_code = result.booking_code
         session.message = result.message
@@ -193,7 +217,9 @@ def run_booking_session(
         # The worker must never die silently: the person is staring at a browser
         # waiting for an outcome, and the session lock has to be released.
         session.status = "failed"
-        if session.is_expired():
+        if session.cancelled_by_user:
+            session.status = "cancelled"
+        elif session.is_expired():
             session.status = "timeout"
         elif session.stop.is_set():
             session.status = "cancelled"

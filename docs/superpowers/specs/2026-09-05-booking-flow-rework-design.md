@@ -202,7 +202,11 @@ Webhook 失敗只記錄日誌；排程重啟也不會重新認領已暫停的任
 `BookingSessionManager` 規定同時只有一個瀏覽器 session——sidecar 只有一顆瀏覽器，
 這是實體限制而非政策。巡檢必須競爭同一把鎖；兩個任務撞在同一輪時，
 後者等下一個設定間隔，不並行開第二個瀏覽器。
-取消／逾時先發出停止訊號；直到 worker 關閉 context 才釋放鎖。
+取消／逾時先發出停止訊號並記錄時間；直到 worker 關閉 context 且所有 VNC 連線關閉才釋放鎖。
+VNC WebSocket 經 API 持續檢查 session，nginx 只將靜態資源轉給 sidecar，拒絕其他路徑的 Upgrade。
+停止 60 秒後仍未清理就嘗試重啟專用 sidecar 瀏覽器；確認新瀏覽器就緒才結束卡住的工作。
+無法確認恢復時保留鎖，不能只放行下一個任務。背景工作遲到的失敗不得覆寫取消或完成。
+前端以 `X-Booking-Session` 查詢本輪結果；本輪已結束則移除舊 iframe，不跟隨下一輪的 session。
 每次 session 仍使用新 context，不保留跨任務會員登入。
 
 ## 測試策略

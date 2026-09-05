@@ -102,3 +102,19 @@ def test_member_profile_is_encrypted_and_can_be_deleted(tmp_path) -> None:
     assert "railway-password" not in raw_database
     assert database.delete_member_profile(user.id)
     assert database.get_member_profile(user.id) is None
+
+
+def test_terminal_states_resist_late_callbacks_but_keep_a_real_booking_code(tmp_path):
+    database = Database(tmp_path / "states.db", encryption_key=Fernet.generate_key().decode())
+    user = database.create_user("audit@example.com", "hash")
+    payload = booking_data()
+    task = database.create_task(user.id, BookingRequest.from_dict(payload),
+                                datetime.now(UTC).isoformat(), payload)
+    assert database.update_task_status(task.id, user.id, "cancelled")
+    assert not database.update_task_status(task.id, user.id, "failed")
+    assert not database.resume_monitoring(task.id, user.id)
+    # Cancellation must never discard a code returned by an already-submitted booking.
+    assert database.update_task_status(task.id, user.id, "completed", booking_code="1234567890")
+    assert not database.update_task_status(task.id, user.id, "cancelled")
+    assert not database.resume_monitoring(task.id, user.id)
+    assert database.get_task(task.id, user.id).booking_code == "1234567890"

@@ -46,9 +46,6 @@ def test_scheduler_tick_returns_promoted_count() -> None:
         def claim_due_checks(self) -> list[object]:
             return [SimpleNamespace(id=str(i), user_id=1, mode="monitor_only") for i in range(3)]
 
-        def clear_check_failures(self, task_id, user_id):
-            pass
-
         def pause_monitoring(self, task_id, user_id, status):
             return True
 

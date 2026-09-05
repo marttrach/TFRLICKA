@@ -38,7 +38,6 @@ TASK_MODES = frozenset({MODE_MONITOR_ONLY, MODE_BOOK_WHEN_AVAILABLE})
 
 DEFAULT_POLL_INTERVAL_SECONDS = 300
 MIN_POLL_INTERVAL_SECONDS = 60
-MAX_BACKOFF_MULTIPLIER = 8
 
 # Statuses the poll loop may claim from. Everything else — a live booking
 # session, a finished task — is deliberately excluded so polling can never
@@ -636,8 +635,11 @@ class Database:
                 UPDATE tasks SET status = ?, updated_at = ?, last_error = ?,
                                  booking_code = COALESCE(?, booking_code)
                 WHERE id = ? AND user_id = ?
+                  AND (status NOT IN ('cancelled', 'completed') OR status = ?
+                       OR (? = 'completed' AND ? IS NOT NULL))
                 """,
-                (status, utc_now(), last_error, booking_code, task_id, user_id),
+                (status, utc_now(), last_error, booking_code, task_id, user_id,
+                 status, status, booking_code),
             )
         return cursor.rowcount == 1
 
@@ -692,40 +694,6 @@ class Database:
                     claimed.append(TaskRecord(**data))
         return claimed
 
-    def record_check_failure(self, task_id: str, user_id: int, error: str) -> int:
-        """Back off exponentially so a broken upstream is not hammered."""
-        now = utc_now()
-        with self.connect() as connection:
-            row = connection.execute(
-                "SELECT check_failures, poll_interval_seconds FROM tasks "
-                "WHERE id = ? AND user_id = ?",
-                (task_id, user_id),
-            ).fetchone()
-            if row is None:
-                return 0
-            failures = min(int(row["check_failures"]) + 1, MAX_BACKOFF_MULTIPLIER)
-            delay = int(row["poll_interval_seconds"]) * (2**failures)
-            connection.execute(
-                "UPDATE tasks SET check_failures = ?, last_error = ?, next_check_at = ?, "
-                "updated_at = ? WHERE id = ? AND user_id = ?",
-                (
-                    failures,
-                    error[:500],
-                    (datetime.fromisoformat(now) + timedelta(seconds=delay)).isoformat(),
-                    now,
-                    task_id,
-                    user_id,
-                ),
-            )
-        return failures
-
-    def clear_check_failures(self, task_id: str, user_id: int) -> None:
-        with self.connect() as connection:
-            connection.execute(
-                "UPDATE tasks SET check_failures = 0 WHERE id = ? AND user_id = ?",
-                (task_id, user_id),
-            )
-
     def expire_finished_monitors(self, now: str | None = None) -> list[TaskRecord]:
         """Stop tasks whose monitor window has closed."""
         moment = now or utc_now()
@@ -754,6 +722,7 @@ class Database:
                 "UPDATE tasks SET status = 'monitoring', next_check_at = ?, updated_at = ? "
                 "WHERE id = ? AND user_id = ? "
                 "AND status IN ('waiting_human', 'failed', 'timeout') "
+                "AND booking_code IS NULL "
                 "AND (monitor_until IS NULL OR monitor_until > ?)",
                 (following, now, task_id, user_id, now),
             )

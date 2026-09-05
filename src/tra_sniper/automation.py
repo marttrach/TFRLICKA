@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 import socket
@@ -10,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 from .models import BookingRequest, Leg, OrderType, TripType
 from .verification import VerificationMode, VerificationProvider, create_verification_provider
@@ -80,6 +83,41 @@ class TRCBookingAutomator:
         # Unset means "launch a browser here", which keeps the CLI working on a
         # laptop with no sidecar container in sight.
         self.cdp_url = cdp_url or os.getenv("TRA_BROWSER_CDP_URL") or None
+
+    def reset_browser(self) -> None:
+        """Recover the dedicated sidecar, not just its abandoned Python worker."""
+        if not self.cdp_url:
+            raise RuntimeError("無法安全重啟本機瀏覽器；請重啟 API 後再試")
+        from playwright.async_api import async_playwright
+
+        def browser_id() -> str:
+            endpoint = urlsplit(cdp_url_over_ipv4(self.cdp_url))._replace(
+                scheme="http", path="/json/version", query="", fragment="",
+            ).geturl()
+            with urlopen(endpoint, timeout=1) as response:
+                return json.load(response)["webSocketDebuggerUrl"]
+
+        async def reset() -> None:
+            async with asyncio.timeout(20), async_playwright() as playwright:
+                original_id = await asyncio.to_thread(browser_id)
+                url = cdp_url_over_ipv4(self.cdp_url)
+                browser = await playwright.chromium.connect_over_cdp(url, timeout=5_000)
+                cdp = await browser.new_browser_cdp_session()
+                await cdp.send("Browser.close")
+                while browser.is_connected():
+                    await asyncio.sleep(0.1)
+                # start-browser.sh exits when Chromium exits; the sidecar's
+                # restart policy brings back a clean desktop. Wait for it so
+                # the next task cannot race the container startup.
+                while True:
+                    try:
+                        if await asyncio.to_thread(browser_id) != original_id:
+                            return
+                    except OSError:
+                        pass
+                    await asyncio.sleep(0.5)
+
+        asyncio.run(reset())
 
     def run(
         self,
