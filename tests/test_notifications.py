@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+import pytest
 
 from tra_sniper.models import BookingRequest
 from tra_sniper.notifications import NOTICE, WebhookNotifier
@@ -70,8 +70,8 @@ def test_webhook_signs_minimal_payload_and_excludes_secrets() -> None:
     }
     assert b"A123456789" not in sent["body"]
     assert b"private" not in sent["body"]
-    expected = hmac.new(b"notification-secret", sent["body"], hashlib.sha256).hexdigest()
-    assert sent["headers"]["X-TRA-Signature"] == f"sha256={expected}"
+    assert sent["headers"]["X-TRA-Token"] == "notification-secret"
+    assert "X-TRA-Signature" not in sent["headers"]
 
 
 def test_booking_result_payload_is_signed_and_excludes_identity() -> None:
@@ -95,9 +95,8 @@ def test_booking_result_payload_is_signed_and_excludes_identity() -> None:
     assert "A123456789" not in sent["body"].decode("utf-8")
     assert "identity" not in payload
 
-    # R-6 keeps the existing HMAC signing rather than a static header token.
-    expected = hmac.new(b"notification-secret", sent["body"], hashlib.sha256).hexdigest()
-    assert sent["headers"]["X-TRA-Signature"] == f"sha256={expected}"
+    assert sent["headers"]["X-TRA-Token"] == "notification-secret"
+    assert "X-TRA-Signature" not in sent["headers"]
 
 
 def test_disabled_webhook_does_not_call_sender() -> None:
@@ -119,7 +118,7 @@ def test_scheduler_posts_to_real_local_http_server(tmp_path) -> None:
         def do_POST(self) -> None:
             size = int(self.headers["Content-Length"])
             received["body"] = self.rfile.read(size)
-            received["signature"] = self.headers["X-TRA-Signature"]
+            received["token"] = self.headers["X-TRA-Token"]
             self.send_response(204)
             self.end_headers()
             ready.set()
@@ -160,10 +159,7 @@ def test_scheduler_posts_to_real_local_http_server(tmp_path) -> None:
         assert decoded["task_id"] == task.id
         assert decoded["action_url"] == f"http://nas.local:43124/tasks/{task.id}"
         assert "identity" not in decoded
-        expected = hmac.new(
-            b"integration-secret", received["body"], hashlib.sha256
-        ).hexdigest()
-        assert received["signature"] == f"sha256={expected}"
+        assert received["token"] == "integration-secret"
     finally:
         server.shutdown()
         server.server_close()
@@ -195,34 +191,124 @@ def test_notification_failure_does_not_roll_back_promotion(tmp_path) -> None:
     assert database.get_task(task.id, user.id).status == "waiting_human"
 
 
-def test_static_auth_header_is_sent_alongside_the_signature() -> None:
+def test_token_is_never_part_of_the_payload() -> None:
     sent: dict[str, Any] = {}
 
     def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
-        sent.update(headers=headers, body=body)
+        sent.update(body=body, headers=headers)
 
     notifier = WebhookNotifier(
-        "https://hooks.example.test/tra",
-        "notification-secret",
-        sender=sender,
-        auth_token="a-different-static-token",
+        "https://hooks.example.test/tra", "super-secret-token", sender=sender
     )
-    assert notifier.notify_result(task_record(), "completed", "1234567890") is True
+    notifier.notify_result(task_record(), "completed", "1234567890")
+    assert b"super-secret-token" not in sent["body"]
+    assert sent["headers"]["X-TRA-Token"] == "super-secret-token"
 
-    # The HMAC stays: dropping it would be a downgrade, the header is additive.
-    expected = hmac.new(b"notification-secret", sent["body"], hashlib.sha256).hexdigest()
-    assert sent["headers"]["X-TRA-Signature"] == f"sha256={expected}"
-    assert sent["headers"]["X-TRA-Auth"] == "a-different-static-token"
-    # The signing key must never be the value travelling in cleartext.
-    assert sent["headers"]["X-TRA-Auth"] != "notification-secret"
+    notifier.notify(task_record(), {"identity": "A123456789"})
+    assert b"super-secret-token" not in sent["body"]
 
 
-def test_auth_header_is_omitted_when_not_configured() -> None:
+def test_missing_url_or_token_disables_sending() -> None:
+    calls = 0
+
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        nonlocal calls
+        calls += 1
+
+    assert WebhookNotifier("", "token", sender=sender).notify_result(
+        task_record(), "completed", None
+    ) is False
+    assert WebhookNotifier("https://hooks.example.test", "", sender=sender).notify_result(
+        task_record(), "completed", None
+    ) is False
+    assert calls == 0
+
+
+def test_cleartext_remote_url_is_refused() -> None:
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        raise AssertionError("must not reach the wire")
+
+    notifier = WebhookNotifier("http://hooks.example.test/tra", "token", sender=sender)
+    assert notifier.transport_is_safe is False
+    with pytest.raises(RuntimeError, match="HTTPS"):
+        notifier.notify_result(task_record(), "completed", None)
+
+    # Loopback stays usable so local integration tests still work.
+    assert WebhookNotifier("http://127.0.0.1:9000/hook", "token").transport_is_safe is True
+    assert WebhookNotifier("https://hooks.example.test/tra", "token").transport_is_safe is True
+
+
+def test_redirect_is_not_followed_so_the_token_is_not_forwarded() -> None:
+    forwarded: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            if self.path == "/hook":
+                self.send_response(307)
+                self.send_header("Location", "/stolen")
+                self.end_headers()
+                return
+            forwarded.append(self.headers.get("X-TRA-Token", ""))
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        notifier = WebhookNotifier(f"http://127.0.0.1:{port}/hook", "integration-secret")
+        with pytest.raises(RuntimeError, match="redirect"):
+            notifier.notify_result(task_record(), "completed", "1234567890")
+        assert forwarded == [], "the token must never reach the redirect target"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+def test_both_event_payloads_carry_the_agreed_fields() -> None:
     sent: dict[str, Any] = {}
 
     def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
-        sent.update(headers=headers)
+        sent.update(body=body)
 
-    notifier = WebhookNotifier("https://hooks.example.test/tra", "secret", sender=sender)
-    notifier.notify_result(task_record(), "completed", None)
-    assert "X-TRA-Auth" not in sent["headers"]
+    notifier = WebhookNotifier(
+        "https://hooks.example.test/tra", "token", "https://tra.example.test", sender=sender
+    )
+
+    notifier.notify(task_record(), {})
+    waiting = json.loads(sent["body"])
+    assert waiting["event"] == "task.waiting_human"
+    assert set(waiting) == {
+        "event", "task_id", "route", "ride_date", "candidates", "action_url", "note"
+    }
+
+    notifier.notify_result(task_record(), "failed", None)
+    result = json.loads(sent["body"])
+    assert result["event"] == "task.booking_result"
+    assert set(result) == {
+        "event", "task_id", "route", "ride_date", "status", "booking_code", "note"
+    }
+    assert result["status"] == "failed"
+    assert result["booking_code"] is None
+
+
+def test_documented_result_statuses_match_the_code() -> None:
+    """The n8n routing is built on this list, so pin it against the source."""
+    from tra_sniper.browser_session import FINISHED_STATUSES
+
+    assert FINISHED_STATUSES == {"completed", "failed", "timeout", "cancelled"}
+
+    sent: dict[str, Any] = {}
+
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        sent.update(body=body)
+
+    notifier = WebhookNotifier("https://hooks.example.test/tra", "token", sender=sender)
+    for status in sorted(FINISHED_STATUSES):
+        notifier.notify_result(task_record(), status, "1234567890" if status == "completed" else None)
+        assert json.loads(sent["body"])["status"] == status

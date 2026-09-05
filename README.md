@@ -101,11 +101,33 @@ TRA_WEBHOOK_SECRET=至少-32-字元的獨立隨機密鑰
 TRA_PUBLIC_URL=http://你的NAS:43124
 ```
 
-只有 `TRA_WEBHOOK_URL` 與 `TRA_WEBHOOK_SECRET` 都存在時才會啟用。請求以
-`X-TRA-Signature: sha256=<hex>` 傳送 HMAC-SHA256 簽章；簽章原文是收到的原始
-JSON bytes。通知只包含任務編號、日期、路線、最多三筆時刻候選與任務連結，
-不會傳送身分證或台鐵會員帳密。通知失敗只會寫入日誌，不會阻止任務進入
-「需要人工」狀態。
+只有 `TRA_WEBHOOK_URL` 與 `TRA_WEBHOOK_SECRET` 都存在時才會啟用。
+
+### 認證方式
+
+請求以 **Header Auth** 認證，`TRA_WEBHOOK_SECRET` 的值原樣放在 `X-TRA-Token`
+標頭送出（不加 `Bearer ` 或 `sha256=` 前綴），對應 n8n Webhook 節點的
+Header Auth credential。
+
+因為 token 是持有即可用的憑證，發送端有兩道保護：
+
+- **URL 必須是 HTTPS**（loopback 位址除外），否則拒絕送出並記錄錯誤，
+  避免 token 以明文上線
+- **不跟隨 HTTP 轉址**，避免 3xx 把帶著 token 的請求轉發到其他主機
+
+### 事件
+
+| 事件 | 觸發時機 |
+|---|---|
+| `task.waiting_human` | 排程到期，任務轉為等待人工 |
+| `task.booking_result` | 訂票 session 結束 |
+
+`task.booking_result` 的 `status` 可能是 `completed`、`failed`、`timeout`、
+`cancelled` 四者之一。
+
+通知只包含任務編號、日期、路線、狀態、訂位代碼、最多三筆時刻候選與任務連結，
+**不會傳送身分證、台鐵會員帳密，也不會傳送 token 本身或訂票 session 連結**。
+通知失敗只會寫入日誌，不會改變任務狀態，也不會重跑訂票。
 
 ## 🛡️ 免責聲明
 
