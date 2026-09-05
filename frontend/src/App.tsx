@@ -221,11 +221,26 @@ const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled"];
 interface BookingSession {
   taskId: string;
   route: string;
-  url: string;
   sessionToken: string;
   status: string;
   bookingCode: string | null;
   message: string;
+}
+
+// noVNC 1.0 (the jammy package the sidecar installs) ships no index.html, so the
+// client file has to be named. It also builds its WebSocket URL from the site
+// root rather than from the page, so the socket path has to be spelled out or it
+// would ask for /websockify and miss the token-prefixed nginx location.
+// resize=scale is what makes it usable on a phone: the remote screen is
+// 1280x1024 and would otherwise have to be panned around.
+function viewerUrl(sessionToken: string): string {
+  const params = new URLSearchParams({
+    autoconnect: "1",
+    reconnect: "1",
+    resize: "scale",
+    path: `booking-session/${sessionToken}/websockify`,
+  });
+  return `/booking-session/${sessionToken}/vnc.html?${params}`;
 }
 
 // Exactly one obvious button per state, so nobody has to guess.
@@ -602,8 +617,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         setBooking({
           taskId: task.id,
           route: task.route,
-          url: session.session_url,
-          // session_url is "/booking-session/<token>/"; DELETE needs the token.
+          // session_url is "/booking-session/<token>/"; both the noVNC URL and
+          // the DELETE that releases the lock are built from the token.
           sessionToken: session.session_url.split("/")[2] ?? "",
           status: "waiting_verification",
           bookingCode: null,
@@ -869,7 +884,7 @@ function BookingScreen({ session, onClose }: { session: BookingSession; onClose:
           <p className="boundary-note">請至台鐵官網或超商於期限內完成付款取票。</p>
         </div>
       ) : (
-        <iframe title="台鐵訂票畫面" src={session.url} allow="clipboard-write" />
+        <iframe title="台鐵訂票畫面" src={viewerUrl(session.sessionToken)} allow="clipboard-write" />
       )}
       <footer>驗證碼與送出都由你本人完成；系統只負責把已填好的畫面送到你面前，並在拿到訂位代碼後記錄結果。</footer>
     </div>
