@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .models import BookingRequest, Leg, OrderType, TripType
 from .verification import VerificationMode, VerificationProvider, create_verification_provider
@@ -52,6 +54,31 @@ def choose_station_suggestion(query: str, suggestions: list[str]) -> int:
     )
 
 
+def cdp_url_over_ipv4(url: str) -> str:
+    """Swap a CDP URL's hostname for its A record.
+
+    Chromium rejects a DevTools request whose Host header is not an IP address
+    or localhost, so `http://tra-sniper-browser:9222` answers 500 no matter how
+    reachable the container is. It also builds the returned
+    webSocketDebuggerUrl from that same header, so the address we ask with is
+    the address Playwright then dials back on.
+
+    IPv4 specifically, for two reasons: Docker's embedded DNS puts the AAAA
+    record first on an IPv6-enabled network, and the socat relay in
+    docker/start-browser.sh listens on IPv4 only.
+    """
+    parts = urlsplit(url)
+    if not parts.hostname:
+        return url
+    try:
+        ip = socket.getaddrinfo(
+            parts.hostname, parts.port, socket.AF_INET, socket.SOCK_STREAM
+        )[0][4][0]
+    except OSError:
+        return url
+    return parts._replace(netloc=f"{ip}:{parts.port}" if parts.port else ip).geturl()
+
+
 class TRCBookingAutomator:
     def __init__(
         self,
@@ -93,7 +120,7 @@ class TRCBookingAutomator:
 
         with sync_playwright() as playwright:
             if self.cdp_url:
-                browser = playwright.chromium.connect_over_cdp(self.cdp_url)
+                browser = playwright.chromium.connect_over_cdp(cdp_url_over_ipv4(self.cdp_url))
             else:
                 browser = playwright.chromium.launch(
                     headless=self.headless,

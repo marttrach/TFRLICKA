@@ -14,6 +14,7 @@ FROM mcr.microsoft.com/playwright:v1.55.0-jammy
 # install would hang rather than fail.
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        socat \
         xvfb \
         x11vnc \
         novnc \
@@ -23,6 +24,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
 ENV DISPLAY=:99 \
     SCREEN_GEOMETRY=1280x1024x24 \
     CDP_PORT=9222 \
+    CDP_LOOPBACK_PORT=9223 \
     VNC_PORT=5900 \
     NOVNC_PORT=6080
 

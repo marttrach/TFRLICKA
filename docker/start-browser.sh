@@ -9,6 +9,12 @@ set -euo pipefail
 DISPLAY="${DISPLAY:-:99}"
 SCREEN_GEOMETRY="${SCREEN_GEOMETRY:-1280x1024x24}"
 CDP_PORT="${CDP_PORT:-9222}"
+# Chromium 140+ silently ignores --remote-debugging-address and always binds
+# DevTools to 127.0.0.1 (upstream hardening against remote cookie theft), so
+# Chromium gets a private loopback port and socat republishes it on the
+# container interface. The two ports must differ: socat cannot bind a port
+# Chromium already holds on loopback.
+CDP_LOOPBACK_PORT="${CDP_LOOPBACK_PORT:-9223}"
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 export DISPLAY
@@ -40,14 +46,10 @@ for _ in $(seq 1 50); do
 done
 
 # --no-sandbox is required for Chromium as root inside a container.
-# --remote-debugging-address=0.0.0.0 is required for the API container to reach
-# CDP; it is safe ONLY because 9222 is never published outside the compose
-# network. Publishing it would hand over the browser and its stored credentials.
 "${CHROME_BIN}" \
     --no-sandbox \
     --disable-dev-shm-usage \
-    --remote-debugging-address=0.0.0.0 \
-    --remote-debugging-port="${CDP_PORT}" \
+    --remote-debugging-port="${CDP_LOOPBACK_PORT}" \
     --no-first-run \
     --no-default-browser-check \
     --disable-features=TranslateUI \
@@ -55,6 +57,17 @@ done
     --window-size="${SCREEN_GEOMETRY%x*}" \
     about:blank &
 CHROME_PID=$!
+
+# Exposing CDP on the container interface is safe ONLY because 9222 is never
+# published outside the compose network -- it has no authentication and this
+# browser holds the user's national ID and TRC credentials.
+#
+# The API must still address this by IP, not by container name: Chromium answers
+# 500 "Host header is specified and is not an IP address or localhost" to a bare
+# name, and it builds the returned webSocketDebuggerUrl from that same header.
+# See cdp_url_over_ipv4() in src/tra_sniper/automation.py.
+socat TCP-LISTEN:"${CDP_PORT}",fork,reuseaddr TCP:127.0.0.1:"${CDP_LOOPBACK_PORT}" &
+SOCAT_PID=$!
 
 x11vnc -display "${DISPLAY}" -forever -shared -nopw -rfbport "${VNC_PORT}" -quiet &
 X11VNC_PID=$!
@@ -66,6 +79,6 @@ echo "start-browser: ready (cdp=${CDP_PORT} novnc=${NOVNC_PORT})"
 
 # Exit as soon as any component dies so the container restart policy recovers
 # the whole stack instead of leaving a half-dead browser the API cannot use.
-wait -n "${XVFB_PID}" "${CHROME_PID}" "${X11VNC_PID}" "${WEBSOCKIFY_PID}"
+wait -n "${XVFB_PID}" "${CHROME_PID}" "${SOCAT_PID}" "${X11VNC_PID}" "${WEBSOCKIFY_PID}"
 echo "start-browser: a component exited; stopping container" >&2
 exit 1
