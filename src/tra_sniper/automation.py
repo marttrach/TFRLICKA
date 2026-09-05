@@ -26,32 +26,16 @@ class AutomationResult:
     screenshot: str | None = None
 
 
-def choose_station_suggestion(query: str, suggestions: list[str]) -> int:
-    """Return the best autocomplete result index without guessing a different station."""
-    normalized = query.strip()
-    if not normalized:
-        raise ValueError("Station query cannot be empty")
+def station_code(station: str) -> str:
+    """Return the numeric key the official <select> uses for a station.
 
-    for index, suggestion in enumerate(suggestions):
-        if suggestion.strip() == normalized:
-            return index
-
-    exact_name = [
-        index
-        for index, suggestion in enumerate(suggestions)
-        if suggestion.partition("-")[2].strip() == normalized
-    ]
-    if len(exact_name) == 1:
-        return exact_name[0]
-    if len(exact_name) > 1:
-        raise ValueError(
-            f"Station {normalized!r} is ambiguous; use the full code-name value: "
-            + ", ".join(suggestions[index] for index in exact_name)
-        )
-
-    raise ValueError(
-        f"Station {normalized!r} was not found in suggestions: {', '.join(suggestions)}"
-    )
+    Stations are stored as "1180-竹北"; the option value is just "1180".
+    "1001-臺北-環島" is a real entry, so only the leading segment is the code.
+    """
+    code = station.split("-", 1)[0].strip()
+    if not code.isdigit():
+        raise ValueError(f"車站 {station!r} 沒有可用的站碼")
+    return code
 
 
 def cdp_url_over_ipv4(url: str) -> str:
@@ -204,34 +188,31 @@ class TRCBookingAutomator:
         raise RuntimeError("等待台鐵會員登入逾時；未嘗試略過官方驗證")
 
     def _prepare_form(self, page: Any, request: BookingRequest) -> None:
+        # The official site splits 依車次/依時段 and 單程/雙行程 across four
+        # separate URLs, and orderType/tripType are hidden inputs set by
+        # whichever page you land on. BOOKING_URL is 依車次單程, so anything
+        # else would silently fill the wrong form.
+        if request.trip_type is not TripType.ONEWAY or request.order_type is not OrderType.BY_TRAIN_NO:
+            raise NotImplementedError(
+                "只支援依車次單程訂票；官方把其他組合放在不同網址上"
+            )
+
         self._accept_cookie_notice(page)
         page.locator(
             f"input[name='custIdTypeEnum'][value='{request.identity_type.value}']"
         ).check()
         page.locator("#pid").fill(request.identity)
 
-        self._select_station(page, "#startStation", request.start_station)
-        self._select_station(page, "#endStation", request.end_station)
+        page.locator("#startStation0").select_option(value=station_code(request.start_station))
+        page.locator("#endStation0").select_option(value=station_code(request.end_station))
+        page.locator("#normalQty0").select_option(value=str(request.quantity))
 
-        page.locator(f"input[name='tripType'][value='{request.trip_type.value}']").check()
-        page.locator(f"input[name='orderType'][value='{request.order_type.value}']").check()
-        page.locator("#normalQty").fill(str(request.quantity))
+        self._fill_leg(page, request.outbound)
 
-        self._fill_leg(page, request.outbound, leg_index=0, order_type=request.order_type)
-        if request.trip_type is TripType.ROUNDTRIP and request.inbound:
-            self._fill_leg(page, request.inbound, leg_index=1, order_type=request.order_type)
-
-        page.locator(
-            "input[name='ticketOrderParamList[0].seatPref']"
-            f"[value='{request.seat_preference.value}']"
-        ).check()
-        page.locator("#chgSeat1").set_checked(request.allow_seat_change)
-        if request.trip_type is TripType.ROUNDTRIP:
-            page.locator(
-                "input[name='ticketOrderParamList[1].seatPref']"
-                f"[value='{request.seat_preference.value}']"
-            ).check()
-            page.locator("#chgSeat2").set_checked(request.allow_seat_change)
+        page.locator("#seatPref0").select_option(value=request.seat_preference.value)
+        page.locator("#chgSeat0").select_option(
+            value="true" if request.allow_seat_change else "false"
+        )
 
     @staticmethod
     def _accept_cookie_notice(page: Any) -> None:
@@ -240,33 +221,24 @@ class TRCBookingAutomator:
             button.first.click()
 
     @staticmethod
-    def _select_station(page: Any, selector: str, station: str) -> None:
-        field = page.locator(selector)
-        field.fill(station)
-        menu = page.locator("ul.ui-autocomplete:visible").last
-        menu.wait_for(state="visible", timeout=10_000)
-        items = menu.locator("li")
-        suggestions = [text.strip() for text in items.all_inner_texts() if text.strip()]
-        index = choose_station_suggestion(station, suggestions)
-        items.nth(index).click()
-        selected = field.input_value().strip()
-        if "-" not in selected:
-            raise RuntimeError(f"TRC did not accept station selection {station!r}")
+    def _fill_leg(page: Any, leg: Leg) -> None:
+        # rideDate is a <select> of roughly the next 30 days. Reading the
+        # options first turns "date is past the booking window" into a message
+        # that says so, instead of Playwright's opaque strict-mode failure.
+        available = page.locator("#rideDate0 option").all_attribute_values("value")
+        if leg.ride_date not in available:
+            window = f"{available[0]} 至 {available[-1]}" if available else "（頁面未提供日期選項）"
+            raise ValueError(
+                f"官方訂票頁沒有 {leg.ride_date} 這個日期；目前開放 {window}"
+            )
+        page.locator("#rideDate0").select_option(value=leg.ride_date)
 
-    @staticmethod
-    def _fill_leg(page: Any, leg: Leg, *, leg_index: int, order_type: OrderType) -> None:
-        suffix = leg_index + 1
-        page.locator(f"#rideDate{suffix}").fill(leg.ride_date)
-        radio_number = 1 + leg_index * 2 if leg.search_by_departure else 2 + leg_index * 2
-        page.locator(f"#startOrEndTime{radio_number}").check()
-
-        if order_type is OrderType.BY_TRAIN_NO:
-            offset = leg_index * 3
-            for item_index, train_number in enumerate(leg.train_numbers, start=1):
-                page.locator(f"#trainNoList{offset + item_index}").fill(train_number)
-        else:
-            page.locator(f"#startTime{suffix}").select_option(label=leg.start_time)
-            page.locator(f"#endTime{suffix}").select_option(label=leg.end_time)
+        # The first field's id is trainNo1 while its name is trainNoList[0].
+        # Addressing all three by name keeps one code path off that quirk.
+        for index, train_number in enumerate(leg.train_numbers):
+            page.locator(
+                f"input[name='ticketOrderParamList[0].trainNoList[{index}]']"
+            ).fill(train_number)
 
     @staticmethod
     def _wait_for_human_verification(
