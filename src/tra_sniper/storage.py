@@ -45,6 +45,15 @@ class TaskRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class TravelerRecord:
+    id: int
+    user_id: int
+    label: str
+    identity: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemberProfileRecord:
     user_id: int
     identity: str
@@ -179,7 +188,147 @@ class Database:
                 )
                 """
             )
+            # One member account per user (member_profiles, unchanged) but many
+            # named identities to book for. Detect first creation so the
+            # migration below runs exactly once, and never resurrects rows the
+            # user has deliberately deleted.
+            travelers_existed = (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'travelers'"
+                ).fetchone()
+                is not None
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS travelers (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    label TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_travelers_user_label "
+                "ON travelers(user_id, label)"
+            )
+            if not travelers_existed:
+                self._seed_travelers_from_profiles(connection)
             connection.execute("PRAGMA optimize")
+
+    def _seed_travelers_from_profiles(self, connection: sqlite3.Connection) -> None:
+        """Carry each existing member profile's identity into the new table.
+
+        Runs once, when `travelers` is first created. Without it, upgrading
+        would silently drop the identity users already saved.
+        """
+        rows = connection.execute(
+            "SELECT user_id, payload, updated_at FROM member_profiles"
+        ).fetchall()
+        for row in rows:
+            try:
+                identity = str(self.cipher.decrypt(row["payload"]).get("identity", "")).strip()
+            except ValueError:
+                continue
+            if not identity:
+                continue
+            connection.execute(
+                """
+                INSERT INTO travelers(user_id, label, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    row["user_id"],
+                    "預設",
+                    self.cipher.encrypt({"identity": identity}),
+                    row["updated_at"],
+                    row["updated_at"],
+                ),
+            )
+
+    def list_travelers(self, user_id: int) -> list[TravelerRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, user_id, label, payload, updated_at FROM travelers "
+                "WHERE user_id = ? ORDER BY label",
+                (user_id,),
+            ).fetchall()
+        return [self._traveler(row) for row in rows]
+
+    def get_traveler(self, traveler_id: int, user_id: int) -> TravelerRecord | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id, user_id, label, payload, updated_at FROM travelers "
+                "WHERE id = ? AND user_id = ?",
+                (traveler_id, user_id),
+            ).fetchone()
+        return self._traveler(row) if row else None
+
+    def _traveler(self, row: sqlite3.Row) -> TravelerRecord:
+        payload = self.cipher.decrypt(row["payload"])
+        return TravelerRecord(
+            id=int(row["id"]),
+            user_id=int(row["user_id"]),
+            label=str(row["label"]),
+            identity=str(payload.get("identity", "")),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def create_traveler(self, user_id: int, *, label: str, identity: str) -> TravelerRecord:
+        now = utc_now()
+        try:
+            with self.connect() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO travelers(user_id, label, payload, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        label.strip(),
+                        self.cipher.encrypt({"identity": identity.strip()}),
+                        now,
+                        now,
+                    ),
+                )
+                traveler_id = int(cursor.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("已經有同名的常用資料") from exc
+        traveler = self.get_traveler(traveler_id, user_id)
+        if traveler is None:
+            raise RuntimeError("traveler was not persisted")
+        return traveler
+
+    def update_traveler(
+        self, traveler_id: int, user_id: int, *, label: str, identity: str
+    ) -> TravelerRecord | None:
+        try:
+            with self.connect() as connection:
+                cursor = connection.execute(
+                    "UPDATE travelers SET label = ?, payload = ?, updated_at = ? "
+                    "WHERE id = ? AND user_id = ?",
+                    (
+                        label.strip(),
+                        self.cipher.encrypt({"identity": identity.strip()}),
+                        utc_now(),
+                        traveler_id,
+                        user_id,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("已經有同名的常用資料") from exc
+        if cursor.rowcount != 1:
+            return None
+        return self.get_traveler(traveler_id, user_id)
+
+    def delete_traveler(self, traveler_id: int, user_id: int) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM travelers WHERE id = ? AND user_id = ?", (traveler_id, user_id)
+            )
+        return cursor.rowcount == 1
 
     def get_member_profile(self, user_id: int) -> MemberProfileRecord | None:
         with self.connect() as connection:

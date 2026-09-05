@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, MemberProfile, Station, Suggestions, Task, TrainCandidate, User } from "./api";
+import { api, MemberProfile, Station, Suggestions, Task, TrainCandidate, Traveler, User } from "./api";
 
 const TOKEN_KEY = "tra-sniper-token";
 
@@ -72,7 +72,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
 }
 
 interface BookingFormState {
-  identity: string;
+  travelerId: number | null;
   startStation: string;
   endStation: string;
   rideDate: string;
@@ -88,7 +88,7 @@ interface BookingFormState {
 }
 
 const defaultForm: BookingFormState = {
-  identity: "",
+  travelerId: null,
   startStation: "1000-臺北",
   endStation: "3300-臺中",
   rideDate: tomorrow(),
@@ -103,6 +103,98 @@ const defaultForm: BookingFormState = {
   useSavedMemberLogin: false,
 };
 
+function TravelerPanel({
+  token,
+  travelers,
+  onChanged,
+}: {
+  token: string;
+  travelers: Traveler[];
+  onChanged: () => void;
+}) {
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [label, setLabel] = useState("");
+  const [identity, setIdentity] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  function reset() {
+    setEditingId(null);
+    setLabel("");
+    setIdentity("");
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      if (editingId === null) {
+        await api.createTraveler(token, { label, identity });
+      } else {
+        await api.updateTraveler(token, editingId, { label, identity });
+      }
+      reset();
+      onChanged();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法儲存常用資料");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(traveler: Traveler) {
+    if (!window.confirm(`確定刪除「${traveler.label}」？`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deleteTraveler(token, traveler.id);
+      if (editingId === traveler.id) reset();
+      onChanged();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法刪除常用資料");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel profile-panel">
+      <div className="panel-heading"><div><span className="step">01</span><h2>常用乘車人</h2></div><small>加密保存</small></div>
+      {travelers.length > 0 && (
+        <ul className="traveler-list">
+          {travelers.map((traveler) => (
+            <li key={traveler.id}>
+              <div><strong>{traveler.label}</strong><small>{maskIdentity(traveler.identity)}</small></div>
+              <div className="traveler-actions">
+                <button type="button" className="compact" disabled={busy} onClick={() => {
+                  setEditingId(traveler.id);
+                  setLabel(traveler.label);
+                  setIdentity(traveler.identity);
+                }}>編輯</button>
+                <button type="button" className="danger compact" disabled={busy} onClick={() => remove(traveler)}>刪除</button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <form className="profile-form" onSubmit={submit}>
+        <label>名稱<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="例如：我自己、老婆、媽" maxLength={32} required /></label>
+        <label>身分證字號<input value={identity} onChange={(event) => setIdentity(event.target.value.toUpperCase())} autoComplete="off" maxLength={32} required /></label>
+        {error && <p className="error" role="alert">{error}</p>}
+        <div className="profile-actions">
+          <button className="primary" disabled={busy}>{busy ? "處理中…" : editingId === null ? "新增乘車人" : "儲存修改"}</button>
+          {editingId !== null && <button type="button" disabled={busy} onClick={reset}>取消編輯</button>}
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function maskIdentity(value: string): string {
+  return value.length <= 3 ? "***" : `${value.slice(0, 1)}****${value.slice(-3)}`;
+}
+
 function MemberProfilePanel({
   token,
   profile,
@@ -112,7 +204,6 @@ function MemberProfilePanel({
   profile: MemberProfile;
   onSaved: (profile: MemberProfile) => void;
 }) {
-  const [identity, setIdentity] = useState(profile.identity);
   const [account, setAccount] = useState(profile.member_account);
   const [password, setPassword] = useState("");
   const [notice, setNotice] = useState("");
@@ -125,7 +216,6 @@ function MemberProfilePanel({
     setError("");
     try {
       const updated = await api.saveProfile(token, {
-        identity,
         member_account: account,
         member_password: password,
       });
@@ -147,7 +237,7 @@ function MemberProfilePanel({
       setAccount("");
       setPassword("");
       onSaved({ ...profile, member_account: "", has_member_password: false });
-      setNotice("台鐵會員帳密已清除，身分證常用資料仍保留");
+      setNotice("台鐵會員帳密已清除，常用乘車人不受影響");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法清除會員帳密");
     } finally {
@@ -157,9 +247,8 @@ function MemberProfilePanel({
 
   return (
     <section className="panel profile-panel">
-      <div className="panel-heading"><div><span className="step">01</span><h2>我的常用資料</h2></div><small>加密保存</small></div>
+      <div className="panel-heading"><div><span className="step">02</span><h2>台鐵會員登入</h2></div><small>選填 · 加密保存</small></div>
       <form className="profile-form" onSubmit={save}>
-        <label>身分證字號<input value={identity} onChange={(event) => setIdentity(event.target.value.toUpperCase())} autoComplete="off" required /></label>
         <label>台鐵會員帳號<input value={account} onChange={(event) => setAccount(event.target.value)} autoComplete="username" placeholder="身分證號或會員編號" /></label>
         <label>台鐵會員密碼<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder={profile.has_member_password ? "已保存；不修改請留空" : "選填"} /></label>
         <p className="privacy-note">帳密只會以 Fernet 加密存放在你的 NAS。官方若要求驗證，仍需由本人或可信任家人完成。</p>
@@ -192,6 +281,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }, []);
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<MemberProfile | null>(null);
+  const [travelers, setTravelers] = useState<Traveler[]>([]);
   const [stations, setStations] = useState<Station[]>([]);
   const [times, setTimes] = useState<string[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -215,13 +305,14 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }, [token, onLogout]);
 
   useEffect(() => {
-    Promise.all([api.me(token), api.profile(token), api.stations(), api.times(), api.tasks(token)])
-      .then(([account, savedProfile, stationList, timeList, taskList]) => {
+    Promise.all([api.me(token), api.profile(token), api.stations(), api.times(), api.tasks(token), api.travelers(token)])
+      .then(([account, savedProfile, stationList, timeList, taskList, travelerList]) => {
         setUser(account);
         setProfile(savedProfile);
+        setTravelers(travelerList);
         setForm((current) => ({
           ...current,
-          identity: savedProfile.identity,
+          travelerId: travelerList[0]?.id ?? null,
           useSavedMemberLogin: savedProfile.has_member_password,
         }));
         setStations(stationList);
@@ -294,8 +385,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       await api.createTask(token, {
         scheduled_at: new Date(form.scheduledAt).toISOString(),
         use_saved_member_login: form.useSavedMemberLogin,
+        traveler_id: form.travelerId,
         booking: {
-          identity: form.identity,
           identity_type: "PERSON_ID",
           start_station: form.startStation,
           end_station: form.endStation,
@@ -313,7 +404,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       setNotice(candidateSuggestions || form.orderType === "BY_TRAIN_NO"
         ? "任務已排入；到點後會轉為等待人工驗證。"
         : "任務已排入，但 TDX 暫時不可用，這次未附離線候選清單。");
-      setForm((current) => ({ ...current, identity: profile?.identity ?? "", trainNumber: "" }));
+      setForm((current) => ({ ...current, trainNumber: "" }));
       await loadTasks();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法建立任務");
@@ -347,7 +438,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       <main className="workspace">
         <section className="welcome-card">
           <div><span>簡單三步驟</span><h1>選車次、排時間、到點完成驗證</h1><p>常用資料只要設定一次，之後每次訂票會自動帶入。</p></div>
-          <a href="https://www.trc.com.tw/tra-tip-web/tip/tip008/tip811/memberLogin" target="_blank" rel="noreferrer">開啟台鐵會員登入</a>
         </section>
         <section className="summary-row" aria-label="任務摘要">
           <article><span>排程中</span><strong>{scheduled}</strong><small>等待觸發時間</small></article>
@@ -358,6 +448,16 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
 
         <div className="content-grid">
           <div className="left-column">
+          <TravelerPanel token={token} travelers={travelers} onChanged={async () => {
+            const refreshed = await api.travelers(token);
+            setTravelers(refreshed);
+            setForm((current) => ({
+              ...current,
+              travelerId: refreshed.some((t) => t.id === current.travelerId)
+                ? current.travelerId
+                : refreshed[0]?.id ?? null,
+            }));
+          }} />
           {profile && <MemberProfilePanel token={token} profile={profile} onSaved={(saved) => {
             setProfile(saved);
             setForm((current) => ({ ...current, identity: saved.identity, useSavedMemberLogin: saved.has_member_password }));
@@ -370,7 +470,13 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 <label><input type="radio" checked={form.orderType === "BY_TRAIN_NO"} onChange={() => setForm({ ...form, orderType: "BY_TRAIN_NO" })} /> 依車次</label>
                 <label><input type="radio" checked={form.orderType === "BY_TIME"} onChange={() => setForm({ ...form, orderType: "BY_TIME" })} /> 依時段</label>
               </fieldset>
-              <label className="wide">身分證字號<input value={form.identity} onChange={(e) => setForm({ ...form, identity: e.target.value })} autoComplete="off" required /></label>
+              <label className="wide">乘車人
+                {travelers.length === 0
+                  ? <span className="empty-hint">請先在上方新增一位常用乘車人</span>
+                  : <select value={form.travelerId ?? ""} onChange={(e) => setForm({ ...form, travelerId: Number(e.target.value) })} required>
+                      {travelers.map((traveler) => <option value={traveler.id} key={traveler.id}>{traveler.label}（{maskIdentity(traveler.identity)}）</option>)}
+                    </select>}
+              </label>
               {profile?.has_member_password && (
                 <label className="member-login-option wide"><input type="checkbox" checked={form.useSavedMemberLogin} onChange={(event) => setForm({ ...form, useSavedMemberLogin: event.target.checked })} /> 購票前先帶入已保存的台鐵會員帳密</label>
               )}

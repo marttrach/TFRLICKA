@@ -70,6 +70,21 @@ class TaskCreate(BaseModel):
     scheduled_at: datetime
     booking: dict[str, Any]
     use_saved_member_login: bool = False
+    # Preferred over sending the identity in `booking`: the number is looked up
+    # server-side so it never has to round-trip through the browser.
+    traveler_id: int | None = None
+
+
+class TravelerCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=32)
+    identity: str = Field(min_length=1, max_length=32)
+
+
+class TravelerResponse(BaseModel):
+    id: int
+    label: str
+    identity: str
+    updated_at: str
 
 
 class TaskResponse(BaseModel):
@@ -85,7 +100,9 @@ class TaskResponse(BaseModel):
 
 
 class MemberProfileUpdate(BaseModel):
-    identity: str = Field(min_length=1, max_length=32)
+    # Identities live in /travelers now. This stays accepted so older clients
+    # keep working; when omitted, the stored value is preserved.
+    identity: str = Field(default="", max_length=32)
     member_account: str = Field(default="", max_length=64)
     member_password: str = Field(default="", max_length=128)
 
@@ -337,7 +354,7 @@ def create_app(
             )
         profile = db.save_member_profile(
             user.id,
-            identity=body.identity,
+            identity=body.identity or (existing.identity if existing else ""),
             member_account=account,
             member_password=password,
         )
@@ -358,9 +375,51 @@ def create_app(
         db.clear_member_login(user.id)
         return Response(status_code=204)
 
+    @app.get("/travelers", response_model=list[TravelerResponse])
+    def list_travelers(user: CurrentUser) -> list[TravelerResponse]:
+        return [
+            TravelerResponse(**asdict(traveler))
+            for traveler in db.list_travelers(user.id)
+        ]
+
+    @app.post("/travelers", response_model=TravelerResponse, status_code=201)
+    def create_traveler(body: TravelerCreate, user: CurrentUser) -> TravelerResponse:
+        try:
+            traveler = db.create_traveler(
+                user.id, label=body.label, identity=body.identity
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return TravelerResponse(**asdict(traveler))
+
+    @app.put("/travelers/{traveler_id}", response_model=TravelerResponse)
+    def update_traveler(
+        traveler_id: int, body: TravelerCreate, user: CurrentUser
+    ) -> TravelerResponse:
+        try:
+            traveler = db.update_traveler(
+                traveler_id, user.id, label=body.label, identity=body.identity
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if traveler is None:
+            raise HTTPException(status_code=404, detail="常用資料不存在")
+        return TravelerResponse(**asdict(traveler))
+
+    @app.delete("/travelers/{traveler_id}", status_code=204)
+    def delete_traveler(traveler_id: int, user: CurrentUser) -> Response:
+        if not db.delete_traveler(traveler_id, user.id):
+            raise HTTPException(status_code=404, detail="常用資料不存在")
+        return Response(status_code=204)
+
     @app.post("/tasks", response_model=TaskResponse, status_code=201)
     def create_task(body: TaskCreate, user: CurrentUser) -> TaskResponse:
         booking_payload = dict(body.booking)
+        if body.traveler_id is not None:
+            traveler = db.get_traveler(body.traveler_id, user.id)
+            if traveler is None:
+                raise HTTPException(status_code=404, detail="常用資料不存在")
+            booking_payload["identity"] = traveler.identity
         if body.use_saved_member_login:
             profile = db.get_member_profile(user.id)
             if not profile or not profile.member_account or not profile.member_password:

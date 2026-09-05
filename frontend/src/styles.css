@@ -82,6 +82,12 @@ input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb
 .profile-form { display: grid; gap: 1rem; padding: 1.2rem; }
 .profile-form .privacy-note { margin: 0; padding: .8rem; background: #edf5f9; border-left: 3px solid var(--blue); }
 .profile-actions { display: flex; gap: .7rem; flex-wrap: wrap; }
+.traveler-list { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: .5rem; }
+.traveler-list li { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .6rem .75rem; border: 1px solid #dfe3e8; border-radius: 4px; background: #fbfcfd; }
+.traveler-list strong { display: block; font-size: .95rem; }
+.traveler-list small { color: #5b6672; font-variant-numeric: tabular-nums; }
+.traveler-actions { display: flex; gap: .4rem; flex-shrink: 0; }
+.empty-hint { display: block; margin-top: .35rem; color: #9c3737; font-size: .85rem; }
 .member-login-option { display: flex; align-items: center; gap: .65rem; padding: .8rem; color: var(--navy); background: #edf5f9; border: 1px solid #c7dce8; font-size: .85rem; }
 .member-login-option input { width: auto; min-height: auto; }
 .booking-form .wide { grid-column: 1 / -1; }

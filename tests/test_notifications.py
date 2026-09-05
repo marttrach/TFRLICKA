@@ -193,3 +193,36 @@ def test_notification_failure_does_not_roll_back_promotion(tmp_path) -> None:
     notifier = WebhookNotifier("https://hooks.invalid", "secret", sender=fail)
     assert TaskScheduler(database, notifier=notifier).tick() == 1
     assert database.get_task(task.id, user.id).status == "waiting_human"
+
+
+def test_static_auth_header_is_sent_alongside_the_signature() -> None:
+    sent: dict[str, Any] = {}
+
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        sent.update(headers=headers, body=body)
+
+    notifier = WebhookNotifier(
+        "https://hooks.example.test/tra",
+        "notification-secret",
+        sender=sender,
+        auth_token="a-different-static-token",
+    )
+    assert notifier.notify_result(task_record(), "completed", "1234567890") is True
+
+    # The HMAC stays: dropping it would be a downgrade, the header is additive.
+    expected = hmac.new(b"notification-secret", sent["body"], hashlib.sha256).hexdigest()
+    assert sent["headers"]["X-TRA-Signature"] == f"sha256={expected}"
+    assert sent["headers"]["X-TRA-Auth"] == "a-different-static-token"
+    # The signing key must never be the value travelling in cleartext.
+    assert sent["headers"]["X-TRA-Auth"] != "notification-secret"
+
+
+def test_auth_header_is_omitted_when_not_configured() -> None:
+    sent: dict[str, Any] = {}
+
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        sent.update(headers=headers)
+
+    notifier = WebhookNotifier("https://hooks.example.test/tra", "secret", sender=sender)
+    notifier.notify_result(task_record(), "completed", None)
+    assert "X-TRA-Auth" not in sent["headers"]

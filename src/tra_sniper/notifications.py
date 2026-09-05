@@ -12,6 +12,13 @@ from .storage import TaskRecord
 
 NOTICE = "候選僅為時刻建議，不代表有位；驗證碼與送出仍須人工完成於官方頁面"
 RESULT_NOTICE = "訂位成功，請於台鐵規定期限內完成付款取票"
+AUTH_HEADER = "X-TRA-Auth"
+
+# The static auth header is only adequate because notifications carry no
+# session token and no link that triggers an action by itself. Someone holding
+# the token can forge a message, not start a booking. If a session URL or a
+# one-click trigger is ever added to a payload, this stops being true and the
+# receiver must verify X-TRA-Signature instead. See PLAN.md 12.9.
 Sender = Callable[[str, bytes, dict[str, str], float], None]
 
 
@@ -57,11 +64,17 @@ class WebhookNotifier:
         *,
         timeout_seconds: float = 5.0,
         sender: Sender | None = None,
+        auth_token: str = "",
     ) -> None:
         self.url = url.strip()
         self.secret = secret
         self.public_url = public_url.strip().rstrip("/")
         self.timeout_seconds = timeout_seconds
+        # Static header for receivers that cannot verify the HMAC, such as an
+        # n8n instance that blocks $env access in Code nodes. It is a SEPARATE
+        # value from `secret` on purpose: this one travels in cleartext on every
+        # request, so leaking it must not also compromise the signing key.
+        self.auth_token = auth_token.strip()
         self._sender = sender or _default_sender
 
     @classmethod
@@ -70,6 +83,7 @@ class WebhookNotifier:
             url=os.getenv("TRA_WEBHOOK_URL", ""),
             secret=os.getenv("TRA_WEBHOOK_SECRET", ""),
             public_url=os.getenv("TRA_PUBLIC_URL", "http://localhost:43124"),
+            auth_token=os.getenv("TRA_WEBHOOK_AUTH_TOKEN", ""),
         )
 
     @property
@@ -118,13 +132,11 @@ class WebhookNotifier:
             sort_keys=True,
         ).encode("utf-8")
         signature = hmac.new(self.secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-        self._sender(
-            self.url,
-            body,
-            {
-                "Content-Type": "application/json; charset=utf-8",
-                "X-TRA-Signature": f"sha256={signature}",
-            },
-            self.timeout_seconds,
-        )
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "X-TRA-Signature": f"sha256={signature}",
+        }
+        if self.auth_token:
+            headers[AUTH_HEADER] = self.auth_token
+        self._sender(self.url, body, headers, self.timeout_seconds)
         return True

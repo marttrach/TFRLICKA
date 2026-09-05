@@ -28,6 +28,13 @@ export interface MemberProfile {
   updated_at: string | null;
 }
 
+export interface Traveler {
+  id: number;
+  label: string;
+  identity: string;
+  updated_at: string;
+}
+
 export interface TrainCandidate {
   train_no: string;
   train_type_name: string;
@@ -96,7 +103,7 @@ export const api = {
   profile(token: string) {
     return request<MemberProfile>("/profile", {}, token);
   },
-  saveProfile(token: string, payload: { identity: string; member_account: string; member_password: string }) {
+  saveProfile(token: string, payload: { member_account: string; member_password: string }) {
     return request<MemberProfile>("/profile", { method: "PUT", body: JSON.stringify(payload) }, token);
   },
   deleteProfile(token: string) {
@@ -104,6 +111,18 @@ export const api = {
   },
   clearMemberLogin(token: string) {
     return request<void>("/profile/member-login", { method: "DELETE" }, token);
+  },
+  travelers(token: string) {
+    return request<Traveler[]>("/travelers", {}, token);
+  },
+  createTraveler(token: string, payload: { label: string; identity: string }) {
+    return request<Traveler>("/travelers", { method: "POST", body: JSON.stringify(payload) }, token);
+  },
+  updateTraveler(token: string, id: number, payload: { label: string; identity: string }) {
+    return request<Traveler>(`/travelers/${id}`, { method: "PUT", body: JSON.stringify(payload) }, token);
+  },
+  deleteTraveler(token: string, id: number) {
+    return request<void>(`/travelers/${id}`, { method: "DELETE" }, token);
   },
   logout(token: string) {
     return request<void>("/auth/logout", { method: "POST" }, token);
