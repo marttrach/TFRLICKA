@@ -9,8 +9,11 @@
 # Keep the tag aligned with the playwright pin in pyproject.toml.
 FROM mcr.microsoft.com/playwright:v1.55.0-jammy
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# DEBIAN_FRONTEND=noninteractive matters here: `apt-get install -y` still
+# blocks on a debconf prompt, and a build has no TTY to answer it, so the
+# install would hang rather than fail.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         xvfb \
         x11vnc \
         novnc \

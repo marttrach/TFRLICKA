@@ -13,6 +13,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # A hung build otherwise runs until GitHub's 6 hour ceiling. These images
+    # take about a minute each; the browser one a few minutes at most.
+    timeout-minutes: 40
+
     # GITHUB_TOKEN publishes the packages; no Docker Hub secret is needed.
     permissions:
       contents: read
@@ -25,14 +29,23 @@ jobs:
           - name: tra-sniper
             context: .
             dockerfile: ./Dockerfile
+            gha_cache: true
           - name: tra-sniper-frontend
             context: ./frontend
             dockerfile: ./frontend/Dockerfile
+            gha_cache: true
           # Headed Chromium + noVNC sidecar. Built from the repo root because
           # it copies docker/start-browser.sh.
+          #
+          # gha_cache is off here on purpose. mode=max exports every layer,
+          # including the multi-GB Playwright base, into the Actions cache,
+          # which is slow, rate limited, and capped at 10 GB per repo. The only
+          # layers we own are one apt install and one COPY, so caching buys
+          # almost nothing while risking a build that never finishes.
           - name: tra-sniper-browser
             context: .
             dockerfile: ./Dockerfile.browser
+            gha_cache: false
 
     steps:
       - name: Checkout repository
@@ -62,5 +75,5 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ steps.img.outputs.owner }}/${{ matrix.name }}:latest
             ${{ env.REGISTRY }}/${{ steps.img.outputs.owner }}/${{ matrix.name }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: ${{ matrix.gha_cache && 'type=gha' || '' }}
+          cache-to: ${{ matrix.gha_cache && 'type=gha,mode=max' || '' }}
