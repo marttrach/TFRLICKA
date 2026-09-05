@@ -228,14 +228,18 @@ class TdxClient:
 
     def stations(self, fallback: list[dict[str, str]]) -> list[dict[str, str]]:
         cached = self.load_cached_stations()
-        if cached:
+        # A cache written before counties existed carries no county at all, and
+        # this file has no TTL, so serving it would leave the county picker
+        # showing nothing but "其他" forever. Treat that as stale and refetch.
+        if cached and any(item["county"] for item in cached):
             return _popular_first(cached, fallback)
         if self.configured:
             try:
                 return _popular_first(self.fetch_stations(), fallback)
             except TdxError:
                 pass
-        return list(fallback)
+        # Refetching was impossible. An ungrouped cache still beats no stations.
+        return _popular_first(cached, fallback) if cached else list(fallback)
 
 
 def _popular_first(

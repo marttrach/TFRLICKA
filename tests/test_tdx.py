@@ -86,3 +86,33 @@ def test_station_cache_and_unconfigured_fallback(tmp_path) -> None:
     fallback = [{"value": "3300-臺中", "label": "臺中", "county": "臺中市"}]
     offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path / "empty")
     assert offline.stations(fallback) == fallback
+
+
+def test_cache_without_counties_is_refetched(tmp_path) -> None:
+    """The reported bug: an old cache made every county show as 其他.
+
+    stations.json has no TTL, so a cache written before counties existed would
+    otherwise be served forever and the picker would never recover.
+    """
+    stale = [{"value": "1000-臺北", "label": "臺北"}]
+    (tmp_path / "stations.json").write_text(json.dumps(stale), encoding="utf-8")
+
+    transport = FakeTransport()
+    client = TdxClient(
+        client_id="id", client_secret="secret", data_dir=tmp_path, transport=transport
+    )
+    resolved = client.stations([])
+
+    assert {item["county"] for item in resolved} == {"臺北市", "新北市"}
+    # And the refreshed cache is what gets served next time, without refetching.
+    offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path)
+    assert {item["county"] for item in offline.stations([])} == {"臺北市", "新北市"}
+
+
+def test_stale_cache_is_still_served_when_refetch_is_impossible(tmp_path) -> None:
+    """Ungrouped stations beat no stations at all."""
+    stale = [{"value": "1000-臺北", "label": "臺北"}]
+    (tmp_path / "stations.json").write_text(json.dumps(stale), encoding="utf-8")
+
+    offline = TdxClient(client_id="", client_secret="", data_dir=tmp_path)
+    assert offline.stations([]) == [{"value": "1000-臺北", "label": "臺北", "county": ""}]

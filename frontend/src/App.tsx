@@ -268,7 +268,11 @@ function StationPicker({
     [stations, county],
   );
 
-  if (searchAll) {
+  // If no station carries a county, a two-level picker offers one useless
+  // "其他" group. Fall back to the flat list rather than a dead-end menu.
+  const countyDataUsable = counties.length > 1 || counties[0] !== OTHER_COUNTY;
+
+  if (searchAll || !countyDataUsable) {
     return (
       <fieldset className="station-picker">
         <legend>{legend}</legend>
