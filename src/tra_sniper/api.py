@@ -91,6 +91,9 @@ class TaskCreate(BaseModel):
     # Preferred over sending the identity in `booking`: the number is looked up
     # server-side so it never has to round-trip through the browser.
     traveler_id: int | None = None
+    # How the chosen train reads on the task card and the VNC header, so the
+    # person always sees which train the session is for.
+    train_label: str = Field(default="", max_length=120)
     mode: str = MODE_BOOK_WHEN_AVAILABLE
     poll_interval_seconds: int = Field(
         default=DEFAULT_POLL_INTERVAL_SECONDS, ge=MIN_POLL_INTERVAL_SECONDS, le=86_400
@@ -128,6 +131,7 @@ class TaskResponse(BaseModel):
     monitor_until: str | None = None
     last_checked_at: str | None = None
     next_check_at: str | None = None
+    train_label: str | None = None
     # No authorised TRA seat-availability source exists (PLAN.md 7.1), so this
     # is always "unknown". It is a field rather than a silence so the UI has to
     # say so out loud instead of implying a seat was found.
@@ -505,6 +509,7 @@ def create_app(
             mode=body.mode,
             poll_interval_seconds=body.poll_interval_seconds,
             monitor_until=monitor_until.astimezone(UTC).isoformat() if monitor_until else None,
+            train_label=body.train_label.strip() or None,
         )
         return _task_response(task)
 
@@ -777,6 +782,20 @@ def create_app(
         sessions.release(session_token)
         return Response(status_code=204)
 
+    @app.delete("/tasks/{task_id}", status_code=204)
+    def delete_task(task_id: str, user: CurrentUser) -> Response:
+        task = db.get_task(task_id, user.id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        active = sessions.active
+        if active is not None and active.task_id == task_id and not active.is_expired():
+            raise HTTPException(
+                status_code=409,
+                detail="這個任務正在訂票中；請先關閉訂票畫面再刪除。",
+            )
+        db.delete_task(task_id, user.id)
+        return Response(status_code=204)
+
     @app.post("/tasks/{task_id}/cancel", status_code=204)
     def cancel_task(
         task_id: str,
@@ -785,7 +804,9 @@ def create_app(
         task = db.get_task(task_id, user.id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        if task.status not in {"scheduled", "waiting_human"}:
+        # monitoring belongs here: the dashboard offers 停止並取消任務 for it,
+        # and the patrol loop makes it the state a task spends most time in.
+        if task.status not in {"scheduled", "monitoring", "waiting_human"}:
             raise HTTPException(status_code=409, detail="Task cannot be cancelled")
         db.update_task_status(task_id, user.id, "cancelled")
         return Response(status_code=204)

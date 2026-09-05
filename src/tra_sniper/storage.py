@@ -49,7 +49,7 @@ TASK_COLUMNS = (
     "id, user_id, status, scheduled_at, route, ride_date, order_type, "
     "created_at, updated_at, last_error, booking_code, mode, "
     "poll_interval_seconds, monitor_until, last_checked_at, next_check_at, "
-    "check_failures"
+    "check_failures, train_label"
 )
 
 
@@ -72,6 +72,9 @@ class TaskRecord:
     last_checked_at: str | None = None
     next_check_at: str | None = None
     check_failures: int = 0
+    # The train the person actually picked, ready to display. Stored as one
+    # string because every consumer only ever concatenates the parts.
+    train_label: str | None = None
 
     @property
     def monitor_start_at(self) -> str:
@@ -206,6 +209,7 @@ class Database:
                 ("last_checked_at", "TEXT"),
                 ("next_check_at", "TEXT"),
                 ("check_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("train_label", "TEXT"),
             ):
                 if column not in task_columns:
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ddl}")
@@ -542,6 +546,7 @@ class Database:
         mode: str = MODE_BOOK_WHEN_AVAILABLE,
         poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
         monitor_until: str | None = None,
+        train_label: str | None = None,
     ) -> TaskRecord:
         task_id = str(uuid.uuid4())
         now = utc_now()
@@ -552,8 +557,9 @@ class Database:
                 INSERT INTO tasks(
                     id, user_id, status, scheduled_at, payload, route, ride_date,
                     order_type, created_at, updated_at,
-                    mode, poll_interval_seconds, monitor_until, next_check_at
-                ) VALUES (?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mode, poll_interval_seconds, monitor_until, next_check_at,
+                    train_label
+                ) VALUES (?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -570,6 +576,7 @@ class Database:
                     monitor_until,
                     # The first check is due when monitoring starts, not now.
                     scheduled_at if monitor_until else None,
+                    train_label,
                 ),
             )
         task = self.get_task(task_id, user_id)
@@ -585,6 +592,14 @@ class Database:
                 (user_id,),
             ).fetchall()
         return [TaskRecord(**dict(row)) for row in rows]
+
+    def delete_task(self, task_id: str, user_id: int) -> bool:
+        """Hard-delete one task. The encrypted payload goes with it."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id)
+            )
+        return cursor.rowcount > 0
 
     def get_task(self, task_id: str, user_id: int) -> TaskRecord | None:
         with self.connect() as connection:

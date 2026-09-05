@@ -39,6 +39,7 @@ export interface Task {
   next_check_at: string | null;
   availability: string;
   availability_note: string;
+  train_label: string | null;
 }
 
 export interface MemberProfile {
@@ -172,6 +173,9 @@ export const api = {
   },
   cancelBookingSession(token: string, sessionToken: string) {
     return request<void>(`/booking-session/${sessionToken}`, { method: "DELETE" }, token);
+  },
+  deleteTask(token: string, taskId: string) {
+    return request<void>(`/tasks/${taskId}`, { method: "DELETE" }, token);
   },
   cancelTask(token: string, taskId: string) {
     return request<void>(`/tasks/${taskId}/cancel`, { method: "POST" }, token);

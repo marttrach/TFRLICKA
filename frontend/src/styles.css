@@ -125,6 +125,8 @@ input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgb
 .status-scheduled { color: #155b82; background: #dff0f9; }
 .status-waiting_human { color: #a44816; background: #fff0e6; }
 .status-completed { color: #176341; background: #e1f5eb; }
+/* The train the task is actually booking: the first thing to read on a card. */
+.task-main .task-train { margin: .15rem 0 .25rem; color: var(--navy); font-size: .82rem; font-weight: 700; }
 .task-time { display: grid; gap: .25rem; }
 .task-time span { color: var(--muted); font-size: .68rem; }
 .task-time b { font-size: .78rem; }

@@ -83,7 +83,14 @@ interface BookingFormState {
   monitorUntil: string;
   rideDate: string;
   trainNumber: string;
-  orderType: "BY_TRAIN_NO" | "BY_TIME";
+  // How you find the train, not how the task books it: a task always books a
+  // specific train number, because that is the only way the booking screen can
+  // open on the train you picked.
+  searchMode: "DIRECT" | "BY_TIME";
+  // Set when the number came from the suggestion list, so the card can name the
+  // train instead of just its number. Cleared when the number is typed by hand.
+  chosenTrain: TrainCandidate | null;
+  trainType: string;
   startTime: string;
   endTime: string;
   preferReserved: boolean;
@@ -105,7 +112,9 @@ const defaultForm: BookingFormState = {
   monitorUntil: "",
   rideDate: tomorrow(),
   trainNumber: "",
-  orderType: "BY_TRAIN_NO",
+  searchMode: "BY_TIME",
+  chosenTrain: null,
+  trainType: "ALL",
   startTime: "08:00",
   endTime: "12:00",
   preferReserved: true,
@@ -221,6 +230,7 @@ const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled"];
 interface BookingSession {
   taskId: string;
   route: string;
+  trainLabel: string | null;
   sessionToken: string;
   status: string;
   bookingCode: string | null;
@@ -433,6 +443,10 @@ function MemberProfilePanel({
   );
 }
 
+function trainLabel(item: TrainCandidate): string {
+  return `${item.train_type_name} ${item.train_no} · ${item.departure_time} → ${item.arrival_time}`;
+}
+
 function CandidateRow({ item, onChoose }: { item: TrainCandidate; onChoose: (item: TrainCandidate) => void }) {
   return (
     <article className="candidate-row">
@@ -465,6 +479,16 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [suggestionKey, setSuggestionKey] = useState("");
   const [waitingSuggestions, setWaitingSuggestions] = useState<Record<string, Suggestions>>({});
   const [booking, setBooking] = useState<BookingSession | null>(null);
+
+  // Train types come from what TDX actually returned, never a hard-coded list:
+  // offering a type with no trains that day is worse than not offering it.
+  const trainTypes = useMemo(() => {
+    if (!suggestions) return [] as string[];
+    const names = [...suggestions.primary, ...suggestions.alternatives].map((i) => i.train_type_name);
+    return [...new Set(names)].sort();
+  }, [suggestions]);
+  const filterByType = (items: TrainCandidate[]) =>
+    form.trainType === "ALL" ? items : items.filter((i) => i.train_type_name === form.trainType);
 
   const currentSuggestionKey = [form.startStation, form.endStation, form.rideDate, form.startTime, form.endTime, form.preferReserved, form.includeTransfers].join("|");
 
@@ -554,8 +578,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }
 
   function chooseCandidate(item: TrainCandidate) {
-    setForm((current) => ({ ...current, orderType: "BY_TRAIN_NO", trainNumber: item.train_no }));
-    setNotice(`已選擇 ${item.train_type_name} ${item.train_no}；請確認後再建立任務。`);
+    setForm((current) => ({ ...current, trainNumber: item.train_no, chosenTrain: item }));
+    setNotice(`已鎖定 ${trainLabel(item)}；確認後即可加入任務佇列。`);
   }
 
   async function createTask(event: FormEvent) {
@@ -564,14 +588,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     setError("");
     setNotice("");
     try {
-      let candidateSuggestions = suggestions;
-      if (form.orderType === "BY_TIME" && suggestionKey !== currentSuggestionKey) {
-        try {
-          candidateSuggestions = await querySuggestions();
-        } catch {
-          candidateSuggestions = null;
-        }
-      }
       await api.createTask(token, {
         // "Start now" sends no time at all: stamping this clock and having the
         // server compare it to its own only ever measured the gap between them.
@@ -579,6 +595,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         use_saved_member_login: form.useSavedMemberLogin,
         traveler_id: form.travelerId,
         mode: form.mode,
+        train_label: form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`,
         poll_interval_seconds: form.pollIntervalMinutes * 60,
         monitor_until: form.monitorUntil ? new Date(form.monitorUntil).toISOString() : null,
         booking: {
@@ -586,20 +603,19 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           start_station: form.startStation,
           end_station: form.endStation,
           trip_type: "ONEWAY",
-          order_type: form.orderType,
+          // Always by train number. 依時段 is how you search, not how you book.
+          order_type: "BY_TRAIN_NO",
           quantity: form.quantity,
           seat_preference: "NONE",
           allow_seat_change: true,
-          outbound: form.orderType === "BY_TRAIN_NO"
-            ? { ride_date: form.rideDate.replaceAll("-", "/"), train_numbers: [form.trainNumber] }
-            : { ride_date: form.rideDate.replaceAll("-", "/"), start_time: form.startTime, end_time: form.endTime },
-          ...(form.orderType === "BY_TIME" && candidateSuggestions ? { candidate_suggestions: candidateSuggestions } : {}),
+          outbound: {
+            ride_date: form.rideDate.replaceAll("-", "/"),
+            train_numbers: [form.trainNumber],
+          },
         },
       });
-      setNotice(candidateSuggestions || form.orderType === "BY_TRAIN_NO"
-        ? "任務已排入；到點後會轉為等待人工驗證。"
-        : "任務已排入，但 TDX 暫時不可用，這次未附離線候選清單。");
-      setForm((current) => ({ ...current, trainNumber: "" }));
+      setNotice("任務已排入；每個間隔會自動查一次，有位時才會通知你去完成驗證。");
+      setForm((current) => ({ ...current, trainNumber: "", chosenTrain: null }));
       await loadTasks();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法建立任務");
@@ -619,6 +635,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         setBooking({
           taskId: task.id,
           route: task.route,
+          trainLabel: task.train_label,
           // session_url is "/booking-session/<token>/"; both the noVNC URL and
           // the DELETE that releases the lock are built from the token.
           sessionToken: session.session_url.split("/")[2] ?? "",
@@ -641,6 +658,16 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   async function cancelTask(taskId: string) {
     await api.cancelTask(token, taskId);
     await loadTasks();
+  }
+
+  async function deleteTask(taskId: string) {
+    if (!window.confirm("刪除這個任務？監控會停止，訂票設定也會一併移除。")) return;
+    try {
+      await api.deleteTask(token, taskId);
+      await loadTasks();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法刪除任務");
+    }
   }
 
   async function closeBooking(session: BookingSession) {
@@ -701,9 +728,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             <div className="panel-heading"><div><span className="step">03</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
             <form className="booking-form" onSubmit={createTask}>
               <fieldset className="mode-switch wide">
-                <legend>查詢方式</legend>
-                <label><input type="radio" checked={form.orderType === "BY_TRAIN_NO"} onChange={() => setForm({ ...form, orderType: "BY_TRAIN_NO" })} /> 依車次</label>
-                <label><input type="radio" checked={form.orderType === "BY_TIME"} onChange={() => setForm({ ...form, orderType: "BY_TIME" })} /> 依時段</label>
+                <legend>怎麼找車次</legend>
+                <label><input type="radio" checked={form.searchMode === "BY_TIME"} onChange={() => setForm({ ...form, searchMode: "BY_TIME" })} /> 用時段與車種找</label>
+                <label><input type="radio" checked={form.searchMode === "DIRECT"} onChange={() => setForm({ ...form, searchMode: "DIRECT" })} /> 直接輸入車次</label>
               </fieldset>
               <label className="wide">乘車人
                 {travelers.length === 0
@@ -752,12 +779,18 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 />
               </div>
               <label>乘車日期<input type="date" value={form.rideDate} onChange={(e) => setForm({ ...form, rideDate: e.target.value })} required /></label>
-              {form.orderType === "BY_TRAIN_NO" ? (
-                <label>車次<input inputMode="numeric" pattern="[0-9]+" value={form.trainNumber} onChange={(e) => setForm({ ...form, trainNumber: e.target.value })} placeholder="例如 110" required /></label>
+              {form.searchMode === "DIRECT" ? (
+                <label>車次<input inputMode="numeric" pattern="[0-9]+" value={form.trainNumber} onChange={(e) => setForm({ ...form, trainNumber: e.target.value, chosenTrain: null })} placeholder="例如 110" required /></label>
               ) : (
                 <>
                   <label>開始時段<select value={form.startTime} onChange={(e) => setForm({ ...form, startTime: e.target.value })}>{times.map((value) => <option key={value}>{value}</option>)}</select></label>
                   <label>結束時段<select value={form.endTime} onChange={(e) => setForm({ ...form, endTime: e.target.value })}>{times.map((value) => <option key={value}>{value}</option>)}</select></label>
+                  <label>車種
+                    <select value={form.trainType} onChange={(e) => setForm({ ...form, trainType: e.target.value })}>
+                      <option value="ALL">全部車種</option>
+                      {trainTypes.map((name) => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  </label>
                   <div className="suggestion-options wide">
                     <label><input type="checkbox" checked={form.preferReserved} onChange={(e) => setForm({ ...form, preferReserved: e.target.checked })} /> 排序時優先對號列車</label>
                     <label><input type="checkbox" checked={form.includeTransfers} onChange={(e) => setForm({ ...form, includeTransfers: e.target.checked })} /> 包含單次轉乘建議</label>
@@ -793,15 +826,18 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               </p>
               {error && <p className="error wide" role="alert">{error}</p>}
               {notice && <p className="notice wide" role="status">{notice}</p>}
-              <button className="primary wide" disabled={busy}>{busy ? "建立中…" : "加入任務佇列"}</button>
+              {form.trainNumber
+                ? <p className="notice wide" role="status">將鎖定 <b>{form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`}</b>；訂票畫面打開時就是這一班。</p>
+                : <p className="wide muted">請先選定一個車次才能建立任務：訂票畫面必須打開在你挑的那一班車上。</p>}
+              <button className="primary wide" disabled={busy || !form.trainNumber}>{busy ? "建立中…" : "加入任務佇列"}</button>
             </form>
-            {form.orderType === "BY_TIME" && suggestions && suggestionKey === currentSuggestionKey && (
+            {form.searchMode === "BY_TIME" && suggestions && suggestionKey === currentSuggestionKey && (
               <section className="suggestions-panel" aria-label="車次建議">
                 <div className="suggestion-warning"><b>時刻建議，不是餘位資訊</b><p>{suggestions.notice}</p></div>
                 <h3>時段內對號列車</h3>
-                {suggestions.primary.length ? suggestions.primary.map((item) => <CandidateRow key={`p-${item.train_no}-${item.departure_time}`} item={item} onChoose={chooseCandidate} />) : <p className="muted">這個時段沒有對號列車候選。</p>}
+                {filterByType(suggestions.primary).length ? filterByType(suggestions.primary).map((item) => <CandidateRow key={`p-${item.train_no}-${item.departure_time}`} item={item} onChoose={chooseCandidate} />) : <p className="muted">這個時段沒有對號列車候選。</p>}
                 <h3>其他選擇</h3>
-                {suggestions.alternatives.slice(0, 8).map((item) => <CandidateRow key={`a-${item.train_no}-${item.departure_time}`} item={item} onChoose={chooseCandidate} />)}
+                {filterByType(suggestions.alternatives).slice(0, 8).map((item) => <CandidateRow key={`a-${item.train_no}-${item.departure_time}`} item={item} onChoose={chooseCandidate} />)}
                 {suggestions.transfers.length > 0 && <h3>單次轉乘</h3>}
                 {suggestions.transfers.map((item, index) => (
                   <article className="transfer-row" key={`${item.transfer_station.value}-${index}`}>
@@ -826,7 +862,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                   <div className="task-main">
                     <span className={`status status-${task.status}`}>{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
-                    <p>{task.ride_date} · {task.order_type === "BY_TRAIN_NO" ? "依車次" : "依時段"} · {task.mode === "monitor_only" ? "只監控" : "到點準備訂票"}</p>
+                    <p className="task-train">{task.train_label ?? "未指定車次"}</p>
+                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "只監控" : "自動巡檢至訂到"}</p>
                     {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
                   </div>
                   <dl className="task-time">
@@ -847,6 +884,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                       {task.last_error && <p className="error">最近錯誤：{task.last_error}</p>}
                       {task.status === "waiting_human" && <button className="compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
                       {["scheduled", "monitoring", "waiting_human"].includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>停止並取消任務</button>}
+                      <button className="danger" onClick={() => deleteTask(task.id)}>刪除任務</button>
                     </details>
                   </div>
                   {task.status === "waiting_human" && waitingSuggestions[task.id] && (
@@ -873,8 +911,8 @@ function BookingScreen({ session, onClose }: { session: BookingSession; onClose:
     <div className="booking-screen" role="dialog" aria-modal="true" aria-label="訂票驗證畫面">
       <header>
         <div>
-          <strong>{session.route}</strong>
-          <small>{finished ? "已結束" : "請在下方畫面完成官方驗證，然後自行按下訂票"}</small>
+          <strong>{session.trainLabel ?? session.route}</strong>
+          <small>{finished ? "已結束" : `${session.route}｜請在下方畫面完成官方驗證，然後自行按下訂票`}</small>
         </div>
         <button onClick={onClose}>{finished ? "關閉" : "放棄這次訂票"}</button>
       </header>
