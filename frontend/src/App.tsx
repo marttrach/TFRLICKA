@@ -453,7 +453,7 @@ function CandidateRow({ item, onChoose }: { item: TrainCandidate; onChoose: (ite
       <div><b>{item.train_type_name} {item.train_no}</b><span>{item.seat_type_label}（車種屬性）</span></div>
       <strong>{item.departure_time} → {item.arrival_time}</strong>
       <small>{item.duration_minutes} 分鐘</small>
-      <button type="button" onClick={() => onChoose(item)}>改用此車次</button>
+      <button type="button" className="primary" onClick={() => onChoose(item)}>② 改用此車次</button>
     </article>
   );
 }
@@ -794,8 +794,15 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                   <div className="suggestion-options wide">
                     <label><input type="checkbox" checked={form.preferReserved} onChange={(e) => setForm({ ...form, preferReserved: e.target.checked })} /> 排序時優先對號列車</label>
                     <label><input type="checkbox" checked={form.includeTransfers} onChange={(e) => setForm({ ...form, includeTransfers: e.target.checked })} /> 包含單次轉乘建議</label>
-                    <button type="button" onClick={() => void querySuggestions().catch((reason) => setError(reason instanceof Error ? reason.message : "無法取得建議"))} disabled={suggestionBusy}>{suggestionBusy ? "查詢中…" : "查詢車次建議"}</button>
                   </div>
+                  <button
+                    type="button"
+                    className="primary wide"
+                    disabled={suggestionBusy}
+                    onClick={() => void querySuggestions().catch(() => setError(
+                      "查不到車次建議（TDX 時刻表暫時不可用）。改用上方「直接輸入車次」即可繼續。"
+                    ))}
+                  >{suggestionBusy ? "查詢中…" : "① 查詢車次建議"}</button>
                 </>
               )}
               <label>一般座票數<select value={form.quantity} onChange={(e) => setForm({ ...form, quantity: Number(e.target.value) })}>{[1, 2, 3, 4, 5, 6].map((value) => <option key={value}>{value}</option>)}</select></label>
@@ -828,9 +835,14 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               {notice && <p className="notice wide" role="status">{notice}</p>}
               {form.trainNumber
                 ? <p className="notice wide" role="status">將鎖定 <b>{form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`}</b>；訂票畫面打開時就是這一班。</p>
-                : <p className="wide muted">請先選定一個車次才能建立任務：訂票畫面必須打開在你挑的那一班車上。</p>}
+                : <p className="wide muted">{form.searchMode === "BY_TIME"
+                    ? "還沒選車次。按上面「① 查詢車次建議」，再從清單按「② 改用此車次」。訂票畫面必須打開在你挑的那一班車上。"
+                    : "還沒填車次。填入車次號碼即可建立任務。"}</p>}
               <button className="primary wide" disabled={busy || !form.trainNumber}>{busy ? "建立中…" : "加入任務佇列"}</button>
             </form>
+            {form.searchMode === "BY_TIME" && suggestions && suggestionKey !== currentSuggestionKey && (
+              <p className="notice" role="status">查詢條件已變更，請再按一次「① 查詢車次建議」。</p>
+            )}
             {form.searchMode === "BY_TIME" && suggestions && suggestionKey === currentSuggestionKey && (
               <section className="suggestions-panel" aria-label="車次建議">
                 <div className="suggestion-warning"><b>時刻建議，不是餘位資訊</b><p>{suggestions.notice}</p></div>
