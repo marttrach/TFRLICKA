@@ -1,6 +1,7 @@
 import asyncio
 import socketserver
 import threading
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -146,7 +147,12 @@ def test_a_cancelled_stream_still_gives_the_browser_slot_back():
         async def vnc(reader, writer):
             writer.write(b"RFB 003.008\n")
             await writer.drain()
-            await reader.read()
+            # The relay aborts its socket rather than closing it, so this read
+            # ends in a reset. Swallowing it keeps the handler from outliving
+            # the test.
+            with suppress(OSError):
+                await reader.read()
+            writer.close()
 
         server = await asyncio.start_server(vnc, "127.0.0.1", 0)
         outgoing = asyncio.Queue()
@@ -168,7 +174,8 @@ def test_a_cancelled_stream_still_gives_the_browser_slot_back():
             sessions.release(session.token)
             sessions.acquire("second", 2)  # the slot is usable again
         finally:
+            # Not wait_closed(): on 3.12 it also waits for the handler above,
+            # which is not what this test is about.
             server.close()
-            await server.wait_closed()
 
     asyncio.run(check())
