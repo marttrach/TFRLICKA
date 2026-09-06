@@ -45,9 +45,17 @@ for _ in $(seq 1 50); do
     sleep 0.2
 done
 
+# Xvfb alone hands out no input focus, so Chromium renders a window nobody can
+# type into: over VNC you can see the booking form and click it, but keystrokes
+# and the 訂票 button never land. matchbox is a ~100KB kiosk WM that focuses and
+# fullscreens the single window we open, which is exactly the shape we want.
+matchbox-window-manager -use_titlebar no &
+MATCHBOX_PID=$!
+
 # --no-sandbox is required for Chromium as root inside a container.
 "${CHROME_BIN}" \
     --no-sandbox \
+    --lang=zh-TW \
     --disable-dev-shm-usage \
     --remote-debugging-port="${CDP_LOOPBACK_PORT}" \
     --no-first-run \
@@ -79,6 +87,7 @@ echo "start-browser: ready (cdp=${CDP_PORT} novnc=${NOVNC_PORT})"
 
 # Exit as soon as any component dies so the container restart policy recovers
 # the whole stack instead of leaving a half-dead browser the API cannot use.
-wait -n "${XVFB_PID}" "${CHROME_PID}" "${SOCAT_PID}" "${X11VNC_PID}" "${WEBSOCKIFY_PID}"
+wait -n "${XVFB_PID}" "${MATCHBOX_PID}" "${CHROME_PID}" "${SOCAT_PID}" "${X11VNC_PID}" \
+    "${WEBSOCKIFY_PID}"
 echo "start-browser: a component exited; stopping container" >&2
 exit 1

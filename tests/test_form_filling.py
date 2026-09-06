@@ -151,6 +151,37 @@ def test_by_time_is_refused_rather_than_silently_wrong():
         )
 
 
+def _fake_playwright(monkeypatch):
+    playwright = MagicMock()
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = MagicMock()
+    sync_api.sync_playwright.return_value.__enter__.return_value = playwright
+    monkeypatch.setitem(sys.modules, "playwright", ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    return playwright
+
+
+def test_sidecar_booking_reuses_the_window_the_person_is_watching(monkeypatch):
+    # A second context is a second top-level window, and the sidecar runs no
+    # window manager: that window takes no keyboard input over VNC.
+    page = FakePage()
+    page.goto = Mock()
+    automator = TRCBookingAutomator(cdp_url="http://browser:9222")
+    page.url = automator.booking_url
+    playwright = _fake_playwright(monkeypatch)
+    browser = playwright.chromium.connect_over_cdp.return_value
+    context = MagicMock()
+    context.pages = [page]
+    browser.contexts = [context]
+
+    assert automator.run(booking()).status == "prepared"
+    browser.new_context.assert_not_called()
+    context.new_page.assert_not_called()
+    # Cleared going in, and the desktop left blank for whoever looks next.
+    assert context.clear_cookies.call_count == 2
+    assert page.goto.call_args.args[0] == "about:blank"
+
+
 def test_legacy_member_credentials_never_open_a_login_page(monkeypatch):
     # No browser dependency in CI: drive the real run() with a recording page.
     page = FakePage()
@@ -158,15 +189,10 @@ def test_legacy_member_credentials_never_open_a_login_page(monkeypatch):
     automator = TRCBookingAutomator(headless=True)
     automator.cdp_url = None
     page.url = automator.booking_url
-    playwright = MagicMock()
+    playwright = _fake_playwright(monkeypatch)
     browser = playwright.chromium.launch.return_value
     context = browser.new_context.return_value
     context.new_page.return_value = page
-    sync_api = ModuleType("playwright.sync_api")
-    sync_api.sync_playwright = MagicMock()
-    sync_api.sync_playwright.return_value.__enter__.return_value = playwright
-    monkeypatch.setitem(sys.modules, "playwright", ModuleType("playwright"))
-    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
 
     result = automator.run(booking(member_login={"account": "saved", "password": "secret"}))
     assert result.status == "prepared"

@@ -124,6 +124,35 @@ def test_cancelling_stops_the_loop(tmp_path) -> None:
     assert task.next_check_at is None
 
 
+def test_closing_the_viewer_keeps_the_task_patrolling(tmp_path) -> None:
+    # 關閉畫面（繼續巡迴）: the round ends, the task does not. Only
+    # POST /tasks/{id}/cancel is the person saying stop for good.
+    ready, release = threading.Event(), threading.Event()
+
+    class Waiting:
+        def run(self, request, **kwargs):
+            kwargs["on_ready"]()
+            ready.set()
+            assert kwargs["stop_event"].wait(5)
+            release.set()
+            return _Result("cancelled", None)
+
+    database, app = _app(tmp_path, Waiting())
+    with TestClient(app) as client:
+        headers = _register(client)
+        task_id = client.post("/tasks", headers=headers, json={"booking": BOOKING}).json()["id"]
+        started = client.post(f"/tasks/{task_id}/booking-session", headers=headers).json()
+        assert ready.wait(2)
+
+        assert client.delete(started["session_url"].rstrip("/"), headers=headers).status_code == 204
+        assert release.wait(2)
+        _wait_for_release(app.state.booking_sessions)
+
+        task = database.get_task(task_id, 1)
+        assert task.status == "monitoring"
+        assert task.next_check_at is not None
+
+
 def test_the_loop_stops_once_the_monitor_window_closed(tmp_path) -> None:
     # A window that shuts mid-round: the attempt still ends, but nothing requeues.
     database, app = _app(tmp_path, FinishingAutomator("timeout"))
@@ -181,6 +210,10 @@ def test_manual_stop_also_enters_recovery_before_expiry():
     sessions.reap()
     assert sessions.active is session  # Cleanup failure must never unlock the desktop.
     session.recover = lambda: sessions.release(session.token)
+    # A failed attempt backs off, so the scheduler tick is not spent retrying it.
+    sessions.reap()
+    assert sessions.active is session
+    session.next_recovery_at = None
     sessions.reap()
     assert sessions.active is None
 
@@ -261,7 +294,8 @@ def test_stuck_worker_recovery_finishes_once_and_preserves_cancel(tmp_path, late
             task_id = client.post('/tasks', headers=headers, json={'booking': BOOKING}).json()['id']
             started = client.post(f'/tasks/{task_id}/booking-session', headers=headers).json()
             assert ready.wait(1)
-            assert client.delete(started['session_url'].rstrip('/'), headers=headers).status_code == 204
+            del started
+            assert client.post(f'/tasks/{task_id}/cancel', headers=headers).status_code == 204
             sessions = app.state.booking_sessions
             session = sessions.active
             session.stopped_at -= timedelta(seconds=61)

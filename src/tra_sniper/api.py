@@ -856,11 +856,14 @@ def create_app(
 
     @app.websocket("/booking-session/{session_token}/websockify")
     async def booking_stream(websocket: WebSocket, session_token: str) -> None:
+        from .automation import ipv4_host  # Lazy: automation pulls the browser extra.
+
         host = urlsplit(os.getenv("TRA_BROWSER_CDP_URL", "")).hostname
         if not host:
             await websocket.close(code=1011)
             return
-        await relay_vnc(websocket, sessions, session_token, host)
+        # x11vnc binds IPv4 only, and Docker's DNS answers AAAA first.
+        await relay_vnc(websocket, sessions, session_token, ipv4_host(host))
 
     @app.get("/tasks/{task_id}/booking-result", response_model=BookingResultResponse)
     def booking_result(
@@ -896,8 +899,10 @@ def create_app(
         session = sessions.resolve(session_token)
         if session is None or session.user_id != user.id:
             raise HTTPException(status_code=403, detail="Session is invalid or expired")
-        db.update_task_status(session.task_id, user.id, "cancelled")
-        session.request_stop()
+        # Closing the viewer ends this round only. The task goes back in the
+        # poll loop and prepares the page again one interval later; stopping
+        # for good is POST /tasks/{id}/cancel, which the person asks for by name.
+        session.request_stop(cancelled=False)
         return Response(status_code=204)
 
     @app.delete("/tasks/{task_id}", status_code=204)

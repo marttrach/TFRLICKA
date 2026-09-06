@@ -15,6 +15,10 @@ TOKEN_BYTES = 32
 # How long a signalled worker gets to close its browser context before the
 # browser is recovered. Never reuse the desktop before cleanup succeeds.
 CLEANUP_GRACE_SECONDS = 60
+# Recovery restarts the sidecar over the network and blocks for as long as that
+# takes. reap() runs at the top of every scheduler tick, so retrying a failing
+# recovery on each one would leave the poll loop doing nothing else at all.
+RECOVERY_RETRY_SECONDS = 60
 
 # Terminal states never resolve a token again; the browser context is gone.
 FINISHED_STATUSES = frozenset({"completed", "failed", "timeout", "cancelled"})
@@ -49,6 +53,7 @@ class BookingSession:
     cancelled_by_user: bool = False
     worker_done: bool = False
     streams: int = 0
+    next_recovery_at: datetime | None = None
     recover: Callable[[], None] | None = field(default=None, repr=False)
 
     def request_stop(self, *, cancelled: bool = True) -> None:
@@ -151,6 +156,11 @@ class BookingSessionManager:
                 if (now - active.stopped_at).total_seconds() < CLEANUP_GRACE_SECONDS:
                     return None
                 recover = active.recover
+                if recover is None:
+                    return None
+                if active.next_recovery_at is not None and now < active.next_recovery_at:
+                    return None
+                active.next_recovery_at = now + timedelta(seconds=RECOVERY_RETRY_SECONDS)
             elif active.is_expired(now):
                 active.request_stop(cancelled=False)
                 return active
@@ -158,8 +168,6 @@ class BookingSessionManager:
                 return None
         # Recovery may perform network I/O and call release(). Do not hold the
         # manager lock here. Failure leaves the slot closed, never shared.
-        if recover is None:
-            return None
         try:
             recover()
         except Exception:
@@ -209,7 +217,10 @@ def run_booking_session(
         session.status = result.status
         if session.cancelled_by_user and not result.booking_code:
             session.status = "cancelled"
-        elif session.status == "cancelled" and session.is_expired():
+        elif session.status == "cancelled" and session.stop.is_set():
+            # Stopped without anyone cancelling the task: closing the viewer or
+            # running out of session time ends the round, not the patrol.
+            # "timeout" is the status the poll loop requeues.
             session.status = "timeout"
         session.booking_code = result.booking_code
         session.message = result.message
@@ -219,10 +230,8 @@ def run_booking_session(
         session.status = "failed"
         if session.cancelled_by_user:
             session.status = "cancelled"
-        elif session.is_expired():
+        elif session.is_expired() or session.stop.is_set():
             session.status = "timeout"
-        elif session.stop.is_set():
-            session.status = "cancelled"
         session.message = str(exc)
         logger.exception(
             "booking session failed",

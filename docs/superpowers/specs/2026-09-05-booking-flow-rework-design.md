@@ -207,7 +207,9 @@ VNC WebSocket 經 API 持續檢查 session，nginx 只將靜態資源轉給 side
 停止 60 秒後仍未清理就嘗試重啟專用 sidecar 瀏覽器；確認新瀏覽器就緒才結束卡住的工作。
 無法確認恢復時保留鎖，不能只放行下一個任務。背景工作遲到的失敗不得覆寫取消或完成。
 前端以 `X-Booking-Session` 查詢本輪結果；本輪已結束則移除舊 iframe，不跟隨下一輪的 session。
-每次 session 仍使用新 context，不保留跨任務會員登入。
+每次 session 重用 sidecar 既有視窗並清 cookie，不保留跨任務資料：另開 context 會多一個
+Xvfb 上沒有 WM 能給焦點的視窗，人在 VNC 看得到卻打不進去。sidecar 因此改跑 matchbox WM。
+「關閉畫面」只結束本輪並排入下一輪；只有任務卡的取消才是本人喊停。
 
 ## 測試策略
 

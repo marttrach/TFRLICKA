@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,19 @@ def station_code(station: str) -> str:
     return code
 
 
+def ipv4_host(host: str) -> str:
+    """Resolve a container name to its A record, or return it unchanged.
+
+    Docker's embedded DNS puts the AAAA record first on an IPv6-enabled
+    network, and neither the socat relay nor x11vnc in docker/start-browser.sh
+    listens on IPv6. Connecting by name therefore burns a doomed attempt first.
+    """
+    try:
+        return socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+    except OSError:
+        return host
+
+
 def cdp_url_over_ipv4(url: str) -> str:
     """Swap a CDP URL's hostname for its A record.
 
@@ -57,11 +71,8 @@ def cdp_url_over_ipv4(url: str) -> str:
     parts = urlsplit(url)
     if not parts.hostname:
         return url
-    try:
-        ip = socket.getaddrinfo(
-            parts.hostname, parts.port, socket.AF_INET, socket.SOCK_STREAM
-        )[0][4][0]
-    except OSError:
+    ip = ipv4_host(parts.hostname)
+    if ip == parts.hostname:
         return url
     return parts._replace(netloc=f"{ip}:{parts.port}" if parts.port else ip).geturl()
 
@@ -143,16 +154,24 @@ class TRCBookingAutomator:
         with sync_playwright() as playwright:
             if self.cdp_url:
                 browser = playwright.chromium.connect_over_cdp(cdp_url_over_ipv4(self.cdp_url))
+                # Drive the window the sidecar already opened. A fresh context
+                # opens a SECOND top-level window, and the sidecar's Xvfb has no
+                # window manager to size, stack or focus it: the person watching
+                # over VNC gets a form that ignores their keyboard. Clearing
+                # cookies is what the fresh context was really buying, and the
+                # browser outliving the booking is exactly why it is needed.
+                context = browser.contexts[0]
+                context.clear_cookies()
+                page = context.pages[0] if context.pages else context.new_page()
+                owns_browser = False
             else:
                 browser = playwright.chromium.launch(
                     headless=self.headless,
                     slow_mo=self.slow_mo_ms,
                 )
-            # A fresh context per session is a security requirement, not a
-            # preference: the sidecar browser outlives this booking, so a shared
-            # context would carry one member login into the next task.
-            context = browser.new_context(locale="zh-TW")
-            page = context.new_page()
+                context = browser.new_context(locale="zh-TW")
+                page = context.new_page()
+                owns_browser = True
             try:
                 # Booking starts directly, including legacy requests carrying
                 # member_login. Logging in first adds an unnecessary challenge.
@@ -185,7 +204,18 @@ class TRCBookingAutomator:
                     stop_event=stop_event,
                 )
             finally:
-                context.close()
+                if owns_browser:
+                    context.close()
+                else:
+                    # Leave the shared desktop blank and cookie-free: the VNC
+                    # stream outlives this call by a moment, and the next round
+                    # must not inherit this traveller's session.
+                    with suppress(Exception):
+                        page.goto("about:blank", timeout=10_000)
+                    with suppress(Exception):
+                        context.clear_cookies()
+                # For a CDP connection this only disconnects; the sidecar keeps
+                # running, which is the whole point of it being a sidecar.
                 browser.close()
 
     def _prepare_provider_handoff(self, page: Any) -> None:
@@ -264,6 +294,8 @@ class TRCBookingAutomator:
         screenshot_path: Path | None,
         stop_event: threading.Event | None = None,
     ) -> AutomationResult:
+        from playwright.sync_api import Error as PlaywrightError
+
         deadline = time.monotonic() + wait_seconds
         last_url = page.url
         while time.monotonic() < deadline:
@@ -275,7 +307,14 @@ class TRCBookingAutomator:
                 )
             page.wait_for_timeout(1_000)
             last_url = page.url
-            body_text = page.locator("body").inner_text(timeout=5_000)
+            try:
+                body_text = page.locator("body").inner_text(timeout=5_000)
+            except PlaywrightError:
+                # The person just pressed 訂票 and the page is navigating, so
+                # this read lost its execution context. Failing the round here
+                # would abandon a booking that is actually in flight; the next
+                # tick reads the result page instead.
+                continue
             code_match = re.search(
                 r"(?:訂票|電腦|取票)(?:代碼|編號)\s*[:：]?\s*([A-Z0-9-]{6,})",
                 body_text,

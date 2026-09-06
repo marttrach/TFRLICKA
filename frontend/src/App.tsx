@@ -678,8 +678,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }
 
   async function closeBooking(session: BookingSession) {
-    // Closing before the official result is in means abandoning the attempt, so
-    // release the browser instead of leaving it holding the single session lock.
+    // Closing ends this round only: the browser lock has to go back, but the
+    // task stays in the poll loop and prepares the page again one interval
+    // later. Stopping for good is 停止並取消任務 on the task card.
     if (!FINISHED_STATUSES.includes(session.status)) {
       await api.cancelBookingSession(token, session.sessionToken).catch(() => undefined);
     }
@@ -929,7 +930,7 @@ function BookingScreen({ session, onClose }: { session: BookingSession; onClose:
           <strong>{session.trainLabel ?? session.route}</strong>
           <small>{finished ? "已結束" : `${session.route}｜請在下方畫面完成官方驗證，然後自行按下訂票`}</small>
         </div>
-        <button onClick={onClose}>{finished ? "關閉" : "放棄這次訂票"}</button>
+        <button onClick={onClose}>{finished ? "關閉" : "關閉畫面（繼續巡迴）"}</button>
       </header>
       {finished ? (
         <div className={`booking-outcome ${session.status}`}>
