@@ -1,7 +1,8 @@
-"""The official booking form contract, as probed on 2026-09-05.
+"""The official booking form contract, as read off tip121/query on 2026-09-06.
 
-See docs/superpowers/specs/2026-09-05-booking-flow-rework-design.md. These
-assert the selectors and values we send, not a live page: CI installs no
+Every field is a text input, radio or checkbox -- the earlier "#startStation0
+<select>" contract matched nothing on the page and timed out on every round.
+These assert the selectors and values we send, not a live page: CI installs no
 browser, and the point is to catch a silent drift from that contract.
 """
 
@@ -11,33 +12,33 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from tra_sniper.automation import TRCBookingAutomator, station_code
+from tra_sniper.automation import LEG0, TRCBookingAutomator
 from tra_sniper.models import BookingRequest
-
-RIDE_DATES = ["2026/09/05", "2026/09/06", "2026/09/25", "2026/10/04"]
 
 
 class FakeLocator:
-    def __init__(self, calls, selector, ride_dates):
-        self.calls = calls
+    def __init__(self, page, selector):
+        self.page = page
         self.selector = selector
-        self.ride_dates = ride_dates
 
     def _record(self, action, value):
-        self.calls.append((self.selector, action, value))
+        self.page.calls.append((self.selector, action, value))
 
     def fill(self, value):
+        self.page.values[self.selector] = value
         self._record("fill", value)
-
-    def select_option(self, value=None, label=None):
-        self._record("select_option", value if value is not None else label)
 
     def check(self):
         self._record("check", None)
 
-    def evaluate_all(self, expression):
-        assert expression == "options => options.map(option => option.value)"
-        return list(self.ride_dates)
+    def set_checked(self, checked):
+        self._record("set_checked", checked)
+
+    def blur(self):
+        self._record("blur", None)
+
+    def input_value(self):
+        return self.page.values.get(self.selector, "")
 
     def count(self):
         return 0
@@ -46,15 +47,15 @@ class FakeLocator:
 class FakePage:
     """Records what would be done to the page, so CI needs no browser."""
 
-    def __init__(self, ride_dates=RIDE_DATES):
+    def __init__(self):
         self.calls = []
-        self.ride_dates = ride_dates
+        self.values = {}
 
     def locator(self, selector):
-        return FakeLocator(self.calls, selector, self.ride_dates)
+        return FakeLocator(self, selector)
 
     def get_by_role(self, role, name=None):
-        return FakeLocator(self.calls, f"role:{role}:{name}", self.ride_dates)
+        return FakeLocator(self, f"role:{role}:{name}")
 
 
 def booking(**overrides):
@@ -76,43 +77,53 @@ def prepared(page=None, **overrides):
     return page.calls
 
 
-def test_station_code_uses_the_official_numeric_key():
-    assert station_code("1180-竹北") == "1180"
-    # The official list has 1001-臺北-環島; only the leading code is the key.
-    assert station_code("1001-臺北-環島") == "1001"
-
-
-def test_station_without_a_numeric_code_is_rejected():
-    with pytest.raises(ValueError, match="站碼"):
-        station_code("竹北")
-
-
-def test_form_drives_the_official_select_controls():
+def test_form_drives_the_official_controls():
     calls = prepared()
-    assert ("#startStation0", "select_option", "1180") in calls
-    assert ("#endStation0", "select_option", "2200") in calls
-    assert ("#rideDate0", "select_option", "2026/09/25") in calls
-    assert ("#normalQty0", "select_option", "2") in calls
-    assert ("#seatPref0", "select_option", "NONE") in calls
-    assert ("#chgSeat0", "select_option", "true") in calls
+    # Stations are jQuery-UI autocompletes holding the whole "code-name" tag.
+    assert ("#startStation", "fill", "1180-竹北") in calls
+    assert ("#endStation", "fill", "2200-大甲") in calls
     assert ("#pid", "fill", "A123456789") in calls
+    assert ("#normalQty", "fill", "2") in calls
+    assert (f"input[name='{LEG0}.rideDate']", "fill", "2026/09/25") in calls
+    assert (f"input[name='{LEG0}.seatPref'][value='NONE']", "check", None) in calls
+    assert (f"input[name='{LEG0}.chgSeat']", "set_checked", True) in calls
+
+
+def test_a_station_the_autocomplete_rejects_is_an_error_not_a_wrong_route():
+    # The official script empties the field when nothing matches its tag list.
+    page = FakePage()
+    page.locator = lambda selector: _Emptying(page, selector)
+    with pytest.raises(ValueError, match="不認得車站"):
+        prepared(page)
+
+
+class _Emptying(FakeLocator):
+    def fill(self, value):
+        super().fill(value)
+        if "Station" in self.selector:
+            self.page.values[self.selector] = ""
 
 
 def test_form_uses_real_playwright_locator_methods():
     # The browser extra is optional; checking its API needs no browser process.
     playwright = pytest.importorskip("playwright.sync_api")
     page = FakePage()
+    real = page.locator
     page.locator = Mock(side_effect=lambda selector: Mock(
-        spec_set=playwright.Locator,
-        wraps=FakeLocator(page.calls, selector, page.ride_dates),
+        spec_set=playwright.Locator, wraps=real(selector),
     ))
+    # spec_set rejects any attribute Locator does not really have, so getting
+    # through _prepare_form proves fill/check/set_checked/blur/input_value are
+    # all real methods -- the exact class of bug the old contract shipped.
     prepared(page)
 
 
-def test_order_type_and_trip_type_are_never_clicked():
-    # Both are hidden inputs now; the tab URL decides them.
-    selectors = [selector for selector, _, _ in prepared()]
-    assert not [s for s in selectors if "orderType" in s or "tripType" in s]
+def test_order_type_and_trip_type_are_set_rather_than_assumed():
+    # Radio pairs on this same page. They happen to default to 依車次單程
+    # today, which is exactly why leaving them alone would fail silently.
+    calls = prepared()
+    assert ("input[name='tripType'][value='ONEWAY']", "check", None) in calls
+    assert ("input[name='orderType'][value='BY_TRAIN_NO']", "check", None) in calls
 
 
 def test_train_numbers_go_to_their_own_zero_based_fields():
@@ -122,17 +133,9 @@ def test_train_numbers_go_to_their_own_zero_based_fields():
         assert (selector, "fill", number) in calls
 
 
-def test_ride_date_outside_the_official_range_is_refused_clearly():
-    page = FakePage(ride_dates=["2026/09/05", "2026/09/06"])
-    with pytest.raises(ValueError) as excinfo:
-        prepared(page)
-    message = str(excinfo.value)
-    assert "2026/09/25" in message
-    assert "2026/09/06" in message
-
-
-def test_seat_change_false_sends_the_string_false():
-    assert ("#chgSeat0", "select_option", "false") in prepared(allow_seat_change=False)
+def test_seat_change_false_unchecks_the_box():
+    assert (f"input[name='{LEG0}.chgSeat']", "set_checked", False) in prepared(
+        allow_seat_change=False)
 
 
 def test_roundtrip_is_refused_rather_than_silently_wrong():

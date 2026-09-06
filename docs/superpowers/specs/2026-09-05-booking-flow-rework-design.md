@@ -17,55 +17,68 @@
 
 ## 已驗證的事實
 
-以下全部來自 2026-09-05 對 `https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query`
+以下全部來自對 `https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query`
 的實際 DOM 探測（只讀取，未送出任何請求）。
+
+> **2026-09-06 更正。** 2026-09-05 那份探測是錯的：它記下的 `select#startStation0`
+> 這一整組 0 結尾 `<select>` 在頁面上**一個都不存在**，照著改的 `_prepare_form`
+> 每一輪都以 `Locator.select_option: Timeout ... waiting for locator("#startStation0")`
+> 收場。諷刺的是那張表的「現行程式碼」欄本來才是對的——這次 rework 是拿一份
+> 假的探測去砍掉一份能動的程式。下表已依實際 HTML、jQuery validator 規則與
+> `tip_station_autocomplete.js` 原始碼重寫。
 
 ### 分頁與網址
 
-「依車次／依時段」「單程／雙行程」是四個分頁連結，**各自是不同網址**，
-不是同一頁上的 radio：
+「依車次／依時段」「單程／來回」**都是同一頁 `/tip001/tip121/query` 上的 radio**，
+不是四個網址。今天的預設值剛好就是依車次＋單程，所以不設定也可能會過——
+正因如此才必須明確設定，否則官方哪天改了預設值會靜默填錯表。
 
-| 分頁 | 網址 |
-| --- | --- |
-| 依車次單程訂票 | `/tip001/tip121/query` |
-| 依時段單程訂票 | `/tip001/tip122/tripOne/byTime` |
+### 表單控制項對照（實際 DOM）
 
-`orderType` 與 `tripType` 現在是 **hidden input**，值由所在網址決定。
-現行程式碼對它們呼叫 `.check()`，必定拋出 `Not a checkbox or radio button`。
+| 欄位 | selector | 型別與寫法 |
+| --- | --- | --- |
+| 身分類別 | `input[name='custIdTypeEnum'][value='PERSON_ID']` | radio，`.check()` |
+| 身分證號 | `#pid` | text，`.fill()` |
+| 單程 | `input[name='tripType'][value='ONEWAY']` | radio，`.check()` |
+| 依車次 | `input[name='orderType'][value='BY_TRAIN_NO']` | radio，`.check()` |
+| 出發／抵達站 | `#startStation` / `#endStation` | text + jQuery-UI autocomplete |
+| 一般座票數 | `#normalQty` | text（旁邊是 -/+ 按鈕），`.fill()` |
+| 搭乘日期 | `input[name='ticketOrderParamList[0].rideDate']`（`#rideDate1`） | text datepicker，`YYYY/MM/DD` |
+| 車次 | `input[name='ticketOrderParamList[0].trainNoList[0..2]']` | text，`.fill()` |
+| 座位偏好 | `input[name='…seatPref'][value='NONE'\|'TABLE']` | radio，`.check()` |
+| 可接受其他座位 | `input[name='…chgSeat']`（`#chgSeat1`） | checkbox，`.set_checked()` |
+| 驗證碼 | `#verifyCode`（name `g-recaptcha-response`） | **不碰** |
+| 送出 | `input[type=submit][value='訂票']` | **不碰，由本人按** |
 
-### 表單控制項對照
+站別欄位不是下拉選單。`tip_station_autocomplete.js` 的 `searchAutoArray()`
+在欄位失焦時，把使用者打的字換成 `availableTags` 裡對應的整串標籤
+（例如 `1180-竹北`），**比對不到就把欄位清空**。所以填入我們存的整串標籤再
+blur，然後回讀 `input_value()`：空的就代表官方站表變了，要當錯誤丟出來，
+不能讓它帶著空站別去訂一張不知道去哪的票。
 
-| `automation.py` 現行寫法 | 官方頁面實際 |
-| --- | --- |
-| `input[name='orderType'][value=…]`＋`.check()` | hidden input，改由網址決定 |
-| `input[name='tripType'][value=…]`＋`.check()` | hidden input，改由網址決定 |
-| `#startStation` ＋ `ul.ui-autocomplete` | `select#startStation0`，option value 為站碼 |
-| `#endStation` ＋ `ul.ui-autocomplete` | `select#endStation0` |
-| `#rideDate1`＋`.fill()` | `select#rideDate0`，option value 為 `YYYY/MM/DD`，僅開放約 30 天 |
-| `#normalQty`＋`.fill()` | `select#normalQty0` |
-| `input[name='…seatPref'][value=…]`＋`.check()` | `select#seatPref0`（`NONE` / `TABLE`） |
-| `#chgSeat1`＋`.set_checked()` | `select#chgSeat0`（`true` / `false`） |
-| `#startOrEndTime{n}` radio | 依車次分頁上不存在 |
-| 索引 `suffix = leg_index + 1` | name 為 0-based（`ticketOrderParamList[0]`） |
+日期沒有 option 清單可讀，只有 jQuery validator 的
+`{ required: true, dateISO: true, checkDateTime: … }`。可訂範圍由官方判斷，
+本地不再自行驗證。
 
-車次欄位：`ticketOrderParamList[0].trainNoList[0]`（id 為 `trainNo1`）、
-`[1]`、`[2]`。注意 name 是 0-based 而 id 是 1-based，兩者不一致。
+車次欄位：name 是 `ticketOrderParamList[0].trainNoList[0..2]`，
+id 卻是 `trainNoList1..3`——0-based 與 1-based 混用，一律以 name 定位。
 
-站碼對應：官方 option 形如 `value="1180"` / text `"1180-竹北"`，
-而 `api.py` 的 `POPULAR_STATIONS` 存的是 `"1180-竹北"`。
-取 `value.split("-")[0]` 即得站碼，無歧義。
+站別對應：`api.py` 的 `POPULAR_STATIONS` 存 `"1180-竹北"`，
+與官方 `availableTags` 同一種格式，整串直接填入即可，不需拆出站碼。
 
 ### 車種
 
-只存在於**依時段**分頁：
+**2026-09-06 更正：車種與車次在同一頁，不是二選一。**
 
 ```
-select name='ticketOrderParamList[0].trainTypeList[0]'
-  ALL=全部  11=自強(3000)  1=太魯閣  2=普悠瑪  3=自強  4=莒光  5=復興
+input[type=checkbox] name='ticketOrderParamList[0].trainTypeList'
+  11=自強(3000)  1=太魯閣  2=普悠瑪  3=自強  4=莒光  5=復興
 ```
 
-依車次分頁沒有這個欄位——車次號碼本身即決定車種。
-**因此「同時指定車次與車種」在官方表單上無法表達，兩者只能二選一。**
+是 checkbox 群組，與車次欄位並存。既然任務一律指定確切車次，車次號碼本身
+就決定了車種，勾不勾在功能上沒有差別，因此**現行實作仍不勾選**；
+車種依舊只當作建議清單的篩選器。這裡記下來是因為原本「官方只讓二選一」
+的理由是錯的，將來若要做依時段訂票，這個欄位是可用的。
 
 ### 驗證機制
 
@@ -79,7 +92,7 @@ sidecar 每次是否遇到驗證，或持久 profile 是否有效。
 
 | 議題 | 決定 | 理由 |
 | --- | --- | --- |
-| 車種語意 | 只作為 tra-sniper 建議清單的篩選器 | 官方二選一；使用者要求 VNC 必須落在指定車次，因此任務一律走依車次 |
+| 車種語意 | 只作為 tra-sniper 建議清單的篩選器 | 指定了確切車次，車種即已決定（原記的「官方二選一」有誤，見上）|
 | 任務建立 | 必須先選定車次才能加入佇列 | 同上；VNC 打開時看到的必須是使用者自己挑過的車 |
 | 人工交接 | 每輪自動備頁並通知一次，人工完成驗證與送出 | 官方在 v3 分數不足時要求圖形驗證碼，自動送出等同代解 |
 | 沒訂成 | 排入下一輪，直到訂到／取消／超過截止時間 | 使用者明確要求；自動送出的部分不做 |
@@ -105,17 +118,15 @@ sidecar 每次是否遇到驗證，或持久 profile 是否有效。
 
 任務一律走依車次單程，`BOOKING_URL` 固定為 `/tip001/tip121/query`。
 
-改寫 `_prepare_form` 與 `_fill_leg`，全數改用上表的新 selector：
+`_prepare_form` 與 `_fill_leg` 依上表填寫：
 
-- 站別：`select_option(value=站碼)`，站碼由 `"1180-竹北".split("-")[0]` 取得。
-- 日期：`select_option("#rideDate0", value="YYYY/MM/DD")`。官方僅開放約 30 天，
-  **日期不在 option 中時必須拋出明確錯誤**，訊息含官方可選範圍，不得靜默失敗。
-- 車次：`#trainNo1` 及 `trainNoList[1]`、`[2]`。
-- 張數／座位偏好／換座：對應三個 `select`。
-- `orderType` / `tripType`：不互動。
+- 站別：`fill("1180-竹北")` → `blur()` → 回讀，空值即報錯。
+- 日期：`fill("YYYY/MM/DD")`，範圍交給官方判斷。
+- 車次：三個欄位一律用 `ticketOrderParamList[0].trainNoList[n]` 這個 name 定位。
+- 張數：`fill()`；座位偏好：radio `.check()`；換座：checkbox `.set_checked()`。
+- `orderType` / `tripType`：明確 `.check()`，不依賴預設值。
 
-刪除 `choose_station_suggestion()`、`_select_station()` 及 `tests/test_station_selection.py`：
-自動完成選單已不存在，這些是死程式碼。
+`station_code()` 隨之刪除：站碼不再單獨使用，整串標籤才是官方要的值。
 
 `TripType.ROUNDTRIP` 或 `OrderType.BY_TIME` 進到 automation 時拋出明確的
 `NotImplementedError`，訊息說明只支援依車次單程。

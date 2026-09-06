@@ -19,6 +19,8 @@ from .models import BookingRequest, Leg, OrderType, TripType
 from .verification import VerificationMode, VerificationProvider, create_verification_provider
 
 BOOKING_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query"
+# Every per-leg field is named for its trip index; only the outbound leg is used.
+LEG0 = "ticketOrderParamList[0]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,18 +30,6 @@ class AutomationResult:
     message: str
     booking_code: str | None = None
     screenshot: str | None = None
-
-
-def station_code(station: str) -> str:
-    """Return the numeric key the official <select> uses for a station.
-
-    Stations are stored as "1180-竹北"; the option value is just "1180".
-    "1001-臺北-環島" is a real entry, so only the leading segment is the code.
-    """
-    code = station.split("-", 1)[0].strip()
-    if not code.isdigit():
-        raise ValueError(f"車站 {station!r} 沒有可用的站碼")
-    return code
 
 
 def ipv4_host(host: str) -> str:
@@ -232,14 +222,11 @@ class TRCBookingAutomator:
         field.fill(token)
 
     def _prepare_form(self, page: Any, request: BookingRequest) -> None:
-        # The official site splits 依車次/依時段 and 單程/雙行程 across four
-        # separate URLs, and orderType/tripType are hidden inputs set by
-        # whichever page you land on. BOOKING_URL is 依車次單程, so anything
-        # else would silently fill the wrong form.
+        # 依車次/依時段 and 單程/來回 are radio pairs on this one page, not four
+        # separate URLs. Only 依車次單程 is implemented, and the radios are set
+        # explicitly rather than trusted to still default the way they do today.
         if request.trip_type is not TripType.ONEWAY or request.order_type is not OrderType.BY_TRAIN_NO:
-            raise NotImplementedError(
-                "只支援依車次單程訂票；官方把其他組合放在不同網址上"
-            )
+            raise NotImplementedError("只支援依車次單程訂票")
 
         self._accept_cookie_notice(page)
         page.locator(
@@ -247,16 +234,20 @@ class TRCBookingAutomator:
         ).check()
         page.locator("#pid").fill(request.identity)
 
-        page.locator("#startStation0").select_option(value=station_code(request.start_station))
-        page.locator("#endStation0").select_option(value=station_code(request.end_station))
-        page.locator("#normalQty0").select_option(value=str(request.quantity))
+        page.locator("input[name='tripType'][value='ONEWAY']").check()
+        page.locator("input[name='orderType'][value='BY_TRAIN_NO']").check()
+
+        self._fill_station(page, "#startStation", request.start_station)
+        self._fill_station(page, "#endStation", request.end_station)
+        # A text input with -/+ buttons, not a <select>.
+        page.locator("#normalQty").fill(str(request.quantity))
 
         self._fill_leg(page, request.outbound)
 
-        page.locator("#seatPref0").select_option(value=request.seat_preference.value)
-        page.locator("#chgSeat0").select_option(
-            value="true" if request.allow_seat_change else "false"
-        )
+        page.locator(
+            f"input[name='{LEG0}.seatPref'][value='{request.seat_preference.value}']"
+        ).check()
+        page.locator(f"input[name='{LEG0}.chgSeat']").set_checked(request.allow_seat_change)
 
     @staticmethod
     def _accept_cookie_notice(page: Any) -> None:
@@ -265,26 +256,32 @@ class TRCBookingAutomator:
             button.first.click()
 
     @staticmethod
-    def _fill_leg(page: Any, leg: Leg) -> None:
-        # rideDate is a <select> of roughly the next 30 days. Reading the
-        # options first turns "date is past the booking window" into a message
-        # that says so, instead of Playwright's opaque strict-mode failure.
-        available = page.locator("#rideDate0 option").evaluate_all(
-            "options => options.map(option => option.value)"
-        )
-        if leg.ride_date not in available:
-            window = f"{available[0]} 至 {available[-1]}" if available else "（頁面未提供日期選項）"
-            raise ValueError(
-                f"官方訂票頁沒有 {leg.ride_date} 這個日期；目前開放 {window}"
-            )
-        page.locator("#rideDate0").select_option(value=leg.ride_date)
+    def _fill_station(page: Any, selector: str, station: str) -> None:
+        """Fill a jQuery-UI autocomplete whose value must be one of its own tags.
 
-        # The first field's id is trainNo1 while its name is trainNoList[0].
+        The field is plain text carrying "1180-竹北", and on blur the official
+        script rewrites whatever is there to the matching tag -- or empties it
+        when nothing matches. Filling the stored label lands on the tag exactly;
+        blurring afterwards lets the site normalise and, if it wipes the field,
+        turns a silently empty station into an error here instead of a booking
+        for the wrong route.
+        """
+        field = page.locator(selector)
+        field.fill(station)
+        field.blur()
+        if not field.input_value().strip():
+            raise ValueError(f"官方訂票頁不認得車站 {station!r}；站名或站碼可能已變更")
+
+    @staticmethod
+    def _fill_leg(page: Any, leg: Leg) -> None:
+        # A datepicker text input taking YYYY/MM/DD, validated as dateISO. Out
+        # of range is the official page's call to make, not ours.
+        page.locator(f"input[name='{LEG0}.rideDate']").fill(leg.ride_date)
+
+        # The first field's id is trainNoList1 while its name is trainNoList[0].
         # Addressing all three by name keeps one code path off that quirk.
         for index, train_number in enumerate(leg.train_numbers):
-            page.locator(
-                f"input[name='ticketOrderParamList[0].trainNoList[{index}]']"
-            ).fill(train_number)
+            page.locator(f"input[name='{LEG0}.trainNoList[{index}]']").fill(train_number)
 
     @staticmethod
     def _wait_for_human_verification(
