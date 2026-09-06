@@ -134,3 +134,41 @@ def test_api_websocket_routes_binary_vnc_and_revokes_it(tmp_path, monkeypatch):
         finally:
             server.shutdown()
             worker.join(2)
+
+
+def test_a_cancelled_stream_still_gives_the_browser_slot_back():
+    # detach_stream is the last statement of a `finally` that awaits four
+    # times first, so it is the cleanup most easily lost. Losing it costs the
+    # browser slot: release() frees the slot only once the stream count is
+    # back to zero, and a booking that cannot acquire one answers 409 with
+    # nothing left on screen for the person to close.
+    async def check():
+        async def vnc(reader, writer):
+            writer.write(b"RFB 003.008\n")
+            await writer.drain()
+            await reader.read()
+
+        server = await asyncio.start_server(vnc, "127.0.0.1", 0)
+        outgoing = asyncio.Queue()
+        websocket = AsyncMock()
+        websocket.scope = {"subprotocols": ["binary"]}
+        websocket.receive_bytes.side_effect = asyncio.Event().wait  # never returns
+        websocket.send_bytes.side_effect = outgoing.put
+        sessions = BookingSessionManager()
+        session = sessions.acquire("first", 1)
+        task = asyncio.create_task(relay_vnc(
+            websocket, sessions, session.token, "127.0.0.1", server.sockets[0].getsockname()[1],
+        ))
+        try:
+            assert await asyncio.wait_for(outgoing.get(), 2) == b"RFB 003.008\n"
+            assert session.streams == 1
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            assert session.streams == 0
+            sessions.release(session.token)
+            sessions.acquire("second", 2)  # the slot is usable again
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(check())

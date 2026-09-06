@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tra_sniper.browser_session import (
+    CLEANUP_GRACE_SECONDS,
     BookingSessionManager,
     SessionBusyError,
     run_booking_session,
@@ -193,3 +194,20 @@ def test_login_and_booking_handoffs_notify_once_even_when_notification_fails() -
     assert notifications == ["waiting_verification"]
     assert session.status == "completed"
     assert manager.active is None
+
+
+def test_reap_frees_a_slot_a_dead_viewer_pinned() -> None:
+    # release() keeps the slot until the last stream detaches, and reap() used
+    # to give up the moment worker_done was set. Between them, one stream that
+    # never detached pinned the browser forever: no recovery ran, nothing was
+    # logged, and every booking request got SessionBusyError.
+    sessions = BookingSessionManager()
+    session = sessions.acquire("task", 1)
+    sessions.attach_stream(session.token)
+    sessions.release(session.token)
+    assert sessions.active is session  # worker done, stream still counted
+
+    session.stopped_at = datetime.now(UTC) - timedelta(seconds=CLEANUP_GRACE_SECONDS + 1)
+    sessions.reap()
+    assert sessions.active is None
+    sessions.acquire("next", 1)

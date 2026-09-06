@@ -139,7 +139,9 @@ class BookingSessionManager:
 
     def detach_stream(self, session: BookingSession) -> None:
         with self._lock:
-            session.streams -= 1
+            # Never below zero: a count that undershoots can never equal it
+            # again, and `streams == 0` is half of what frees the slot.
+            session.streams = max(session.streams - 1, 0)
             if self._active is session and session.worker_done and session.streams == 0:
                 self._active = None
 
@@ -148,7 +150,22 @@ class BookingSessionManager:
         now = datetime.now(UTC)
         with self._lock:
             active = self._active
-            if active is None or active.worker_done:
+            if active is None:
+                return None
+            if active.worker_done:
+                # The worker is gone and only a stream still holds the slot.
+                # release() waits for that count to reach zero, so anything
+                # that stops it -- a viewer the server never saw close, a
+                # count that drifted -- pinned the browser for the life of
+                # the process: every later booking answered 409 and no
+                # recovery ever ran, because this method used to stop here.
+                stopped_at = active.stopped_at or now
+                if (now - stopped_at).total_seconds() >= CLEANUP_GRACE_SECONDS:
+                    self._active = None
+                    logger.warning(
+                        "released a browser slot a finished session still held",
+                        extra={"event": "booking_session.slot_forced", "task_id": active.task_id},
+                    )
                 return None
             if active.stop.is_set():
                 # Also cover older callers that signalled the event directly.
