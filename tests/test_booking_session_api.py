@@ -357,7 +357,9 @@ def test_expired_worker_keeps_slot_until_cleanup_then_requeues(tmp_path, monkeyp
             assert session.stop.is_set()
             second = _create_task(client, headers)
             assert client.post(f"/tasks/{second}/booking-session", headers=headers).status_code == 409
-            assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 409
+            # The slot stays taken until the worker cleans up. Deleting the
+            # task is still allowed; see tests/test_task_delete.py.
+            assert app.state.booking_sessions.active is session
             cleanup.set()
             assert finished.wait(1)
             # Nobody took over in time, so the task waits for its next round

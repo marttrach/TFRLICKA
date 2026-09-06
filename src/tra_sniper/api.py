@@ -910,12 +910,15 @@ def create_app(
         task = db.get_task(task_id, user.id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        # Deleting is an explicit instruction, so it always goes through: a
+        # round still open on this task is stopped rather than allowed to block
+        # it. Refusing with 409 left any task whose session never finished
+        # cleaning up -- a wedged worker, a viewer that never detached --
+        # undeletable until the API restarted, with nothing the person could
+        # close to fix it.
         active = sessions.active
-        if active is not None and active.task_id == task_id:
-            raise HTTPException(
-                status_code=409,
-                detail="這個任務正在訂票中；請先關閉訂票畫面再刪除。",
-            )
+        if active is not None and active.task_id == task_id and active.user_id == user.id:
+            active.request_stop()
         db.delete_task(task_id, user.id)
         return Response(status_code=204)
 

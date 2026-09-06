@@ -671,6 +671,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     if (!window.confirm("刪除這個任務？監控會停止，訂票設定也會一併移除。")) return;
     try {
       await api.deleteTask(token, taskId);
+      // The task is gone, so its booking screen has nothing left behind it.
+      setBooking((current) => (current && current.taskId === taskId ? null : current));
       await loadTasks();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法刪除任務");

@@ -62,16 +62,35 @@ def test_delete_cannot_reach_another_users_task(tmp_path) -> None:
         assert len(client.get("/tasks", headers=owner).json()) == 1
 
 
-def test_delete_is_refused_while_a_booking_session_holds_the_task(tmp_path) -> None:
+def test_delete_stops_a_live_booking_session_instead_of_refusing(tmp_path) -> None:
+    # A 409 here is a trap: a session whose worker never finished cleaning up
+    # holds the slot forever, and there is nothing the person can close.
     _, app = _app(tmp_path)
     with TestClient(app) as client:
         headers = _register(client)
         task_id = _create(client, headers)["id"]
-        app.state.booking_sessions.acquire(task_id, 1)
+        session = app.state.booking_sessions.acquire(task_id, 1)
 
-        response = client.delete(f"/tasks/{task_id}", headers=headers)
-        assert response.status_code == 409
-        assert len(client.get("/tasks", headers=headers).json()) == 1
+        assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 204
+        assert client.get("/tasks", headers=headers).json() == []
+        assert session.stop.is_set()
+
+
+def test_delete_works_once_a_round_has_ended(tmp_path) -> None:
+    # 逾時未完成 / 訂票失敗 tasks are the ones people reach for the delete
+    # button on, and a lingering VNC stream must not stand in the way.
+    _, app = _app(tmp_path)
+    sessions = app.state.booking_sessions
+    with TestClient(app) as client:
+        headers = _register(client)
+        task_id = _create(client, headers)["id"]
+        session = sessions.acquire(task_id, 1)
+        sessions.attach_stream(session.token)  # viewer still connected
+        sessions.release(session.token)  # worker finished; slot not free yet
+        assert sessions.active is session
+
+        assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 204
+        assert client.get("/tasks", headers=headers).json() == []
 
 
 def test_deleting_a_missing_task_is_404(tmp_path) -> None:
