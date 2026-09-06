@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from tra_sniper.suggestions import (
+    TAIPEI,
     TrainCandidate,
     candidates_from_records,
+    minutes_already_past,
     pair_transfers,
     sort_candidates,
 )
@@ -115,3 +119,23 @@ def test_absolute_ceiling_still_applies_without_a_direct_baseline() -> None:
     )
 
     assert paired == [], "a 14 hour itinerary is not a usable suggestion"
+
+
+def test_a_train_that_already_left_today_is_not_offered() -> None:
+    # Booking one is impossible, and offering it sends the person into a round
+    # that can only fail. The ±60 minute window slack makes this worse: asking
+    # for 13:00 onwards at 16:02 would otherwise surface a 12:xx departure.
+    records = [
+        record("133", "自強", "1", "15:44", "16:42"),
+        record("179", "自強", "1", "17:53", "18:52"),
+    ]
+    remaining = candidates_from_records(records, "13:00", "23:30", not_before=16 * 60 + 2)
+    assert [item.train_no for item in remaining] == ["179"]
+
+
+def test_minutes_already_past_only_applies_to_the_ride_day() -> None:
+    now = datetime(2026, 9, 6, 16, 2, tzinfo=TAIPEI)
+    assert minutes_already_past("2026/09/06", now) == 16 * 60 + 2
+    assert minutes_already_past("2026/09/07", now) is None
+    # The server runs on UTC; the timetable does not.
+    assert minutes_already_past("2026/09/06", datetime(2026, 9, 6, 8, 2, tzinfo=UTC)) == 962

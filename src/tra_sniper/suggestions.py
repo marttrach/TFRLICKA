@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .tdx import TdxClient, TdxError
@@ -11,6 +11,9 @@ TRANSFER_NOTICE = (
     "轉乘需分開購買兩張車票；第一段誤點可能影響第二段。系統不知道任一段是否有位，"
     "10 分鐘緩衝亦未計入實際月台距離。"
 )
+# The timetable is published in Taiwan time and Taiwan keeps no daylight
+# saving, so a fixed offset is exact. The API container runs on UTC.
+TAIPEI = timezone(timedelta(hours=8))
 RESERVED_TYPE_CODES = {"1", "2", "3"}
 RESERVED_TYPE_NAMES = ("自強", "普悠瑪", "太魯閣")
 
@@ -105,8 +108,25 @@ def parse_candidate(record: dict[str, Any], start: int, end: int) -> TrainCandid
     )
 
 
+def minutes_already_past(ride_date: str, now: datetime | None = None) -> int | None:
+    """Minutes of the ride day already gone, or None when it is not today.
+
+    Only today's timetable can hold a train that has already left; any other
+    date lies entirely ahead. Taiwan keeps no daylight saving, so a fixed +8 is
+    exact and does not depend on the container carrying a tz database.
+    """
+    moment = (now or datetime.now(TAIPEI)).astimezone(TAIPEI)
+    if date.fromisoformat(ride_date.replace("/", "-")) != moment.date():
+        return None
+    return moment.hour * 60 + moment.minute
+
+
 def candidates_from_records(
-    records: list[dict[str, Any]], start_time: str, end_time: str
+    records: list[dict[str, Any]],
+    start_time: str,
+    end_time: str,
+    *,
+    not_before: int | None = None,
 ) -> list[TrainCandidate]:
     start = time_minutes(start_time)
     end = time_minutes(end_time)
@@ -117,6 +137,10 @@ def candidates_from_records(
         except (TypeError, ValueError):
             continue
         departure = time_minutes(candidate.departure_time)
+        # A departed train cannot be booked, and the +/-60 minute slack below
+        # would otherwise pull in departures from before the person even asked.
+        if not_before is not None and departure < not_before:
+            continue
         if start - 60 <= departure <= end + 60:
             candidates.append(candidate)
     return candidates
@@ -215,10 +239,12 @@ class SuggestionService:
         prefer_reserved: bool = True,
         include_transfers: bool = True,
     ) -> dict[str, Any]:
-        date.fromisoformat(ride_date.replace("/", "-"))
+        not_before = minutes_already_past(ride_date)  # also validates the date
         start_id, end_id = _station_id(start_station), _station_id(end_station)
         direct_records = self.client.daily_timetable(start_id, end_id, ride_date)
-        direct = candidates_from_records(direct_records, start_time, end_time)
+        direct = candidates_from_records(
+            direct_records, start_time, end_time, not_before=not_before
+        )
         ranked = sort_candidates(direct, start_time, end_time, prefer_reserved=prefer_reserved)
         primary = [item for item in ranked if item.in_requested_window and item.is_reserved_type]
         alternatives = [
@@ -228,6 +254,9 @@ class SuggestionService:
             or (not item.in_requested_window and item.is_reserved_type)
         ]
         transfers: list[dict[str, Any]] = []
+        # Deliberately unfiltered: this is the route's best possible time, the
+        # yardstick transfers are judged against. Late in the day the trains
+        # still to come are not a fair measure of how fast the route can be.
         all_direct = candidates_from_records(direct_records, "00:00", "23:59")
         fastest = min((item.duration_minutes for item in all_direct), default=0)
         # Deliberately not gated on `fastest`: a route with no direct service is
@@ -239,11 +268,13 @@ class SuggestionService:
                         self.client.daily_timetable(start_id, hub_id, ride_date),
                         start_time,
                         end_time,
+                        not_before=not_before,
                     )
                     second = candidates_from_records(
                         self.client.daily_timetable(hub_id, end_id, ride_date),
                         "00:00",
                         "23:59",
+                        not_before=not_before,
                     )
                 except TdxError:
                     # Direct candidates remain useful if a secondary OD query fails.
