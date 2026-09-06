@@ -49,8 +49,17 @@ done
 # type into: over VNC you can see the booking form and click it, but keystrokes
 # and the 訂票 button never land. matchbox is a ~100KB kiosk WM that focuses and
 # fullscreens the single window we open, which is exactly the shape we want.
-matchbox-window-manager -use_titlebar no &
-MATCHBOX_PID=$!
+#
+# It is deliberately absent from the `wait -n` below, and its failure is
+# swallowed: Chromium, CDP and VNC all work without a WM, so a WM that refuses
+# to start should cost keyboard focus, not the whole sidecar. Listed there, one
+# bad option or one X error restarts the container -- forever, since the next
+# start hits the same option -- and then there is no booking page at all.
+(
+    matchbox-window-manager -use_titlebar no \
+        || matchbox-window-manager \
+        || echo "start-browser: no window manager; VNC typing may not work" >&2
+) &
 
 # --no-sandbox is required for Chromium as root inside a container.
 "${CHROME_BIN}" \
@@ -87,7 +96,7 @@ echo "start-browser: ready (cdp=${CDP_PORT} novnc=${NOVNC_PORT})"
 
 # Exit as soon as any component dies so the container restart policy recovers
 # the whole stack instead of leaving a half-dead browser the API cannot use.
-wait -n "${XVFB_PID}" "${MATCHBOX_PID}" "${CHROME_PID}" "${SOCAT_PID}" "${X11VNC_PID}" \
+wait -n "${XVFB_PID}" "${CHROME_PID}" "${SOCAT_PID}" "${X11VNC_PID}" \
     "${WEBSOCKIFY_PID}"
 echo "start-browser: a component exited; stopping container" >&2
 exit 1
