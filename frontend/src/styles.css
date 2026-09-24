@@ -267,3 +267,87 @@ body { padding-bottom: env(safe-area-inset-bottom); }
   overflow-wrap: anywhere;
 }
 .boundary-note { color: #c9d6e4; font-size: .9rem; }
+
+/* ---------------------------------------------------------------------------
+   Motion and tabbed layout, after THSR-Sniper: tabs in the top bar, cards that
+   lift, buttons that respond, a pulse on anything still in progress. Colours,
+   large-text mode and the mobile rules above are unchanged.
+   --------------------------------------------------------------------------- */
+
+:root { --radius: 12px; --ease: cubic-bezier(.2, .8, .2, 1); --shadow-lift: 0 16px 36px rgba(18, 58, 90, .14); }
+
+@keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 currentColor; } 70%, 100% { box-shadow: 0 0 0 7px transparent; } }
+@keyframes glow { 50% { box-shadow: inset 0 4px var(--orange), 0 0 0 4px rgba(232, 111, 43, .18); } }
+
+.rise { animation: rise .45s var(--ease) both; animation-delay: calc(var(--i, 0) * 45ms); }
+.view { display: grid; gap: 1.3rem; animation: rise .35s var(--ease) both; }
+.view > .booking-panel { max-width: 980px; }
+.view > .profile-panel { max-width: 760px; }
+.icon { width: 1.15em; height: 1.15em; flex: none; }
+.spinner { display: inline-block; width: 1em; height: 1em; margin-right: .45rem; vertical-align: -.15em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
+.pulse-dot { display: inline-block; width: 8px; height: 8px; margin-right: .4rem; border-radius: 50%; background: currentColor; animation: pulse-ring 1.8s ease-out infinite; }
+.page-message { margin-bottom: 1rem; border-radius: 8px; animation: rise .3s var(--ease) both; }
+.page-message .text-button { padding: 0 .2rem; }
+
+.topbar { position: sticky; top: 0; z-index: 20; height: auto; min-height: 68px; gap: 1rem; background: linear-gradient(100deg, #0c2a43, var(--navy) 45%, #164c74); }
+.brand-mark { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 10px; background: linear-gradient(135deg, var(--orange), #f2a15f); box-shadow: 0 6px 16px rgba(232, 111, 43, .35); }
+.brand-mark img { width: 30px; height: 30px; }
+.nav-tabs { display: flex; gap: .35rem; padding: .3rem; background: rgba(255, 255, 255, .08); border-radius: 12px; }
+.nav-tab { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: .5rem; min-height: 44px; border: 0; background: transparent; color: #cfe1ee; padding: .5rem .95rem; border-radius: 9px; font-weight: 750; transition: background-color .25s var(--ease), color .2s, transform .2s var(--ease); }
+.nav-tab:hover { background: rgba(255, 255, 255, .12); color: white; transform: translateY(-1px); }
+.nav-tab.active { background: var(--orange); color: white; box-shadow: 0 6px 16px rgba(232, 111, 43, .35); }
+.nav-badge { position: absolute; top: -4px; right: -4px; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 10px; background: white; color: #c9561b; font-size: .7rem; display: grid; place-items: center; animation: pulse-ring 1.8s ease-out infinite; }
+
+.panel, .welcome-card { border-radius: var(--radius); overflow: hidden; }
+.summary-row { border-radius: var(--radius); overflow: hidden; }
+.summary-row article { transition: transform .25s var(--ease), box-shadow .25s; }
+.summary-row article:hover { transform: translateY(-2px); box-shadow: var(--shadow-lift); position: relative; z-index: 1; }
+.summary-row article.attention { animation: rise .45s var(--ease) both, glow 2.4s ease-in-out infinite; }
+
+.primary, .danger, .candidate-row button { transition: transform .2s var(--ease), background-color .2s, box-shadow .2s, color .2s; border-radius: 8px; }
+.primary { box-shadow: 0 6px 16px rgba(232, 111, 43, .25); }
+.primary:hover:not(:disabled) { transform: translateY(-1px) scale(1.02); box-shadow: 0 10px 22px rgba(232, 111, 43, .32); }
+.danger:hover:not(:disabled) { background: #9c3737; color: white; }
+.primary:active:not(:disabled), .danger:active:not(:disabled) { transform: scale(.97); }
+input, select { border-radius: 8px; transition: border-color .2s, box-shadow .2s; }
+
+.task-card { border-left: 4px solid transparent; transition: background-color .2s, border-color .25s; }
+.task-card:hover { background: #f8fbfc; }
+.task-waiting_human { border-left-color: var(--orange); }
+.task-monitoring { border-left-color: var(--blue); }
+.task-completed { border-left-color: #1f8a57; }
+.task-failed, .task-timeout { border-left-color: #b83a3a; }
+.status { display: inline-flex; align-items: center; border-radius: 999px; padding: .2rem .55rem; }
+.status-monitoring { color: #155b82; background: #dff0f9; }
+.status-failed, .status-timeout { color: #9c3737; background: #fdeaea; }
+.candidate-row { border-radius: 8px; transition: border-color .2s, transform .2s var(--ease), box-shadow .2s; }
+.candidate-row:hover { border-color: var(--blue); transform: translateX(3px); box-shadow: 0 8px 24px rgba(34, 57, 72, .08); }
+
+/* What the official page is asking for right now, above the remote screen. */
+.verification-prompt { display: flex; align-items: center; margin: 0; padding: .75rem max(1rem, env(safe-area-inset-left)); background: var(--orange); color: white; font-weight: 800; animation: rise .3s var(--ease) both; }
+
+@media (max-width: 760px) {
+  .topbar { flex-wrap: wrap; padding-top: .6rem; padding-bottom: .6rem; }
+  .nav-tabs { order: 3; width: 100%; }
+  .nav-tab { flex: 1; flex-direction: column; gap: .15rem; padding: .45rem .3rem; font-size: .8rem; }
+  .summary-row article:hover { transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-iteration-count: 1 !important; }
+}
+
+/* The nth-of-type spans above leak into the nested station fieldsets (label 1
+   spans 3 implicit columns, label 2 is pinned to column 1). A plain two-column
+   grid lays the current form out correctly on desktop. */
+@media (min-width: 761px) {
+  .booking-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .booking-form label:nth-of-type(n) { grid-column: auto; }
+  .booking-form > fieldset, .booking-form > .station-block, .booking-form > p,
+  .booking-form > button, .booking-form > .suggestion-options, .booking-form > .wide,
+  .booking-form > label.wide { grid-column: 1 / -1; }
+  .station-picker > label { grid-column: auto; }
+  .task-card { grid-template-columns: minmax(230px, 1fr) minmax(230px, auto) auto; }
+}

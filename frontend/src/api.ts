@@ -89,6 +89,18 @@ export interface Suggestions {
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? "/api";
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+// Only a rejected token ends the session. Logging out on any failure revoked
+// every device's token whenever the API restarted or a sidecar call failed.
+export function isAuthError(reason: unknown): boolean {
+  return reason instanceof ApiError && reason.status === 401;
+}
+
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) {
@@ -105,7 +117,7 @@ async function request<T>(path: string, options: RequestInit = {}, token?: strin
     } catch {
       // Keep the status-based message when the server did not return JSON.
     }
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

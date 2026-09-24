@@ -1,11 +1,34 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, MemberProfile, Station, Suggestions, Task, TrainCandidate, Traveler, User } from "./api";
+import { CSSProperties, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { api, isAuthError, MemberProfile, Station, Suggestions, Task, TrainCandidate, Traveler, User } from "./api";
 
 const TOKEN_KEY = "tra-sniper-token";
+const APP_TITLE = "好搭車｜台鐵訂票小幫手";
 
+type Tab = "tasks" | "create" | "people";
+const TABS: { id: Tab; label: string; icon: string }[] = [
+  { id: "tasks", label: "任務", icon: "M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01" },
+  { id: "create", label: "建立任務", icon: "M12 5v14M5 12h14" },
+  { id: "people", label: "乘車人", icon: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 20a8 8 0 0 1 16 0" },
+];
+
+function Icon({ path }: { path: string }) {
+  return (
+    <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={path} />
+    </svg>
+  );
+}
+
+function Spinner() {
+  return <span className="spinner" aria-hidden="true" />;
+}
+
+// Local calendar date: toISOString() is UTC, which in Taiwan before 08:00 is
+// still yesterday and made "tomorrow" default to today.
 function tomorrow(): string {
   const value = new Date();
   value.setDate(value.getDate() + 1);
+  value.setMinutes(value.getMinutes() - value.getTimezoneOffset());
   return value.toISOString().slice(0, 10);
 }
 
@@ -178,8 +201,8 @@ function TravelerPanel({
   }
 
   return (
-    <section className="panel profile-panel">
-      <div className="panel-heading"><div><span className="step">01</span><h2>常用乘車人</h2></div><small>加密保存</small></div>
+    <section className="panel profile-panel rise">
+      <div className="panel-heading"><div><h2>常用乘車人</h2></div><small>加密保存</small></div>
       {travelers.length > 0 && (
         <ul className="traveler-list">
           {travelers.map((traveler) => (
@@ -222,6 +245,9 @@ const STATUS_TEXT: Record<string, string> = {
   expired: "監控已截止",
   ended: "本輪已結束",
 };
+
+// Statuses where something is still happening get a pulsing dot beside the words.
+const LIVE_STATUSES = ["monitoring", "waiting_human"];
 
 // The four statuses browser_session.FINISHED_STATUSES can end a session with.
 const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled", "expired", "ended"];
@@ -478,6 +504,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [suggestionKey, setSuggestionKey] = useState("");
   const [waitingSuggestions, setWaitingSuggestions] = useState<Record<string, Suggestions>>({});
   const [booking, setBooking] = useState<BookingSession | null>(null);
+  const [tab, setTab] = useState<Tab>("tasks");
 
   // Train types come from what TDX actually returned, never a hard-coded list:
   // offering a type with no trains that day is worse than not offering it.
@@ -502,7 +529,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     try {
       setTasks(await api.tasks(token));
     } catch (reason) {
-      if (reason instanceof Error && /expired|signed in/i.test(reason.message)) onLogout();
+      if (isAuthError(reason)) onLogout();
     }
   }, [token, onLogout]);
 
@@ -520,7 +547,10 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         setTimes(timeList);
         setTasks(taskList);
       })
-      .catch(onLogout);
+      .catch((reason) => {
+        if (isAuthError(reason)) onLogout();
+        else setError(reason instanceof Error ? `無法載入資料：${reason.message}；請稍後重新整理。` : "無法載入資料");
+      });
   }, [token, onLogout]);
 
   useEffect(() => {
@@ -529,12 +559,14 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }, [loadTasks]);
 
   useEffect(() => {
-    const waitingTasks = tasks.filter((task) => task.status === "waiting_human");
-    if (!waitingTasks.length) return;
-    void Promise.all(waitingTasks.map(async (task) => [task.id, await api.taskSuggestions(token, task.id)] as const))
-      .then((entries) => setWaitingSuggestions(Object.fromEntries(entries)))
+    // The task list is replaced every 10 s poll; fetch each task's offline
+    // candidates once instead of re-downloading all of them on every poll.
+    const missing = tasks.filter((task) => task.status === "waiting_human" && !(task.id in waitingSuggestions));
+    if (!missing.length) return;
+    void Promise.all(missing.map(async (task) => [task.id, await api.taskSuggestions(token, task.id)] as const))
+      .then((entries) => setWaitingSuggestions((current) => ({ ...current, ...Object.fromEntries(entries) })))
       .catch(() => undefined);
-  }, [tasks, token]);
+  }, [tasks, token, waitingSuggestions]);
 
   useEffect(() => {
     if (!linkedTaskId || !tasks.some((task) => task.id === linkedTaskId)) return;
@@ -561,6 +593,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
 
   const waiting = useMemo(() => tasks.filter((task) => task.status === "waiting_human").length, [tasks]);
   const scheduled = useMemo(() => tasks.filter((task) => task.status === "scheduled").length, [tasks]);
+
+  // A page prepared in the background needs a person within its round; the
+  // tab title is the one place they will see that without the webhook.
+  useEffect(() => {
+    document.title = waiting ? `(${waiting}) ${APP_TITLE}` : APP_TITLE;
+  }, [waiting]);
 
   async function querySuggestions(): Promise<Suggestions> {
     setSuggestionBusy(true);
@@ -624,6 +662,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       setNotice("任務已排入；每個間隔會自動備好訂票頁並通知你接手，直到訂到或超過截止時間。通知不代表有位。");
       setForm((current) => ({ ...current, trainNumber: "", chosenTrain: null }));
       await loadTasks();
+      setTab("tasks");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法建立任務");
     } finally {
@@ -663,7 +702,13 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }
 
   async function cancelTask(taskId: string) {
-    await api.cancelTask(token, taskId);
+    setError("");
+    try {
+      await api.cancelTask(token, taskId);
+      setNotice("任務已停止並取消。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法取消任務");
+    }
     await loadTasks();
   }
 
@@ -704,22 +749,34 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand-lockup"><img src="/favicon.svg" alt="" /><strong>好搭車</strong><small>台鐵訂票小幫手</small></div>
+        <div className="brand-lockup"><span className="brand-mark"><img src="/favicon.svg" alt="" /></span><strong>好搭車</strong><small>台鐵訂票小幫手</small></div>
+        <nav className="nav-tabs" role="tablist" aria-label="主要頁面">
+          {TABS.map((item) => (
+            <button key={item.id} role="tab" aria-selected={tab === item.id} className={`nav-tab${tab === item.id ? " active" : ""}`} onClick={() => { setTab(item.id); setError(""); setNotice(""); }}>
+              <Icon path={item.icon} /><span>{item.label}</span>
+              {item.id === "tasks" && waiting > 0 && <b className="nav-badge" aria-label={`${waiting} 個任務待你完成驗證`}>{waiting}</b>}
+            </button>
+          ))}
+        </nav>
         <div className="account"><span>{user?.email ?? "載入中…"}</span><button onClick={() => document.body.classList.toggle("large-text")}>大字模式</button><button onClick={onLogout}>登出</button></div>
       </header>
       <main className="workspace">
-        <section className="welcome-card">
+        {error && <p className="error page-message" role="alert">{error}</p>}
+        {notice && <p className="notice page-message" role="status">{notice}</p>}
+        {tab === "tasks" && (<>
+        <section className="welcome-card rise">
           <div><span>簡單三步驟</span><h1>選車次、排時間、到點完成驗證</h1><p>常用資料只要設定一次，之後每次訂票會自動帶入。</p></div>
         </section>
         <section className="summary-row" aria-label="任務摘要">
-          <article><span>排程中</span><strong>{scheduled}</strong><small>等待觸發時間</small></article>
-          <article className={waiting ? "attention" : ""}><span>需要人工</span><strong>{waiting}</strong><small>驗證碼與最終確認</small></article>
-          <article><span>全部任務</span><strong>{tasks.length}</strong><small>含取消與完成</small></article>
-          <div className="boundary"><b>驗證協助</b><p>若官方要求驗證，可放大畫面、重新產生，或請可信任家人協助；最後仍由你確認送出。</p></div>
+          <article className="rise" style={{ "--i": 0 } as CSSProperties}><span>排程中</span><strong>{scheduled}</strong><small>等待觸發時間</small></article>
+          <article className={`rise${waiting ? " attention" : ""}`} style={{ "--i": 1 } as CSSProperties}><span>需要人工</span><strong>{waiting}</strong><small>驗證碼與最終確認</small></article>
+          <article className="rise" style={{ "--i": 2 } as CSSProperties}><span>全部任務</span><strong>{tasks.length}</strong><small>含取消與完成</small></article>
+          <div className="boundary rise" style={{ "--i": 3 } as CSSProperties}><b>驗證協助</b><p>若官方要求驗證，可放大畫面、重新產生，或請可信任家人協助；最後仍由你確認送出。</p></div>
         </section>
+        </>)}
 
-        <div className="content-grid">
-          <div className="left-column">
+        {tab === "people" && (
+          <div className="view" key="people">
           <TravelerPanel token={token} travelers={travelers} onChanged={async () => {
             const refreshed = await api.travelers(token);
             setTravelers(refreshed);
@@ -731,8 +788,16 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             }));
           }} />
           {profile && <MemberProfilePanel token={token} profile={profile} onSaved={setProfile} />}
-          <section className="panel booking-panel">
-            <div className="panel-heading"><div><span className="step">03</span><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
+          </div>
+        )}
+
+        {tab === "create" && (
+          <div className="view" key="create">
+          {travelers.length === 0 && (
+            <p className="notice page-message">還沒有乘車人。請先到<button type="button" className="text-button" onClick={() => setTab("people")}>「乘車人」</button>新增一位，才能建立任務。</p>
+          )}
+          <section className="panel booking-panel rise">
+            <div className="panel-heading"><div><h2>建立訂票任務</h2></div><small>依車次 · 依時段</small></div>
             <form className="booking-form" onSubmit={createTask}>
               <fieldset className="mode-switch wide">
                 <legend>怎麼找車次</legend>
@@ -808,7 +873,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                       reason instanceof TypeError ? "無法連線至服務，請確認網路後重試。"
                         : reason instanceof Error ? reason.message : "查詢失敗，請稍後重試。"
                     ))}
-                  >{suggestionBusy ? "查詢中…" : "① 查詢車次建議"}</button>
+                  >{suggestionBusy && <Spinner />}{suggestionBusy ? "查詢中…" : "① 查詢車次建議"}</button>
                 </>
               )}
               <label>一般座票數<select value={form.quantity} onChange={(e) => setForm({ ...form, quantity: Number(e.target.value) })}>{[1, 2, 3, 4, 5, 6].map((value) => <option key={value}>{value}</option>)}</select></label>
@@ -837,14 +902,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 系統<strong>無法得知任何車次是否有位</strong>：台鐵餘票沒有可用的官方開放資料來源。
                 每個間隔自動備好訂票頁並通知你接手，每輪最多等你 15 分鐘。驗證與送出一律由你本人完成。沒完成就等下一輪，直到訂到、你取消，或超過監控截止時間。
               </p>
-              {error && <p className="error wide" role="alert">{error}</p>}
-              {notice && <p className="notice wide" role="status">{notice}</p>}
               {form.trainNumber
                 ? <p className="notice wide" role="status">將鎖定 <b>{form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`}</b>；訂票畫面打開時就是這一班。</p>
                 : <p className="wide muted">{form.searchMode === "BY_TIME"
                     ? "還沒選車次。按上面「① 查詢車次建議」，再從清單按「② 改用此車次」。訂票畫面必須打開在你挑的那一班車上。"
                     : "還沒填車次。填入車次號碼即可建立任務。"}</p>}
-              <button className="primary wide" disabled={busy || !form.trainNumber}>{busy ? "建立中…" : "加入任務佇列"}</button>
+              <button className="primary wide" disabled={busy || !form.trainNumber}>{busy && <Spinner />}{busy ? "建立中…" : "加入任務佇列"}</button>
             </form>
             {form.searchMode === "BY_TIME" && suggestions && suggestionKey !== currentSuggestionKey && (
               <p className="notice" role="status">查詢條件已變更，請再按一次「① 查詢車次建議」。</p>
@@ -870,15 +933,17 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             )}
           </section>
           </div>
+        )}
 
-          <section className="panel task-panel">
-            <div className="panel-heading"><div><span className="step">04</span><h2>任務佇列</h2></div><button className="text-button" onClick={loadTasks}>重新整理</button></div>
+        {tab === "tasks" && (
+          <section className="panel task-panel rise">
+            <div className="panel-heading"><div><h2>任務佇列</h2></div><button className="text-button" onClick={loadTasks}>重新整理</button></div>
             <div className="task-list">
-              {tasks.length === 0 && <div className="empty"><b>尚無任務</b><p>建立第一個訂票條件後，狀態會顯示在這裡。</p></div>}
-              {tasks.map((task) => (
-                <article id={`task-${task.id}`} className={`task-card${task.id === linkedTaskId ? " task-card-linked" : ""}`} key={task.id}>
+              {tasks.length === 0 && <div className="empty"><b>尚無任務</b><p>建立第一個訂票條件後，狀態會顯示在這裡。</p><button type="button" className="primary" onClick={() => setTab("create")}>建立任務</button></div>}
+              {tasks.map((task, index) => (
+                <article id={`task-${task.id}`} className={`task-card task-${task.status} rise${task.id === linkedTaskId ? " task-card-linked" : ""}`} style={{ "--i": index } as CSSProperties} key={task.id}>
                   <div className="task-main">
-                    <span className={`status status-${task.status}`}>{STATUS_TEXT[task.status] ?? task.status}</span>
+                    <span className={`status status-${task.status}`}>{LIVE_STATUSES.includes(task.status) && <i className="pulse-dot" />}{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
                     <p className="task-train">{task.train_label ?? "未指定車次"}</p>
                     <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "每輪自動備頁，等你接手"}</p>
@@ -916,7 +981,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               ))}
             </div>
           </section>
-        </div>
+        )}
       </main>
       {booking && <BookingScreen session={booking} onClose={() => void closeBooking(booking)} />}
     </div>
@@ -942,7 +1007,12 @@ function BookingScreen({ session, onClose }: { session: BookingSession; onClose:
           {session.bookingCode && <p className="boundary-note">請至台鐵官網或超商於期限內完成付款取票。</p>}
         </div>
       ) : (
-        <iframe title="台鐵訂票畫面" src={viewerUrl(session.sessionToken)} allow="clipboard-write" />
+        <>
+          {session.message && (
+            <p className="verification-prompt" role="status"><i className="pulse-dot" />{session.message}</p>
+          )}
+          <iframe title="台鐵訂票畫面" src={viewerUrl(session.sessionToken)} allow="clipboard-write" />
+        </>
       )}
       <footer>驗證碼與送出都由你本人完成；系統只負責把已填好的畫面送到你面前，並在拿到訂位代碼後記錄結果。</footer>
     </div>

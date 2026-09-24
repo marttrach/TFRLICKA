@@ -14,7 +14,7 @@ import pytest
 
 @pytest.mark.skipif(not os.getenv("TRA_TEST_FRONTEND_URL"), reason="requires local Vite + Chromium")
 def test_round_end_and_stale_train_selection():
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import expect, sync_playwright
 
     task = {
         "id": "audit-task", "status": "waiting_human", "route": "竹北 → 大甲",
@@ -73,22 +73,23 @@ def test_round_end_and_stale_train_selection():
             dialog.get_by_role('button', name='關閉', exact=True).wait_for(timeout=8000)
             assert dialog.locator('iframe').count() == 0
             dialog.get_by_role('button', name='關閉', exact=True).click()
+            page.get_by_role('tab', name='建立任務').click()
             page.get_by_role('button', name='① 查詢車次建議').click()
             page.get_by_role('button', name='② 改用此車次').first.click()
             submit = page.get_by_role('button', name='加入任務佇列')
-            assert submit.is_enabled()
-            page.get_by_label('乘車日期', exact=True).fill('2026-09-25')
-            assert submit.is_disabled()
+            expect(submit).to_be_enabled()
+            page.get_by_label('乘車日期', exact=True).fill('2099-12-30')  # never the default, so the date really changes
+            expect(submit).to_be_disabled()
             assert page.get_by_text('將鎖定', exact=False).count() == 0
             page.get_by_role('button', name='① 查詢車次建議').click()
             page.get_by_role('button', name='② 改用此車次').first.click()
-            assert submit.is_enabled()
+            expect(submit).to_be_enabled()
             page.get_by_role('button', name='交換出發與抵達', exact=True).click()
-            assert submit.is_disabled()
+            expect(submit).to_be_disabled()
             page.get_by_role('radio', name='直接輸入車次').check()
             page.get_by_label('車次', exact=True).fill('110')
             page.get_by_label('乘車日期', exact=True).fill('2026-09-26')
-            assert submit.is_enabled()  # Explicit manual entry is still supported.
+            expect(submit).to_be_enabled()  # Explicit manual entry is still supported.
         finally:
             browser.close()
 
