@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -49,6 +49,10 @@ BOOKING_TIME_LABELS = tuple(
 ) + ("23:59",)
 
 
+# Ride dates are Taiwan calendar dates; the container clock is usually UTC.
+TAIWAN_TZ = timezone(timedelta(hours=8))
+
+
 def _parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value.replace("/", "-"))
@@ -76,7 +80,7 @@ class Leg:
 
     def validate(self, order_type: OrderType) -> None:
         ride_date = _parse_date(self.ride_date)
-        if ride_date < datetime.now().astimezone().date():
+        if ride_date < datetime.now(TAIWAN_TZ).date():
             raise ValueError(f"ride_date {self.ride_date} is in the past")
 
         if order_type is OrderType.BY_TRAIN_NO:

@@ -21,6 +21,10 @@ from .verification import VerificationMode, VerificationProvider, create_verific
 BOOKING_URL = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip121/query"
 # Every per-leg field is named for its trip index; only the outbound leg is used.
 LEG0 = "ticketOrderParamList[0]"
+# Shown when reCAPTCHA v3 fails and the person must type the picture code.
+CAPTCHA_IMAGE_SELECTOR = "#codeimg"
+CAPTCHA_PROMPT = "官方要求輸入圖形驗證碼，請在畫面中輸入後按下訂票"
+CAPTCHA_WRONG = "驗證碼錯誤，請在畫面中重新輸入；本輪仍在等待你"
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +133,7 @@ class TRCBookingAutomator:
         screenshot: str | Path | None = None,
         stop_event: threading.Event | None = None,
         on_ready: Callable[[], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> AutomationResult:
         request.validate()
         if submit and self.headless:
@@ -192,6 +197,7 @@ class TRCBookingAutomator:
                     wait_seconds=max(0, int(deadline - time.monotonic())),
                     screenshot_path=screenshot_path,
                     stop_event=stop_event,
+                    on_progress=on_progress,
                 )
             finally:
                 if owns_browser:
@@ -290,11 +296,13 @@ class TRCBookingAutomator:
         wait_seconds: int,
         screenshot_path: Path | None,
         stop_event: threading.Event | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> AutomationResult:
         from playwright.sync_api import Error as PlaywrightError
 
         deadline = time.monotonic() + wait_seconds
         last_url = page.url
+        last_prompt: str | None = None
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return AutomationResult(
@@ -306,6 +314,7 @@ class TRCBookingAutomator:
             last_url = page.url
             try:
                 body_text = page.locator("body").inner_text(timeout=5_000)
+                captcha_shown = page.locator(CAPTCHA_IMAGE_SELECTOR).is_visible()
             except PlaywrightError:
                 # The person just pressed 訂票 and the page is navigating, so
                 # this read lost its execution context. Failing the round here
@@ -326,12 +335,23 @@ class TRCBookingAutomator:
                     booking_code=code_match.group(1),
                     screenshot=str(screenshot_path) if screenshot_path else None,
                 )
-            if "驗證碼錯誤" in body_text or "訂票失敗" in body_text:
+            if "訂票失敗" in body_text:
                 return AutomationResult(
                     status="failed",
                     url=last_url,
-                    message="TRC reported that verification or booking failed.",
+                    message="TRC reported that the booking failed.",
                 )
+            # A wrong code is retryable on this same page. Ending the round here
+            # would blank the screen under the person mid-typing and make them
+            # wait a whole poll interval for the next one.
+            prompt = None
+            if "驗證碼錯誤" in body_text:
+                prompt = CAPTCHA_WRONG
+            elif captcha_shown:
+                prompt = CAPTCHA_PROMPT
+            if prompt and prompt != last_prompt and on_progress:
+                on_progress(prompt)
+            last_prompt = prompt
 
         return AutomationResult(
             status="timeout",

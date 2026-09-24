@@ -223,6 +223,17 @@ def run_booking_session(
             except Exception:
                 logger.exception("booking handoff notification failed")
 
+    def progress(message: str) -> None:
+        # What the official page is asking the person for right now, shown on
+        # the booking screen. Reported, never acted on: the person still types.
+        if session.status != "waiting_verification" or session.stop.is_set():
+            return
+        session.message = message
+        logger.info(
+            "booking session verification prompt",
+            extra={"event": "booking_session.verification_prompt", "task_id": session.task_id},
+        )
+
     try:
         result = automator.run(  # type: ignore[attr-defined]
             request,
@@ -230,6 +241,7 @@ def run_booking_session(
             wait_seconds=session.remaining_seconds(),
             stop_event=session.stop,
             on_ready=ready,
+            on_progress=progress,
         )
         session.status = result.status
         if session.cancelled_by_user and not result.booking_code:
