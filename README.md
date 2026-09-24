@@ -46,10 +46,17 @@ cp .env.example .env
 若要使用完整車站與時刻建議，再填入 TDX 的 `TDX_CLIENT_ID`、
 `TDX_CLIENT_SECRET`；未設定時 API 仍可使用熱門站與依車次模式。
 
+映像檔（API、前端、瀏覽器 sidecar）由 GitHub Actions 建置，推送到 Docker Hub 並保留
+GHCR 副本。在 `.env` 或 Portainer 設定 `DOCKERHUB_USER` 為你的 Docker Hub 帳號：
+
 ```bash
 docker compose pull
 docker compose up -d
 ```
+
+CI 需要 repository secrets `DOCKERHUB_USERNAME` 與 `DOCKERHUB_TOKEN`（Read & Write）
+才會推送 Docker Hub；未設定時只推送 GHCR。另設 `PORTAINER_WEBHOOK_URL` 時，三個映像檔
+全部推送完成後才觸發 Portainer 重新部署，避免拉到舊的 `:latest`。
 
 服務啟動後：
 
@@ -69,6 +76,11 @@ docker compose up -d
 訂票流程不使用台鐵會員帳密，舊任務包含的 `member_login` 也會忽略。
 已保存的會員資料保留在摺疊設定區，可自行清除；後續付款等操作請至台鐵官網辦理。
 這能省去會員登入那一關，但官方訂票頁仍可能要求驗證，無法保證只出現一次。
+
+驗證畫面上方會即時回報官方正在要求什麼：出現圖形驗證碼時顯示「官方要求輸入圖形驗證碼」，
+輸入錯誤時顯示「驗證碼錯誤」並**保留本輪畫面**讓你直接重打，不會因一次打錯就清空頁面、
+等下一輪。驗證碼一律由你本人輸入，系統只回報狀態，不辨識、不代填。每次出現提示都會以
+`booking_session.verification_prompt` 事件寫入日誌，可用來確認圖形驗證碼是否每輪都出現。
 
 ## 📱 手機操作
 

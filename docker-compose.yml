@@ -1,6 +1,6 @@
 services:
   tra-sniper-api:
-    image: ghcr.io/marttrach/tra-sniper:latest
+    image: docker.io/${DOCKERHUB_USER:?Set DOCKERHUB_USER in Portainer}/tra-sniper:latest
     container_name: tra-sniper-api
     environment:
       TRA_TOKEN_SECRET: ${TRA_TOKEN_SECRET:?Set TRA_TOKEN_SECRET in Portainer}
@@ -40,7 +40,7 @@ services:
   # 6080 must stay inside this network. Access is only ever through the
   # frontend's token-guarded /booking-session/ proxy.
   tra-sniper-browser:
-    image: ghcr.io/marttrach/tra-sniper-browser:latest
+    image: docker.io/${DOCKERHUB_USER:?Set DOCKERHUB_USER in Portainer}/tra-sniper-browser:latest
     container_name: tra-sniper-browser
     shm_size: "1gb"
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
       - default
 
   tra-sniper-frontend:
-    image: ghcr.io/marttrach/tra-sniper-frontend:latest
+    image: docker.io/${DOCKERHUB_USER:?Set DOCKERHUB_USER in Portainer}/tra-sniper-frontend:latest
     container_name: tra-sniper-frontend
     ports:
       - "43124:80"

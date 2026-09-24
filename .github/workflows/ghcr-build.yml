@@ -1,9 +1,12 @@
-name: Build and Push Images to GHCR
+name: Build and Push Images
 
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
 
 env:
@@ -17,7 +20,11 @@ jobs:
     # take about a minute each; the browser one a few minutes at most.
     timeout-minutes: 40
 
-    # GITHUB_TOKEN publishes the packages; no Docker Hub secret is needed.
+    # Step `if:` can't read `secrets`, so expose it through env.
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+    # GITHUB_TOKEN publishes the GHCR packages.
     permissions:
       contents: read
       packages: write
@@ -61,10 +68,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub is the fast pull path from the deployment network.
+      # Skipped when the secret is absent, so forks still build to GHCR.
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build the tag list in the shell so no blank line reaches build-push-action.
       # GHCR rejects uppercase characters in image paths.
-      - name: Compute image owner
-        id: img
-        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - name: Compute tags
+        id: tags
+        env:
+          IMAGE: ${{ matrix.name }}
+          SHA: ${{ github.sha }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo 'list<<TAGS_EOF'
+            echo "${REGISTRY}/${owner}/${IMAGE}:latest"
+            echo "${REGISTRY}/${owner}/${IMAGE}:${SHA}"
+            if [ -n "$DOCKERHUB_USERNAME" ]; then
+              echo "docker.io/${DOCKERHUB_USERNAME}/${IMAGE}:latest"
+              echo "docker.io/${DOCKERHUB_USERNAME}/${IMAGE}:${SHA}"
+            fi
+            echo TAGS_EOF
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v6
@@ -72,8 +103,18 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.img.outputs.owner }}/${{ matrix.name }}:latest
-            ${{ env.REGISTRY }}/${{ steps.img.outputs.owner }}/${{ matrix.name }}:${{ github.sha }}
-          cache-from: ${{ matrix.gha_cache && 'type=gha' || '' }}
-          cache-to: ${{ matrix.gha_cache && 'type=gha,mode=max' || '' }}
+          tags: ${{ steps.tags.outputs.list }}
+          # Scoped per image so the two cached builds stop evicting each other.
+          cache-from: ${{ matrix.gha_cache && format('type=gha,scope={0}', matrix.name) || '' }}
+          cache-to: ${{ matrix.gha_cache && format('type=gha,mode=max,scope={0}', matrix.name) || '' }}
+
+  # Redeploy only after every image is pushed, so Portainer never pulls a stale :latest.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+    steps:
+      - name: Trigger Portainer stack webhook
+        if: env.PORTAINER_WEBHOOK_URL != ''
+        run: curl -fsS -X POST --max-time 60 "$PORTAINER_WEBHOOK_URL"
