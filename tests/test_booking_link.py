@@ -85,9 +85,11 @@ def _task(client) -> tuple[str, dict[str, str]]:
 
 def _api(tmp_path, tdx: TdxClient) -> TestClient:
     database = Database(tmp_path / "api.db", encryption_key=Fernet.generate_key().decode())
-    return TestClient(
+    client = TestClient(
         create_app(database, TokenManager("t" * 32), start_scheduler=False, tdx_client=tdx)
     )
+    client.database = database
+    return client
 
 
 def test_api_returns_a_link_for_the_tasks_first_train(tmp_path) -> None:
@@ -114,3 +116,37 @@ def test_api_explains_missing_credentials_and_tdx_failures(tmp_path) -> None:
     client.app.state.tdx.client_id = client.app.state.tdx.client_secret = "set"
     client.app.state.tdx.mcp_post = FakeMcp("權限不足", is_error=True)
     assert client.post(f"/tasks/{task_id}/booking-link", headers=headers).status_code == 503
+
+
+def test_notification_link_needs_no_login_and_redirects_to_a_fresh_tdx_link(tmp_path) -> None:
+    mcp = FakeMcp(REDIRECT)
+    client = _api(tmp_path, _client(tmp_path, mcp))
+    task_id, headers = _task(client)
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    task = client.database.get_task(task_id, user_id)
+
+    notifier = client.app.state.scheduler.notifier
+    notifier.public_url = "https://tra.example.test"
+    link = notifier.payload_for(task, {})["booking_url"]
+    assert link.startswith(f"https://tra.example.test/api/tasks/{task_id}/booking-link/open?")
+    assert not mcp.calls  # building the notification must not spend a TDX call
+
+    # nginx strips "/api"; the person tapping the link is not logged in.
+    path = link.removeprefix("https://tra.example.test/api")
+    opened = client.get(path, follow_redirects=False)
+    assert (opened.status_code, opened.headers["location"]) == (303, REDIRECT)
+
+    assert client.get(path[:-1] + "0", follow_redirects=False).status_code == 403
+    other_task = path.replace(task_id, "another-task")
+    assert client.get(other_task, follow_redirects=False).status_code == 403
+
+    client.post(f"/tasks/{task_id}/cancel", headers=headers)
+    assert client.get(path, follow_redirects=False).status_code == 410
+
+
+def test_notification_has_no_booking_link_without_tdx_credentials(tmp_path) -> None:
+    client = _api(tmp_path, TdxClient(client_id="", client_secret="", data_dir=tmp_path))
+    task_id, headers = _task(client)
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    task = client.database.get_task(task_id, user_id)
+    assert "booking_url" not in client.app.state.scheduler.notifier.payload_for(task, {})

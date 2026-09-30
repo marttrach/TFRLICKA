@@ -212,6 +212,13 @@ Header Auth credential。
 **不會傳送身分證、台鐵會員帳密，也不會傳送 token 本身或訂票 session 連結**。
 通知失敗只會寫入日誌，不會改變任務狀態，也不會重跑訂票。
 
+設定了 TDX 金鑰時，`task.waiting_human` 會多一個 `booking_url`，可直接轉發到
+Telegram 等通訊軟體讓人點開：它不需登入，點下去才向 TDX 取一條新的官方訂票連結並
+轉址過去（TDX 連結只有幾分鐘效期，所以不直接放進通知）。連結以
+`TRA_TOKEN_SECRET` 簽章、只在任務進行中有效，網址為
+`TRA_PUBLIC_URL` 加上 `/api/tasks/<id>/booking-link/open`，所以 `TRA_PUBLIC_URL`
+必須是收訊裝置連得到的位址。拿到連結的人都能開啟，請只轉給訂票的本人。
+
 ## 🛡️ 免責聲明
 
 **本軟體僅供學術研究與教育用途。**

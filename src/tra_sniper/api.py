@@ -1,3 +1,4 @@
+import hmac
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -666,12 +668,10 @@ def create_app(
             "availability_known": False,
         }
 
-    @app.post("/tasks/{task_id}/booking-link")
-    def task_booking_link(task_id: str, user: CurrentUser, response: Response) -> dict[str, str]:
-        """A TDX link to the official page, pre-filled, for the person's own browser."""
-        response.headers["Cache-Control"] = "no-store"
+    def _official_link(task_id: str, user_id: int) -> tuple[str, str]:
+        """Ask TDX for the official pre-filled page; returns (url, train number)."""
         try:
-            booking = BookingRequest.from_dict(db.get_task_payload(task_id, user.id))
+            booking = BookingRequest.from_dict(db.get_task_payload(task_id, user_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Task not found") from exc
         except (TypeError, ValueError) as exc:
@@ -696,7 +696,43 @@ def create_app(
                 status_code=503,
                 detail="TDX 無法產生官方訂票連結；請確認帳號已開通「臺鐵訂票導訂」，或稍後重試",
             ) from exc
+        return url, train_no
+
+    @app.post("/tasks/{task_id}/booking-link")
+    def task_booking_link(task_id: str, user: CurrentUser, response: Response) -> dict[str, str]:
+        """A TDX link to the official page, pre-filled, for the person's own browser."""
+        response.headers["Cache-Control"] = "no-store"
+        url, train_no = _official_link(task_id, user.id)
         return {"url": url, "train_no": train_no}
+
+    def _open_link_signature(task_id: str, user_id: int) -> str:
+        return tokens.sign(f"booking-link:{user_id}:{task_id}")
+
+    def _open_link_url(task: TaskRecord) -> str | None:
+        """The link a notification carries: stable, and redirects to a fresh TDX link.
+
+        TDX links expire within minutes, far sooner than a message gets read,
+        so the notification points here and the TDX link is issued on the tap.
+        """
+        if not tdx.configured:
+            return None
+        signature = _open_link_signature(task.id, task.user_id)
+        # "/api" is where frontend/nginx.conf mounts this API on the public origin.
+        return (
+            f"{scheduler.notifier.public_url}/api/tasks/{task.id}/booking-link/open"
+            f"?u={task.user_id}&sig={signature}"
+        )
+
+    @app.get("/tasks/{task_id}/booking-link/open")
+    def open_booking_link(task_id: str, u: int, sig: str) -> Response:
+        """Opened from a notification, so the signature stands in for the login."""
+        if not hmac.compare_digest(sig, _open_link_signature(task_id, u)):
+            raise HTTPException(status_code=403, detail="連結無效")
+        task = db.get_task(task_id, u)
+        if not task or task.status not in {"scheduled", "monitoring", "waiting_human"}:
+            raise HTTPException(status_code=410, detail="這個任務已結束，連結不再有效")
+        url, _ = _official_link(task_id, u)
+        return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
 
     def _build_automator(booking_request: BookingRequest) -> Any:
         del booking_request
@@ -860,6 +896,7 @@ def create_app(
         _start_booking(task.id, task.user_id)
 
     scheduler.prepare_booking = prepare_scheduled_booking
+    scheduler.notifier.booking_url_for = _open_link_url
 
     @app.post(
         "/tasks/{task_id}/booking-session",

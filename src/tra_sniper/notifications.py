@@ -20,6 +20,11 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # and no link that triggers an action by itself, so a forged message misleads
 # but cannot start a booking. Adding either to a payload invalidates this and
 # the receiver would need a verifiable signature again. See PLAN.md 12.9.
+#
+# booking_url stays inside that rule: it only opens the official page with the
+# route, date and train filled in. The traveller's ID is not in it and nothing
+# is submitted. It is signed and needs no login, so whoever receives the
+# payload can open it -- forward it only to the person doing the booking.
 Sender = Callable[[str, bytes, dict[str, str], float], None]
 
 
@@ -77,6 +82,7 @@ class WebhookNotifier:
         *,
         timeout_seconds: float = 5.0,
         sender: Sender | None = None,
+        booking_url_for: Callable[[TaskRecord], str | None] | None = None,
     ) -> None:
         self.url = url.strip()
         # TRA_WEBHOOK_SECRET now carries the Header Auth token rather than a
@@ -85,6 +91,8 @@ class WebhookNotifier:
         self.public_url = public_url.strip().rstrip("/")
         self.timeout_seconds = timeout_seconds
         self._sender = sender or _default_sender
+        # Set by the API once it knows whether TDX can issue official links.
+        self.booking_url_for = booking_url_for
 
     @classmethod
     def from_env(cls) -> WebhookNotifier:
@@ -105,7 +113,7 @@ class WebhookNotifier:
         return parsed.scheme == "https" or (parsed.hostname or "") in LOOPBACK_HOSTS
 
     def payload_for(self, task: TaskRecord, stored_payload: dict[str, Any]) -> dict[str, Any]:
-        return {
+        payload = {
             "event": "task.waiting_human",
             "task_id": task.id,
             "route": task.route,
@@ -114,6 +122,10 @@ class WebhookNotifier:
             "action_url": f"{self.public_url}/tasks/{task.id}",
             "note": NOTICE,
         }
+        booking_url = self.booking_url_for(task) if self.booking_url_for else None
+        if booking_url:
+            payload["booking_url"] = booking_url
+        return payload
 
     def result_payload_for(
         self, task: TaskRecord, status: str, booking_code: str | None

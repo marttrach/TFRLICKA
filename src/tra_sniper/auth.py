@@ -79,6 +79,10 @@ class TokenManager:
         signature = hmac.new(self._secret, encoded.encode("ascii"), hashlib.sha256).digest()
         return f"{encoded}.{_b64encode(signature)}"
 
+    def sign(self, text: str) -> str:
+        """Sign a link that has to outlive a login token, such as one in a notification."""
+        return hmac.new(self._secret, text.encode("utf-8"), hashlib.sha256).hexdigest()
+
     def verify(self, token: str, *, now: int | None = None) -> TokenClaims:
         try:
             encoded, signature = token.split(".", 1)
