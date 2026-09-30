@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -13,6 +14,11 @@ from typing import Any, Protocol
 
 TOKEN_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
 API_ROOT = "https://tdx.transportdata.tw/api/basic/v3/Rail/TRA"
+# TDX's hosted MCP server (github.com/tdxmotc/MCP). Its booking-link tool is the
+# only documented way to the official 導訂 deep link, so it is called as plain
+# JSON-RPC over HTTP rather than pulling in an MCP client for one tool.
+MCP_URL = "https://tdx.transportdata.tw/tdx-mcp/rail"
+BOOKING_LINK_TOOL = "get_taiwan_rail_online_booking_link"
 
 # Which county a station sits in never changes, so it is shipped rather than
 # fetched: reading it from TDX made the picker depend on credentials being set,
@@ -82,6 +88,41 @@ def _county_of(record: dict[str, Any]) -> str:
     return ""
 
 
+def _mcp_post(
+    message: dict[str, Any], headers: dict[str, str]
+) -> tuple[str, dict[str, Any] | None]:
+    """POST one JSON-RPC message; return (session id, reply or None)."""
+    request = urllib.request.Request(
+        MCP_URL,
+        data=json.dumps(message).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **headers,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            session_id = response.headers.get("mcp-session-id", "")
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise HttpError(exc.code) from exc
+    except OSError as exc:
+        raise TdxError("TDX is temporarily unavailable") from exc
+    # The reply is either bare JSON or one server-sent "data:" line; a
+    # notification gets an empty 202.
+    lines = [line[5:] for line in body.splitlines() if line.startswith("data:")]
+    text = lines[-1] if lines else body
+    try:
+        return session_id, json.loads(text) if text.strip() else None
+    except ValueError as exc:
+        raise TdxError("TDX returned an unexpected response") from exc
+
+
+McpPost = Callable[[dict[str, Any], dict[str, str]], tuple[str, dict[str, Any] | None]]
+
+
 @dataclass(slots=True)
 class CacheEntry:
     value: Any
@@ -97,6 +138,7 @@ class TdxClient:
         data_dir: str | Path | None = None,
         cache_ttl_hours: float | None = None,
         transport: HttpTransport | None = None,
+        mcp_post: McpPost = _mcp_post,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -110,6 +152,7 @@ class TdxClient:
             configured_ttl = float(os.getenv("TDX_CACHE_TTL_HOURS", "6"))
         self.cache_ttl_seconds = max(configured_ttl, 0.01) * 3600
         self.transport = transport or UrllibTransport()
+        self.mcp_post = mcp_post
         self.clock = clock
         self.sleep = sleep
         self._token: CacheEntry | None = None
@@ -188,6 +231,67 @@ class TdxClient:
         records = self._records(payload, "TrainTimetables", "DailyTrainTimetables")
         self._timetables[key] = CacheEntry(records, now + self.cache_ttl_seconds)
         return records
+
+    def booking_link(
+        self, start_station: str, end_station: str, train_no: str, ride_date: str, quantity: int
+    ) -> str:
+        """Ask TDX for a short-lived link to the official page, already filled in.
+
+        The person opens it in their own browser and books there themselves.
+        Needs the 臺鐵訂票導訂 permission on the TDX account.
+        """
+        if not self.configured:
+            raise TdxError("TDX credentials are not configured")
+        auth = {"cid": self.client_id, "cst": self.client_secret}
+        session_id, _ = self.mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "tra-sniper", "version": "1"},
+                },
+            },
+            auth,
+        )
+        headers = {**auth, "mcp-session-id": session_id}
+        self.mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, headers)
+        _, reply = self.mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": BOOKING_LINK_TOOL,
+                    "arguments": {
+                        # Stations are stored as "1020-板橋"; the tool takes the name.
+                        "origin_station_name": start_station.split("-", 1)[-1],
+                        "destination_station_name": end_station.split("-", 1)[-1],
+                        "train_number": train_no,
+                        "date": ride_date.replace("/", "-"),
+                        "ticket_count": quantity,
+                    },
+                },
+            },
+            headers,
+        )
+        result = reply.get("result") if isinstance(reply, dict) else None
+        if not isinstance(result, dict) or result.get("isError"):
+            raise TdxError("TDX did not return a booking link")
+        text = " ".join(
+            str(item.get("text", ""))
+            for item in result.get("content", [])
+            if isinstance(item, dict)
+        )
+        # ponytail: the tool's reply shape is undocumented, so the link is picked
+        # by its host -- it also echoes the key-protected API URL it called, which
+        # a browser cannot open. Read a named field once TDX documents one.
+        for url in re.findall(r"""https://[^\s"'\\<>]+""", text):
+            if not url.startswith("https://tdx.transportdata.tw/api/"):
+                return url
+        raise TdxError("TDX did not return a booking link")
 
     def fetch_stations(self) -> list[dict[str, str]]:
         payload = self._get("Station")

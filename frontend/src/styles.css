@@ -351,3 +351,13 @@ input, select { border-radius: 8px; transition: border-color .2s, box-shadow .2s
   .station-picker > label { grid-column: auto; }
   .task-card { grid-template-columns: minmax(230px, 1fr) minmax(230px, auto) auto; }
 }
+
+/* Official TDX booking link, opened on the person's own device. */
+.own-device { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin: .4rem 0; }
+.booking-screen > .own-device { margin: 0; padding: .5rem max(1rem, env(safe-area-inset-left)); color: #c9d6e4; }
+.official-link {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 0 .9rem;
+  border: 0; border-radius: 8px; background: var(--blue); color: #fff;
+  font-weight: 600; font-size: .85rem; text-decoration: none;
+}
+.official-link:disabled { opacity: .6; }

@@ -46,6 +46,12 @@ cp .env.example .env
 若要使用完整車站與時刻建議，再填入 TDX 的 `TDX_CLIENT_ID`、
 `TDX_CLIENT_SECRET`；未設定時 API 仍可使用熱門站與依車次模式。
 
+同一組金鑰若在 TDX 會員中心開通了「臺鐵訂票導訂」，任務上會多一顆
+「改用我的裝置訂票」：它向 [TDX MCP 服務](https://github.com/tdxmotc/MCP)
+取得有時效的官方訂票連結，在你自己的瀏覽器開啟已帶入日期、起訖站、車次與張數的
+台鐵訂票頁。身分證字號不會送給 TDX，仍由你在官方頁面輸入並送出；在那邊訂到後，
+請回來停止任務。
+
 映像檔（API、前端、瀏覽器 sidecar）由 GitHub Actions 建置，推送到 Docker Hub 並保留
 GHCR 副本。在 `.env` 或 Portainer 設定 `DOCKERHUB_USER` 為你的 Docker Hub 帳號：
 

@@ -196,6 +196,9 @@ export const api = {
   taskConfig(token: string, taskId: string) {
     return request<Record<string, unknown>>(`/tasks/${taskId}/config`, {}, token);
   },
+  bookingLink(token: string, taskId: string) {
+    return request<{ url: string; train_no: string }>(`/tasks/${taskId}/booking-link`, { method: "POST" }, token);
+  },
   taskSuggestions(token: string, taskId: string) {
     return request<Suggestions>(`/tasks/${taskId}/suggestions`, {}, token);
   },

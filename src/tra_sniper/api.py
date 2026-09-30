@@ -666,6 +666,38 @@ def create_app(
             "availability_known": False,
         }
 
+    @app.post("/tasks/{task_id}/booking-link")
+    def task_booking_link(task_id: str, user: CurrentUser, response: Response) -> dict[str, str]:
+        """A TDX link to the official page, pre-filled, for the person's own browser."""
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            booking = BookingRequest.from_dict(db.get_task_payload(task_id, user.id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Task not found") from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not booking.outbound.train_numbers:
+            raise HTTPException(status_code=422, detail="這個任務沒有指定車次，無法產生官方訂票連結")
+        if not tdx.configured:
+            raise HTTPException(status_code=409, detail="尚未設定 TDX 金鑰，無法產生官方訂票連結")
+        # The official page has three train fields, so the first one is enough
+        # to land there; each extra link would cost another TDX call.
+        train_no = booking.outbound.train_numbers[0]
+        try:
+            url = tdx.booking_link(
+                booking.start_station,
+                booking.end_station,
+                train_no,
+                booking.outbound.ride_date,
+                booking.quantity,
+            )
+        except TdxError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="TDX 無法產生官方訂票連結；請確認帳號已開通「臺鐵訂票導訂」，或稍後重試",
+            ) from exc
+        return {"url": url, "train_no": train_no}
+
     def _build_automator(booking_request: BookingRequest) -> Any:
         del booking_request
         if automator_factory is not None:

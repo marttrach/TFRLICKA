@@ -65,7 +65,7 @@ def booking(**overrides):
         "end_station": "2200-大甲",
         "quantity": 2,
         "order_type": "BY_TRAIN_NO",
-        "outbound": {"ride_date": "2026/09/25", "train_numbers": ["123"]},
+        "outbound": {"ride_date": "2099/12/30", "train_numbers": ["123"]},
     }
     data.update(overrides)
     return BookingRequest.from_dict(data)
@@ -84,7 +84,7 @@ def test_form_drives_the_official_controls():
     assert ("#endStation", "fill", "2200-大甲") in calls
     assert ("#pid", "fill", "A123456789") in calls
     assert ("#normalQty", "fill", "2") in calls
-    assert (f"input[name='{LEG0}.rideDate']", "fill", "2026/09/25") in calls
+    assert (f"input[name='{LEG0}.rideDate']", "fill", "2099/12/30") in calls
     assert (f"input[name='{LEG0}.seatPref'][value='NONE']", "check", None) in calls
     assert (f"input[name='{LEG0}.chgSeat']", "set_checked", True) in calls
 
@@ -127,7 +127,7 @@ def test_order_type_and_trip_type_are_set_rather_than_assumed():
 
 
 def test_train_numbers_go_to_their_own_zero_based_fields():
-    calls = prepared(outbound={"ride_date": "2026/09/25", "train_numbers": ["123", "456", "789"]})
+    calls = prepared(outbound={"ride_date": "2099/12/30", "train_numbers": ["123", "456", "789"]})
     for index, number in enumerate(["123", "456", "789"]):
         selector = f"input[name='ticketOrderParamList[0].trainNoList[{index}]']"
         assert (selector, "fill", number) in calls
@@ -142,7 +142,7 @@ def test_roundtrip_is_refused_rather_than_silently_wrong():
     with pytest.raises(NotImplementedError, match="依車次單程"):
         prepared(
             trip_type="ROUNDTRIP",
-            inbound={"ride_date": "2026/09/26", "train_numbers": ["456"]},
+            inbound={"ride_date": "2099/12/31", "train_numbers": ["456"]},
         )
 
 
@@ -150,7 +150,7 @@ def test_by_time_is_refused_rather_than_silently_wrong():
     with pytest.raises(NotImplementedError, match="依車次單程"):
         prepared(
             order_type="BY_TIME",
-            outbound={"ride_date": "2026/09/25", "start_time": "08:00", "end_time": "12:00"},
+            outbound={"ride_date": "2099/12/30", "start_time": "08:00", "end_time": "12:00"},
         )
 
 

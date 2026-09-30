@@ -966,6 +966,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                       <p className="unknown">{task.availability_note}</p>
                       {task.last_error && <p className="error">最近錯誤：{task.last_error}</p>}
                       {task.status === "waiting_human" && <button className="compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
+                      {["scheduled", "monitoring", "waiting_human"].includes(task.status) && <OfficialLink token={token} taskId={task.id} />}
                       {["scheduled", "monitoring", "waiting_human"].includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>停止並取消任務</button>}
                       <button className="danger" onClick={() => deleteTask(task.id)}>刪除任務</button>
                     </details>
@@ -983,12 +984,47 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           </section>
         )}
       </main>
-      {booking && <BookingScreen session={booking} onClose={() => void closeBooking(booking)} />}
+      {booking && <BookingScreen token={token} session={booking} onClose={() => void closeBooking(booking)} />}
     </div>
   );
 }
 
-function BookingScreen({ session, onClose }: { session: BookingSession; onClose: () => void }) {
+// The TDX link expires within minutes, so it is fetched on the first tap and
+// opened on the second: a window opened after an await is blocked as a popup.
+function OfficialLink({ token, taskId }: { token: string; taskId: string }) {
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function generate() {
+    setBusy(true);
+    setError("");
+    try {
+      setUrl((await api.bookingLink(token, taskId)).url);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "無法產生官方訂票連結");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (url) {
+    return (
+      <span className="own-device">
+        <a className="official-link" href={url} target="_blank" rel="noopener noreferrer" onClick={() => setUrl("")}>開啟台鐵官方訂票頁</a>
+        <small>連結幾分鐘內有效；在那邊訂到後，請回來停止這個任務。</small>
+      </span>
+    );
+  }
+  return (
+    <span className="own-device">
+      <button type="button" className="official-link" onClick={generate} disabled={busy}>{busy ? "產生連結中…" : "改用我的裝置訂票"}</button>
+      {error && <small className="error" role="alert">{error}</small>}
+    </span>
+  );
+}
+
+function BookingScreen({ token, session, onClose }: { token: string; session: BookingSession; onClose: () => void }) {
   const finished = FINISHED_STATUSES.includes(session.status);
   return (
     <div className="booking-screen" role="dialog" aria-modal="true" aria-label="訂票驗證畫面">
@@ -1011,6 +1047,7 @@ function BookingScreen({ session, onClose }: { session: BookingSession; onClose:
           {session.message && (
             <p className="verification-prompt" role="status"><i className="pulse-dot" />{session.message}</p>
           )}
+          <OfficialLink token={token} taskId={session.taskId} />
           <iframe title="台鐵訂票畫面" src={viewerUrl(session.sessionToken)} allow="clipboard-write" />
         </>
       )}
