@@ -175,17 +175,10 @@ export const api = {
   createTask(token: string, payload: unknown) {
     return request<Task>("/tasks", { method: "POST", body: JSON.stringify(payload) }, token);
   },
-  startBookingSession(token: string, taskId: string) {
-    return request<{ task_id: string; session_url: string; expires_at: string; notice: string }>(
-      `/tasks/${taskId}/booking-session`, { method: "POST" }, token);
-  },
-  bookingResult(token: string, taskId: string, sessionToken?: string) {
-    return request<{ task_id: string; status: string; booking_code: string | null; message: string }>(
-      `/tasks/${taskId}/booking-result`,
-      { headers: sessionToken ? { "X-Booking-Session": sessionToken } : {} }, token);
-  },
-  cancelBookingSession(token: string, sessionToken: string) {
-    return request<void>(`/booking-session/${sessionToken}`, { method: "DELETE" }, token);
+  reportBooked(token: string, taskId: string, bookingCode: string) {
+    return request<Task>(`/tasks/${taskId}/booked`, {
+      method: "POST", body: JSON.stringify({ booking_code: bookingCode }),
+    }, token);
   },
   deleteTask(token: string, taskId: string) {
     return request<void>(`/tasks/${taskId}`, { method: "DELETE" }, token);

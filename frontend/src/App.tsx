@@ -237,59 +237,22 @@ function TravelerPanel({
 const STATUS_TEXT: Record<string, string> = {
   scheduled: "尚未啟動",
   monitoring: "監控中",
-  waiting_human: "待你完成驗證",
+  waiting_human: "已提醒，待你訂票",
   completed: "已訂位",
   cancelled: "已取消",
   failed: "訂票失敗",
   timeout: "逾時未完成",
   expired: "監控已截止",
-  ended: "本輪已結束",
 };
 
 // Statuses where something is still happening get a pulsing dot beside the words.
 const LIVE_STATUSES = ["monitoring", "waiting_human"];
 
-// The four statuses browser_session.FINISHED_STATUSES can end a session with.
-const FINISHED_STATUSES = ["completed", "failed", "timeout", "cancelled", "expired", "ended"];
-
-interface BookingSession {
-  taskId: string;
-  route: string;
-  trainLabel: string | null;
-  sessionToken: string;
-  status: string;
-  bookingCode: string | null;
-  message: string;
-}
-
-// noVNC 1.0 (the jammy package the sidecar installs) ships no index.html, so the
-// client file has to be named. It also builds its WebSocket URL from the site
-// root rather than from the page, so the socket path has to be spelled out or it
-// would ask for /websockify and miss the token-prefixed nginx location.
-// resize=scale is what makes it usable on a phone: the remote screen is
-// 1280x1024 and would otherwise have to be panned around.
-function viewerUrl(sessionToken: string): string {
-  const params = new URLSearchParams({
-    autoconnect: "1",
-    reconnect: "1",
-    resize: "scale",
-    path: `booking-session/${sessionToken}/websockify`,
-  });
-  return `/booking-session/${sessionToken}/vnc.html?${params}`;
-}
-
-// Exactly one obvious button per state, so nobody has to guess.
-const PRIMARY_ACTION: Record<string, { label: string; kind: "session" | "result" | "cancel" }> = {
-  scheduled: { label: "立即開啟訂票頁", kind: "session" },
-  monitoring: { label: "立即開啟訂票頁", kind: "session" },
-  waiting_human: { label: "開啟驗證畫面", kind: "session" },
-  completed: { label: "查看訂位結果", kind: "result" },
-  failed: { label: "查看訂位結果", kind: "result" },
-  timeout: { label: "查看訂位結果", kind: "result" },
-};
+// Open tasks can still be booked, so they get the official link and 我訂到了.
+const OPEN_STATUSES = ["scheduled", "monitoring", "waiting_human"];
 
 function nextCheckText(task: Task): string {
-  if (task.status === "waiting_human") return "等待你接手，已暫停";
+  if (task.status === "waiting_human") return "已提醒，不再查詢";
   if (!task.next_check_at) return "不再查詢";
   if (["completed", "cancelled", "expired", "failed", "timeout"].includes(task.status)) {
     return "不再查詢";
@@ -503,7 +466,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [suggestions, setSuggestions] = useState<Suggestions | null>(null);
   const [suggestionKey, setSuggestionKey] = useState("");
   const [waitingSuggestions, setWaitingSuggestions] = useState<Record<string, Suggestions>>({});
-  const [booking, setBooking] = useState<BookingSession | null>(null);
   const [tab, setTab] = useState<Tab>("tasks");
 
   // Train types come from what TDX actually returned, never a hard-coded list:
@@ -573,29 +535,11 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     document.getElementById(`task-${linkedTaskId}`)?.scrollIntoView({ block: "center" });
   }, [linkedTaskId, tasks]);
 
-  // While the person solves the CAPTCHA in the frame, poll for the outcome so
-  // the booking code appears without them hunting for a button.
-  useEffect(() => {
-    if (!booking || FINISHED_STATUSES.includes(booking.status)) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const result = await api.bookingResult(token, booking.taskId, booking.sessionToken);
-        setBooking((current) => current && current.taskId === result.task_id
-          ? { ...current, status: result.status, bookingCode: result.booking_code, message: result.message }
-          : current);
-        if (FINISHED_STATUSES.includes(result.status)) await loadTasks();
-      } catch {
-        // A dropped poll is not worth interrupting the person mid-verification.
-      }
-    }, 5_000);
-    return () => window.clearInterval(timer);
-  }, [booking, token, loadTasks]);
-
   const waiting = useMemo(() => tasks.filter((task) => task.status === "waiting_human").length, [tasks]);
   const scheduled = useMemo(() => tasks.filter((task) => task.status === "scheduled").length, [tasks]);
 
-  // A page prepared in the background needs a person within its round; the
-  // tab title is the one place they will see that without the webhook.
+  // A reminded task is waiting on the person; the tab title is the one place
+  // they will see that without the webhook.
   useEffect(() => {
     document.title = waiting ? `(${waiting}) ${APP_TITLE}` : APP_TITLE;
   }, [waiting]);
@@ -659,7 +603,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           },
         },
       });
-      setNotice("任務已排入；每個間隔會自動備好訂票頁並通知你接手，直到訂到或超過截止時間。通知不代表有位。");
+      setNotice("任務已排入；每個間隔會通知你並附上官方訂票連結，直到你回報訂到、取消，或超過截止時間。通知不代表有位。");
       setForm((current) => ({ ...current, trainNumber: "", chosenTrain: null }));
       await loadTasks();
       setTab("tasks");
@@ -670,35 +614,17 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     }
   }
 
-  async function runPrimaryAction(task: Task) {
-    const action = PRIMARY_ACTION[task.status];
-    if (!action) return;
+  async function reportBooked(task: Task) {
+    const code = window.prompt("在官方頁面訂到後，輸入訂位代碼（電腦代碼）：")?.trim();
+    if (!code) return;
     setError("");
     try {
-      if (action.kind === "session") {
-        const session = await api.startBookingSession(token, task.id);
-        setNotice(session.notice);
-        setBooking({
-          taskId: task.id,
-          route: task.route,
-          trainLabel: task.train_label,
-          // session_url is "/booking-session/<token>/"; both the noVNC URL and
-          // the DELETE that releases the lock are built from the token.
-          sessionToken: session.session_url.split("/")[2] ?? "",
-          status: "waiting_verification",
-          bookingCode: null,
-          message: "",
-        });
-      } else {
-        const result = await api.bookingResult(token, task.id);
-        setNotice(result.booking_code
-          ? `訂位代碼 ${result.booking_code}`
-          : `狀態：${STATUS_TEXT[result.status] ?? result.status}${result.message ? `／${result.message}` : ""}`);
-      }
-      await loadTasks();
+      await api.reportBooked(token, task.id, code);
+      setNotice(`已記錄訂位代碼 ${code.toUpperCase()}，任務完成，不再提醒。`);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "無法完成操作");
+      setError(reason instanceof Error ? reason.message : "無法記錄訂位代碼");
     }
+    await loadTasks();
   }
 
   async function cancelTask(taskId: string) {
@@ -716,23 +642,10 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     if (!window.confirm("刪除這個任務？監控會停止，訂票設定也會一併移除。")) return;
     try {
       await api.deleteTask(token, taskId);
-      // The task is gone, so its booking screen has nothing left behind it.
-      setBooking((current) => (current && current.taskId === taskId ? null : current));
       await loadTasks();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "無法刪除任務");
     }
-  }
-
-  async function closeBooking(session: BookingSession) {
-    // Closing ends this round only: the browser lock has to go back, but the
-    // task stays in the poll loop and prepares the page again one interval
-    // later. Stopping for good is 停止並取消任務 on the task card.
-    if (!FINISHED_STATUSES.includes(session.status)) {
-      await api.cancelBookingSession(token, session.sessionToken).catch(() => undefined);
-    }
-    setBooking(null);
-    await loadTasks();
   }
 
   async function downloadConfig(taskId: string) {
@@ -754,7 +667,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           {TABS.map((item) => (
             <button key={item.id} role="tab" aria-selected={tab === item.id} className={`nav-tab${tab === item.id ? " active" : ""}`} onClick={() => { setTab(item.id); setError(""); setNotice(""); }}>
               <Icon path={item.icon} /><span>{item.label}</span>
-              {item.id === "tasks" && waiting > 0 && <b className="nav-badge" aria-label={`${waiting} 個任務待你完成驗證`}>{waiting}</b>}
+              {item.id === "tasks" && waiting > 0 && <b className="nav-badge" aria-label={`${waiting} 個任務待你訂票`}>{waiting}</b>}
             </button>
           ))}
         </nav>
@@ -765,11 +678,11 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         {notice && <p className="notice page-message" role="status">{notice}</p>}
         {tab === "tasks" && (<>
         <section className="welcome-card rise">
-          <div><span>簡單三步驟</span><h1>選車次、排時間、到點完成驗證</h1><p>常用資料只要設定一次，之後每次訂票會自動帶入。</p></div>
+          <div><span>簡單三步驟</span><h1>選車次、排時間、到點收到訂票連結</h1><p>常用資料只要設定一次，之後每次訂票會自動帶入。</p></div>
         </section>
         <section className="summary-row" aria-label="任務摘要">
           <article className="rise" style={{ "--i": 0 } as CSSProperties}><span>排程中</span><strong>{scheduled}</strong><small>等待觸發時間</small></article>
-          <article className={`rise${waiting ? " attention" : ""}`} style={{ "--i": 1 } as CSSProperties}><span>需要人工</span><strong>{waiting}</strong><small>驗證碼與最終確認</small></article>
+          <article className={`rise${waiting ? " attention" : ""}`} style={{ "--i": 1 } as CSSProperties}><span>需要人工</span><strong>{waiting}</strong><small>已提醒、待你訂票</small></article>
           <article className="rise" style={{ "--i": 2 } as CSSProperties}><span>全部任務</span><strong>{tasks.length}</strong><small>含取消與完成</small></article>
           <div className="boundary rise" style={{ "--i": 3 } as CSSProperties}><b>驗證協助</b><p>若官方要求驗證，可放大畫面、重新產生，或請可信任家人協助；最後仍由你確認送出。</p></div>
         </section>
@@ -900,12 +813,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               <label>監控截止時間<input type="datetime-local" value={form.monitorUntil} onChange={(e) => setForm({ ...form, monitorUntil: e.target.value })} /></label>
               <p className="wide privacy-note">
                 系統<strong>無法得知任何車次是否有位</strong>：台鐵餘票沒有可用的官方開放資料來源。
-                每個間隔自動備好訂票頁並通知你接手，每輪最多等你 15 分鐘。驗證與送出一律由你本人完成。沒完成就等下一輪，直到訂到、你取消，或超過監控截止時間。
+                每個間隔通知你一次並附上官方訂票連結（已帶入日期、起訖站、車次與張數）。身分證、驗證與送出由你在官方頁面完成；訂到後按「我訂到了」，否則持續提醒，直到你取消或超過監控截止時間。
               </p>
               {form.trainNumber
-                ? <p className="notice wide" role="status">將鎖定 <b>{form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`}</b>；訂票畫面打開時就是這一班。</p>
+                ? <p className="notice wide" role="status">將鎖定 <b>{form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`}</b>；訂票連結會帶入這一班。</p>
                 : <p className="wide muted">{form.searchMode === "BY_TIME"
-                    ? "還沒選車次。按上面「① 查詢車次建議」，再從清單按「② 改用此車次」。訂票畫面必須打開在你挑的那一班車上。"
+                    ? "還沒選車次。按上面「① 查詢車次建議」，再從清單按「② 改用此車次」。訂票連結會帶入你挑的那一班車。"
                     : "還沒填車次。填入車次號碼即可建立任務。"}</p>}
               <button className="primary wide" disabled={busy || !form.trainNumber}>{busy && <Spinner />}{busy ? "建立中…" : "加入任務佇列"}</button>
             </form>
@@ -946,7 +859,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <span className={`status status-${task.status}`}>{LIVE_STATUSES.includes(task.status) && <i className="pulse-dot" />}{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
                     <p className="task-train">{task.train_label ?? "未指定車次"}</p>
-                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "每輪自動備頁，等你接手"}</p>
+                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "每輪提醒並附訂票連結"}</p>
                     {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
                   </div>
                   <dl className="task-time">
@@ -956,9 +869,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <div><dt>餘票資料</dt><dd className="unknown">未提供</dd></div>
                   </dl>
                   <div className="task-actions">
-                    <button className="primary" onClick={() => runPrimaryAction(task)} disabled={!PRIMARY_ACTION[task.status]}>
-                      {PRIMARY_ACTION[task.status]?.label ?? "無可用操作"}
-                    </button>
+                    {OPEN_STATUSES.includes(task.status) && (
+                      <>
+                        <OfficialLink token={token} taskId={task.id} />
+                        <button className="primary" onClick={() => reportBooked(task)}>我訂到了</button>
+                      </>
+                    )}
                     <details className="task-details">
                       <summary>查看詳情</summary>
                       <p>查詢間隔：每 {Math.round(task.poll_interval_seconds / 60)} 分鐘</p>
@@ -966,8 +882,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                       <p className="unknown">{task.availability_note}</p>
                       {task.last_error && <p className="error">最近錯誤：{task.last_error}</p>}
                       {task.status === "waiting_human" && <button className="compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}
-                      {["scheduled", "monitoring", "waiting_human"].includes(task.status) && <OfficialLink token={token} taskId={task.id} />}
-                      {["scheduled", "monitoring", "waiting_human"].includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>停止並取消任務</button>}
+                      {OPEN_STATUSES.includes(task.status) && <button className="danger" onClick={() => cancelTask(task.id)}>停止並取消任務</button>}
                       <button className="danger" onClick={() => deleteTask(task.id)}>刪除任務</button>
                     </details>
                   </div>
@@ -984,7 +899,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           </section>
         )}
       </main>
-      {booking && <BookingScreen token={token} session={booking} onClose={() => void closeBooking(booking)} />}
     </div>
   );
 }
@@ -1011,48 +925,16 @@ function OfficialLink({ token, taskId }: { token: string; taskId: string }) {
   if (url) {
     return (
       <span className="own-device">
-        <a className="official-link" href={url} target="_blank" rel="noopener noreferrer" onClick={() => setUrl("")}>開啟台鐵官方訂票頁</a>
-        <small>連結幾分鐘內有效；在那邊訂到後，請回來停止這個任務。</small>
+        <a className="official-link" href={url} target="_blank" rel="noopener noreferrer" onClick={() => setUrl("")}>前往台鐵官方訂票頁</a>
+        <small>連結幾分鐘內有效；訂到後請按「我訂到了」。</small>
       </span>
     );
   }
   return (
     <span className="own-device">
-      <button type="button" className="official-link" onClick={generate} disabled={busy}>{busy ? "產生連結中…" : "改用我的裝置訂票"}</button>
+      <button type="button" className="official-link" onClick={generate} disabled={busy}>{busy ? "產生連結中…" : "開啟官方訂票頁"}</button>
       {error && <small className="error" role="alert">{error}</small>}
     </span>
-  );
-}
-
-function BookingScreen({ token, session, onClose }: { token: string; session: BookingSession; onClose: () => void }) {
-  const finished = FINISHED_STATUSES.includes(session.status);
-  return (
-    <div className="booking-screen" role="dialog" aria-modal="true" aria-label="訂票驗證畫面">
-      <header>
-        <div>
-          <strong>{session.trainLabel ?? session.route}</strong>
-          <small>{finished ? "已結束" : `${session.route}｜請在下方畫面完成官方驗證，然後自行按下訂票`}</small>
-        </div>
-        <button onClick={onClose}>{finished ? "關閉" : "關閉畫面（繼續巡迴）"}</button>
-      </header>
-      {finished ? (
-        <div className={`booking-outcome ${session.status}`}>
-          <b>{STATUS_TEXT[session.status] ?? session.status}</b>
-          {session.bookingCode && <p className="booking-code">訂位代碼 {session.bookingCode}</p>}
-          {session.message && <p>{session.message}</p>}
-          {session.bookingCode && <p className="boundary-note">請至台鐵官網或超商於期限內完成付款取票。</p>}
-        </div>
-      ) : (
-        <>
-          {session.message && (
-            <p className="verification-prompt" role="status"><i className="pulse-dot" />{session.message}</p>
-          )}
-          <OfficialLink token={token} taskId={session.taskId} />
-          <iframe title="台鐵訂票畫面" src={viewerUrl(session.sessionToken)} allow="clipboard-write" />
-        </>
-      )}
-      <footer>驗證碼與送出都由你本人完成；系統只負責把已填好的畫面送到你面前，並在拿到訂位代碼後記錄結果。</footer>
-    </div>
   );
 }
 

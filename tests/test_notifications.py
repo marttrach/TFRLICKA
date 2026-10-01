@@ -154,7 +154,8 @@ def test_scheduler_posts_to_real_local_http_server(tmp_path) -> None:
 
         assert TaskScheduler(database, notifier=notifier).tick() == 1
         assert ready.wait(timeout=1)
-        assert database.get_task(task.id, user.id).status == "waiting_human"
+        # Reminders repeat each interval, so the task stays in the poll loop.
+        assert database.get_task(task.id, user.id).status == "monitoring"
         decoded = json.loads(received["body"])
         assert decoded["task_id"] == task.id
         assert decoded["action_url"] == f"http://nas.local:43124/tasks/{task.id}"
@@ -188,7 +189,7 @@ def test_notification_failure_does_not_roll_back_promotion(tmp_path) -> None:
 
     notifier = WebhookNotifier("https://hooks.invalid", "secret", sender=fail)
     assert TaskScheduler(database, notifier=notifier).tick() == 1
-    assert database.get_task(task.id, user.id).status == "waiting_human"
+    assert database.get_task(task.id, user.id).status == "monitoring"
 
 
 def test_token_is_never_part_of_the_payload() -> None:
@@ -295,20 +296,3 @@ def test_both_event_payloads_carry_the_agreed_fields() -> None:
     }
     assert result["status"] == "failed"
     assert result["booking_code"] is None
-
-
-def test_documented_result_statuses_match_the_code() -> None:
-    """The n8n routing is built on this list, so pin it against the source."""
-    from tra_sniper.browser_session import FINISHED_STATUSES
-
-    assert FINISHED_STATUSES == {"completed", "failed", "timeout", "cancelled"}
-
-    sent: dict[str, Any] = {}
-
-    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
-        sent.update(body=body)
-
-    notifier = WebhookNotifier("https://hooks.example.test/tra", "token", sender=sender)
-    for status in sorted(FINISHED_STATUSES):
-        notifier.notify_result(task_record(), status, "1234567890" if status == "completed" else None)
-        assert json.loads(sent["body"])["status"] == status

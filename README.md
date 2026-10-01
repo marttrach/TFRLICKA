@@ -2,10 +2,10 @@
 
 # 🚆 好搭車
 
-### 清楚易用的台鐵訂票任務與瀏覽器輔助工具
+### 清楚易用的台鐵訂票任務與 AI 助理工具
 
-從建立行程、排程提醒到開啟官方訂票頁面，\
-用一個清楚、簡潔的儀表板管理你的訂票任務。
+從查班次、排程提醒到送出官方訂票連結，\
+用儀表板或你的 AI 助理（Hermes 等 MCP client）管理訂票任務。
 
 [![License](https://img.shields.io/github/license/marttrach/TFRLICKA?style=flat-square)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/marttrach/TFRLICKA/test.yml?branch=main&style=flat-square&label=tests)](https://github.com/marttrach/TFRLICKA/actions)
@@ -20,13 +20,13 @@
 - **常用資料** — 加密保存乘車人資料；訂票直接填表，不先登入台鐵會員
 - **無障礙介面** — 大字、高對比、全中文提示與清楚的操作步驟
 - **React 儀表板** — 建立、查看及取消訂票任務
-- **預約排程** — 到達指定時間後提醒使用者接手訂票
-- **Webhook 通知** — 任務就緒時可通知 n8n 等服務並直接開啟該任務
+- **預約排程** — 到達指定時間後，每個間隔提醒一次並附官方訂票連結
+- **Webhook 通知** — 提醒可送到 n8n、Hermes 等服務，轉發到 Telegram 讓人直接點開
+- **AI 助理 (MCP)** — 查車站、查班次、開監控、拿訂票連結、回報訂到，都能交給 agent
 - **多種行程** — 支援單程、來回、依車次或時段查詢
 - **時刻建議** — 透過 TDX 排序對號、非對號、鄰近時段與單次轉乘選項
 - **離線候選** — 建立任務時加密保存候選，等待人工處理時不必重新查詢
-- **瀏覽器輔助** — 自動開啟台鐵官方頁面並填入訂票條件
-- **可替換驗證介面** — 預留 `manual`、本機 `mock` 與未來核准 `official_api` 供應器
+- **官方導訂連結** — 透過 [TDX MCP 服務](https://github.com/tdxmotc/MCP) 開啟已填好日期、起訖站、車次與張數的台鐵訂票頁
 - **資料保護** — 登入節流、可撤銷 Token 與敏感資料加密儲存
 - **Docker 部署** — 一個指令啟動 API、排程器與前端介面
 
@@ -46,13 +46,12 @@ cp .env.example .env
 若要使用完整車站與時刻建議，再填入 TDX 的 `TDX_CLIENT_ID`、
 `TDX_CLIENT_SECRET`；未設定時 API 仍可使用熱門站與依車次模式。
 
-同一組金鑰若在 TDX 會員中心開通了「臺鐵訂票導訂」，任務上會多一顆
-「改用我的裝置訂票」：它向 [TDX MCP 服務](https://github.com/tdxmotc/MCP)
-取得有時效的官方訂票連結，在你自己的瀏覽器開啟已帶入日期、起訖站、車次與張數的
-台鐵訂票頁。身分證字號不會送給 TDX，仍由你在官方頁面輸入並送出；在那邊訂到後，
-請回來停止任務。
+同一組金鑰必須在 TDX 會員中心開通「臺鐵訂票導訂」，才能產生官方訂票連結：
+它向 [TDX MCP 服務](https://github.com/tdxmotc/MCP) 取得有時效的連結，在你自己的
+瀏覽器開啟已帶入日期、起訖站、車次與張數的台鐵訂票頁。身分證字號不會送給 TDX，
+由你在官方頁面輸入、通過驗證並送出；訂到後按「我訂到了」記錄電腦代碼，提醒就會停止。
 
-映像檔（API、前端、瀏覽器 sidecar）由 GitHub Actions 建置，推送到 Docker Hub 並保留
+映像檔（API、前端）由 GitHub Actions 建置，推送到 Docker Hub 並保留
 GHCR 副本。在 `.env` 或 Portainer 設定 `DOCKERHUB_USER` 為你的 Docker Hub 帳號：
 
 ```bash
@@ -61,7 +60,7 @@ docker compose up -d
 ```
 
 CI 需要 repository secrets `DOCKERHUB_USERNAME` 與 `DOCKERHUB_TOKEN`（Read & Write）
-才會推送 Docker Hub；未設定時只推送 GHCR。另設 `PORTAINER_WEBHOOK_URL` 時，三個映像檔
+才會推送 Docker Hub；未設定時只推送 GHCR。另設 `PORTAINER_WEBHOOK_URL` 時，兩個映像檔
 全部推送完成後才觸發 Portainer 重新部署，避免拉到舊的 `:latest`。
 
 服務啟動後：
@@ -70,23 +69,50 @@ CI 需要 repository secrets `DOCKERHUB_USERNAME` 與 `DOCKERHUB_TOKEN`（Read &
 | --- | --- |
 | 儀表板 | <http://localhost:43124> |
 | API 文件 | <http://localhost:48100/docs> |
+| AI 助理 MCP | <http://localhost:48100/mcp> |
 
 ## 🎯 使用流程
 
-1. 建立會員並登入儀表板
-2. 新增一位或多位「常用乘車人」（每位一組名稱與身分證，加密保存）
-3. 先選縣市、再選車站，設定乘車日期與車次／時段條件
-4. 選擇執行模式與查詢間隔，開始監控
-5. 任務就緒後開啟訂票畫面，完成官方驗證並自行送出訂票
+1. 建立會員並登入儀表板（或讓 AI 助理代你操作，見下方「AI 助理」）
+2. 先選縣市、再選車站，設定乘車日期與車次／時段條件
+3. 選擇執行模式與提醒間隔，開始監控
+4. 到點後每個間隔收到一次提醒（儀表板、webhook 或 AI 助理），附官方訂票連結
+5. 點開連結，在台鐵官方頁面輸入身分證、通過驗證並自行按下訂票
+6. 訂到後按「我訂到了」輸入電腦代碼，任務完成、提醒停止
 
-訂票流程不使用台鐵會員帳密，舊任務包含的 `member_login` 也會忽略。
-已保存的會員資料保留在摺疊設定區，可自行清除；後續付款等操作請至台鐵官網辦理。
-這能省去會員登入那一關，但官方訂票頁仍可能要求驗證，無法保證只出現一次。
+驗證（reCAPTCHA／圖形驗證碼）在你自己的瀏覽器裡完成，系統不辨識、不代填、不送出。
+「常用乘車人」仍可保存，但官方連結不會帶入身分證；需要時可用瀏覽器的自動填入。
 
-驗證畫面上方會即時回報官方正在要求什麼：出現圖形驗證碼時顯示「官方要求輸入圖形驗證碼」，
-輸入錯誤時顯示「驗證碼錯誤」並**保留本輪畫面**讓你直接重打，不會因一次打錯就清空頁面、
-等下一輪。驗證碼一律由你本人輸入，系統只回報狀態，不辨識、不代填。每次出現提示都會以
-`booking_session.verification_prompt` 事件寫入日誌，可用來確認圖形驗證碼是否每輪都出現。
+## 🤖 AI 助理（Hermes 等 MCP client）
+
+API 內建 MCP 端點 `/mcp`（Streamable HTTP），讓 agent 走完整個流程，只把最後
+「輸入身分證與驗證碼、按訂票」留給你：
+
+| 工具 | 用途 |
+|---|---|
+| `find_stations` | 站名轉站碼，例如「板橋」→ `1020-板橋` |
+| `search_trains` | 查某日兩站間的班次（TDX 時刻表，不含餘位） |
+| `create_booking_task` | 開始監控 1～3 個車次，每個間隔發提醒 |
+| `list_tasks` | 列出任務、狀態與 `booking_url` |
+| `get_booking_link` | 立即取一條新的官方訂票連結，傳給你點開 |
+| `report_booked` | 記錄你訂到的電腦代碼，結束提醒 |
+| `cancel_task` | 停止任務 |
+
+在 Portainer 設定：
+
+```dotenv
+TRA_AGENT_TOKEN=至少-32-字元的隨機字串
+TRA_AGENT_EMAIL=你在儀表板註冊的-email
+```
+
+agent 以 `TRA_AGENT_EMAIL` 這個帳號的身分操作，`TRA_AGENT_TOKEN` 未設定時 `/mcp`
+一律回 401。在 Hermes 的 MCP 設定加入這個 HTTP server：
+
+- 網址：`http://你的NAS:48100/mcp`（或經前端的 `http://你的NAS:43124/api/mcp`）
+- 標頭：`Authorization: Bearer <TRA_AGENT_TOKEN>`
+
+同樣的設定也適用 Claude Code：
+`claude mcp add --transport http tra-sniper http://你的NAS:48100/mcp --header "Authorization: Bearer <TRA_AGENT_TOKEN>"`
 
 ## 📱 手機操作
 
@@ -105,74 +131,32 @@ CI 需要 repository secrets `DOCKERHUB_USERNAME` 與 `DOCKERHUB_TOKEN`（Read &
 
 | 欄位 | 意義 | 預設 |
 |---|---|---|
-| `scheduled_at`／`monitor_start_at` | 何時**開始**監控 | 立即 |
-| `poll_interval_seconds` | 沒訂成時，多久再備一次訂票頁 | 300 秒（5 分鐘） |
-| `monitor_until` | 監控**截止**時間 | 未設定＝直到訂到或取消 |
+| `scheduled_at`／`monitor_start_at` | 何時**開始**提醒 | 立即 |
+| `poll_interval_seconds` | 沒回報訂到時，多久再提醒一次 | 300 秒（5 分鐘） |
+| `monitor_until` | 提醒**截止**時間 | 未設定＝直到回報訂到或取消 |
 
-執行模式：`monitor_only`（到點提醒一次）或 `book_when_available`（每個間隔自動開頁填表）。
+執行模式：`monitor_only`（到點提醒一次）或 `book_when_available`（每個間隔提醒一次）。
 
-> **通知代表需要你接手，不代表有位。** 任務回應中的 `availability` 恆為 `unknown`。
-> 每一輪把訂票頁備好後發一次 `task.waiting_human`，同一輪內不重複通知。
-> 開啟通知中的任務連結並登入，再按「開啟驗證畫面」即可接回原頁面。
-> **驗證與送出一律由本人完成**：官方在 reCAPTCHA v3 驗證未通過時可能要求圖形驗證碼，
-> 系統不辨識、不代解、不自動送出，因此「有沒有位」只有你按下訂票後才會知道。
+> **提醒代表「現在可以去訂」，不代表有位。** 台鐵沒有可用的餘位開放資料，
+> 任務回應中的 `availability` 恆為 `unknown`；有沒有位只有你按下訂票後才知道。
 
-防重複與退避規則：
-
-- 同一任務不會同時執行兩次查詢（資料庫層 compare-and-swap，重啟後依然有效）
-- 訂票 session 進行中會離開可輪詢狀態，**不會每 5 分鐘再開一個瀏覽器**
-- 瀏覽器忙碌時等下一個設定間隔
-- 訂位成功、使用者取消、監控截止後立即停止
-- 頁面保留最長 15 分鐘，且不超過 `monitor_until`；逾時後關閉頁面
-- 交接後沒完成（`failed`／`timeout`）**會排入下一輪**，間隔為 `poll_interval_seconds`；
-  未設 `monitor_until` 就一直重試到訂到或你取消
-- **頁面準備階段就失敗則停止**並記錄錯誤：填不了表代表官方版面變了，重試只會空轉
-- 使用者取消（`cancelled`）不重試：那是本人喊停。只有任務卡上的「停止並取消任務」算喊停；
-  訂票畫面的「關閉畫面（繼續巡迴）」只結束這一輪，任務仍會在下個間隔重新備頁
-- 逾時重試有極小的重複訂位風險：若你已按下訂票但官方結果未被辨識，下一輪會再備一次頁；
-  接手前請先確認官方訂位紀錄
-- 取消或逾時會撤銷正在連線的 VNC；原瀏覽器 context 與舊連線都關閉後才開放下一個任務
-- 停止超過 60 秒仍未清理時，會嘗試重啟專用瀏覽器 sidecar；無法確認恢復則保留鎖，不讓兩個任務共用桌面。
-  每次嘗試至少間隔 60 秒，否則排程每 5 秒就被一次重啟卡住，其他任務全部排不進來
-- 訂票只用 sidecar 既有的那一個視窗（不另開 context），每輪前後清 cookie：
-  Xvfb 上有 matchbox 這個極小的 WM 負責給焦點，第二個視窗會變成「看得到、打不進去」
-- 每輪結果與重試排程分開顯示；本輪結束後關閉舊畫面，下一輪從任務重新開啟
+- 同一任務不會同時被兩個排程處理（資料庫層 compare-and-swap，重啟後依然有效）
+- 回報訂到、取消或超過監控截止後立即停止
+- 提醒送不出去只記錄日誌，下一個間隔會再提醒
 - 修改日期、站點或查詢時段後，從時刻建議選取的車次會解除鎖定，必須重新選擇
-- 通知失敗只記錄日誌，不重開頁面或重複通知；結束時另發一次訂票結果事件
 
-## 🧰 CLI 模式
-
-安裝 Python 3.11 以上版本後：
+## 🧰 CLI
 
 ```bash
-python -m pip install -e ".[browser]"
-python -m playwright install chromium
-cp config.example.json booking.json
-tra-sniper book booking.json
+python -m pip install -e .
+tra-sniper serve              # 啟動 API 與排程器
+tra-sniper validate booking.json
+tra-sniper ocr screenshot.png
 ```
 
-加入 `--submit` 可讓瀏覽器保持開啟，方便完成驗證與最後確認：
+### 開發測試
 
-```bash
-tra-sniper book booking.json --submit --wait-seconds 600
-```
-
-若台鐵要求 CAPTCHA 或 reCAPTCHA，程式會停下來等待使用者完成官方驗證，
-不會自動辨識、送出或繞過驗證。可使用瀏覽器縮放、官方重新產生／語音播放，
-或請可信任家人協助。
-
-`TRA_VERIFICATION_PROVIDER` 正式環境維持 `manual`。`mock` 有強制 localhost
-限制，只用來測試未來驗證交接流程；`official_api` 已保留穩定介面，但在取得
-台鐵核准的端點、認證與回應格式以前會明確回報尚未設定。
-
-### 開發回歸測試
-
-一般測試執行 `pytest`。瀏覽器回歸測試使用已安裝的 `[browser]` extra 與 Chromium：
-先在 `frontend` 執行 `pnpm dev`，再於專案根目錄執行
-`TRA_TEST_FRONTEND_URL=http://127.0.0.1:5173 pytest tests/test_dashboard_browser.py`。
-測試只使用本機假資料，不會向台鐵送出訂票。
-
-VNC 修正需要同步更新 **API 與 frontend** 容器；瀏覽器容器仍沿用既有映像與重啟政策。
+執行 `pytest`。測試只使用本機假資料，不會向台鐵或 TDX 送出請求。
 
 ## 🔔 任務就緒通知
 
@@ -202,15 +186,14 @@ Header Auth credential。
 
 | 事件 | 觸發時機 |
 |---|---|
-| `task.waiting_human` | 頁面可供人工接手時一次；純提醒模式則為排程到期時一次 |
-| `task.booking_result` | 訂票 session 結束 |
+| `task.waiting_human` | 每次提醒（每個間隔一次；純提醒模式只有一次） |
+| `task.booking_result` | 回報訂到時 |
 
-`task.booking_result` 的 `status` 可能是 `completed`、`failed`、`timeout`、
-`cancelled` 四者之一。
+`task.booking_result` 的 `status` 為 `completed`，並附上 `booking_code`。
 
 通知只包含任務編號、日期、路線、狀態、訂位代碼、最多三筆時刻候選與任務連結，
-**不會傳送身分證、台鐵會員帳密，也不會傳送 token 本身或訂票 session 連結**。
-通知失敗只會寫入日誌，不會改變任務狀態，也不會重跑訂票。
+**不會傳送身分證、台鐵會員帳密，也不會傳送 token 本身**。
+通知失敗只會寫入日誌，不會改變任務狀態。
 
 設定了 TDX 金鑰時，`task.waiting_human` 會多一個 `booking_url`，可直接轉發到
 Telegram 等通訊軟體讓人點開：它不需登入，點下去才向 TDX 取一條新的官方訂票連結並

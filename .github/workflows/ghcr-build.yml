@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     # A hung build otherwise runs until GitHub's 6 hour ceiling. These images
-    # take about a minute each; the browser one a few minutes at most.
+    # take about a minute each.
     timeout-minutes: 40
 
     # Step `if:` can't read `secrets`, so expose it through env.
@@ -41,18 +41,6 @@ jobs:
             context: ./frontend
             dockerfile: ./frontend/Dockerfile
             gha_cache: true
-          # Headed Chromium + noVNC sidecar. Built from the repo root because
-          # it copies docker/start-browser.sh.
-          #
-          # gha_cache is off here on purpose. mode=max exports every layer,
-          # including the multi-GB Playwright base, into the Actions cache,
-          # which is slow, rate limited, and capped at 10 GB per repo. The only
-          # layers we own are one apt install and one COPY, so caching buys
-          # almost nothing while risking a build that never finishes.
-          - name: tra-sniper-browser
-            context: .
-            dockerfile: ./Dockerfile.browser
-            gha_cache: false
 
     steps:
       - name: Checkout repository

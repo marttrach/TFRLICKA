@@ -118,7 +118,7 @@ class BookingRequest:
     def from_dict(cls, data: dict[str, Any]) -> BookingRequest:
         inbound_data = data.get("inbound")
         request = cls(
-            identity=str(data["identity"]).strip(),
+            identity=str(data.get("identity", "")).strip(),
             identity_type=IdentityType(data.get("identity_type", IdentityType.PERSON_ID)),
             start_station=str(data["start_station"]).strip(),
             end_station=str(data["end_station"]).strip(),
@@ -141,8 +141,7 @@ class BookingRequest:
         return request
 
     def validate(self) -> None:
-        if not self.identity:
-            raise ValueError("identity is required")
+        # identity is optional: the person types it on the official page.
         if not self.start_station or not self.end_station:
             raise ValueError("start_station and end_station are required")
         if self.start_station == self.end_station:

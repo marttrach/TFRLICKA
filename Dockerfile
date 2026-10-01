@@ -15,10 +15,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-# The browser extra installs the playwright Python package so the API can drive
-# the sidecar over CDP. `playwright install` is deliberately NOT run here: the
-# browser binaries live in the sidecar image, which keeps this image small.
-RUN pip install --no-cache-dir ".[browser]"
+RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 

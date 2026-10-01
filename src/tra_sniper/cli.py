@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
-from .automation import TRCBookingAutomator
 from .models import BookingRequest
 from .ocr import SUPPORTED_LANGUAGES, OcrService
 
@@ -21,7 +19,7 @@ def load_request(path: str | Path) -> BookingRequest:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tra-sniper",
-        description="Prepare the official TRC individual booking form.",
+        description="Taiwan Railway booking reminders with a person in the loop.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -39,17 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="OCR language preset (default: zh-TW)",
     )
 
-    book = subparsers.add_parser("book", help="Open and prepare the official booking page")
-    book.add_argument("config")
-    book.add_argument(
-        "--submit",
-        action="store_true",
-        help="Keep the browser open for manual CAPTCHA and user-confirmed submission",
-    )
-    book.add_argument("--headless", action="store_true", help="Only valid without --submit")
-    book.add_argument("--slow-mo", type=int, default=0, metavar="MS")
-    book.add_argument("--wait-seconds", type=int, default=600)
-    book.add_argument("--screenshot")
     return parser
 
 
@@ -66,20 +53,9 @@ def main(argv: list[str] | None = None) -> int:
             print(result.text)
             return 0
         request = load_request(args.config)
-        if args.command == "validate":
-            print(json.dumps(request.redacted(), ensure_ascii=False, indent=2, default=str))
-            print("Configuration is valid; identity was redacted.")
-            return 0
-
-        automator = TRCBookingAutomator(headless=args.headless, slow_mo_ms=args.slow_mo)
-        result = automator.run(
-            request,
-            submit=args.submit,
-            wait_seconds=args.wait_seconds,
-            screenshot=args.screenshot,
-        )
-        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
-        return 0 if result.status in {"prepared", "completed"} else 2
+        print(json.dumps(request.redacted(), ensure_ascii=False, indent=2, default=str))
+        print("Configuration is valid; identity was redacted.")
+        return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

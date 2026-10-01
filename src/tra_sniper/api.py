@@ -2,40 +2,36 @@ import hmac
 import logging
 import os
 import re
-import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
-from urllib.parse import urlsplit
 
 from fastapi import (
     Depends,
     FastAPI,
     File,
     Form,
-    Header,
     HTTPException,
     Response,
     UploadFile,
-    WebSocket,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
+from starlette.routing import Route
 
+from .agent import INSTRUCTIONS as AGENT_INSTRUCTIONS
+from .agent import BearerGuard
 from .auth import TokenManager, hash_password, verify_password
-from .browser_session import (
-    BookingSessionManager,
-    SessionBusyError,
-    run_booking_session,
-)
 from .logging_config import configure_logging
-from .models import BOOKING_TIME_LABELS, BookingRequest
+from .models import BOOKING_TIME_LABELS, TAIWAN_TZ, BookingRequest
 from .ocr import MAX_IMAGE_BYTES, OcrService
 from .scheduler import TaskScheduler
 from .storage import (
@@ -50,8 +46,6 @@ from .storage import (
 from .suggestions import SuggestionService
 from .tdx import TdxClient, TdxError
 from .tra_ocr import TraOcrService
-from .verification import VerificationProvider, create_verification_provider
-from .vnc_proxy import relay_vnc
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 DEFAULT_DEV_ORIGINS = (
@@ -61,10 +55,7 @@ DEFAULT_DEV_ORIGINS = (
     "http://127.0.0.1:3000",
 )
 LOGIN_RETRY_AFTER_SECONDS = 15 * 60
-BOOKING_SESSION_NOTICE = (
-    "正在準備或等待你接手。請在畫面上完成台鐵官方驗證並自行按下訂票；"
-    "系統不會辨識驗證碼，也不會替你按送出。"
-)
+OPEN_STATUSES = frozenset({"scheduled", "monitoring", "waiting_human"})
 logger = logging.getLogger(__name__)
 DUMMY_PASSWORD_HASH = hash_password("not-a-real-user-password")
 
@@ -107,8 +98,7 @@ class TaskCreate(BaseModel):
     # Preferred over sending the identity in `booking`: the number is looked up
     # server-side so it never has to round-trip through the browser.
     traveler_id: int | None = None
-    # How the chosen train reads on the task card and the VNC header, so the
-    # person always sees which train the session is for.
+    # How the chosen train reads on the task card and in reminders.
     train_label: str = Field(default="", max_length=120)
     mode: str = MODE_BOOK_WHEN_AVAILABLE
     poll_interval_seconds: int = Field(
@@ -191,18 +181,8 @@ class TraOcrResponse(OcrResponse):
     warnings: list[str]
 
 
-class BookingSessionResponse(BaseModel):
-    task_id: str
-    session_url: str
-    expires_at: str
-    notice: str
-
-
-class BookingResultResponse(BaseModel):
-    task_id: str
-    status: str
-    booking_code: str | None = None
-    message: str = ""
+class BookedReport(BaseModel):
+    booking_code: str = Field(min_length=4, max_length=32, pattern=r"^[A-Za-z0-9-]+$")
 
 
 class SuggestionPreferences(BaseModel):
@@ -256,33 +236,37 @@ def create_app(
     token_manager: TokenManager | None = None,
     ocr_service: OcrService | None = None,
     tdx_client: TdxClient | None = None,
-    verification_provider: VerificationProvider | None = None,
     *,
     start_scheduler: bool = True,
-    automator_factory: Any | None = None,
 ) -> FastAPI:
     db = database or Database()
     tokens = token_manager or TokenManager()
-    sessions = BookingSessionManager()
-    scheduler = TaskScheduler(db, session_manager=sessions)
+    scheduler = TaskScheduler(db)
     ocr = ocr_service or OcrService()
     tra_ocr = TraOcrService(ocr)
     tdx = tdx_client or TdxClient()
     suggestion_service = SuggestionService(tdx)
-    verification = verification_provider or create_verification_provider()
     bearer = HTTPBearer(auto_error=False)
+    # Stateless: every agent call stands alone, so a restart drops nothing.
+    agent = FastMCP(
+        "tra-sniper",
+        instructions=AGENT_INSTRUCTIONS,
+        stateless_http=True,
+        json_response=True,
+        # The bearer token is the gate. Host checks would only reject the
+        # container name or NAS address the agent dials.
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if start_scheduler:
             scheduler.start()
         try:
-            yield
+            async with agent.session_manager.run():
+                yield
         finally:
             scheduler.stop()
-            active = sessions.active
-            if active is not None:
-                active.request_stop()
 
     app = FastAPI(
         title="TRA-Sniper API",
@@ -327,15 +311,7 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {
-            "status": "ok",
-            "scheduler": "human-in-the-loop",
-            "verification": verification.capabilities.mode.value,
-        }
-
-    @app.get("/verification/capabilities")
-    def verification_capabilities() -> dict[str, str | bool]:
-        return verification.capabilities.as_dict()
+        return {"status": "ok", "scheduler": "human-in-the-loop"}
 
     @app.get("/stations")
     def stations() -> list[dict[str, str]]:
@@ -475,8 +451,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="常用資料不存在")
         return Response(status_code=204)
 
-    @app.post("/tasks", response_model=TaskResponse, status_code=201)
-    def create_task(body: TaskCreate, user: CurrentUser) -> TaskResponse:
+    def _create_task(body: TaskCreate, user: UserRecord) -> TaskRecord:
         booking_payload = dict(body.booking)
         booking_payload.pop("member_login", None)
         if body.traveler_id is not None:
@@ -523,15 +498,17 @@ def create_app(
             monitor_until=monitor_until.astimezone(UTC).isoformat() if monitor_until else None,
             train_label=body.train_label.strip() or None,
         )
-        return _task_response(task)
+        return task
+
+    @app.post("/tasks", response_model=TaskResponse, status_code=201)
+    def create_task(body: TaskCreate, user: CurrentUser) -> TaskResponse:
+        return _task_response(_create_task(body, user))
 
     @app.get("/tasks", response_model=list[TaskResponse])
     def list_tasks(user: CurrentUser) -> list[TaskResponse]:
         return [_task_response(task) for task in db.list_tasks(user.id)]
 
-    @app.post("/suggestions")
-    def suggestions(body: SuggestionRequest, user: CurrentUser) -> dict[str, Any]:
-        del user
+    def _suggest(body: SuggestionRequest) -> dict[str, Any]:
         if body.start_time not in BOOKING_TIME_LABELS or body.end_time not in BOOKING_TIME_LABELS:
             raise HTTPException(status_code=422, detail="請選擇有效的開始與結束時段")
         if body.start_time >= body.end_time:
@@ -557,6 +534,11 @@ def create_app(
                 status_code=503,
                 detail="TDX 時刻表暫時不可用，請稍後重試，或改用「直接輸入車次」",
             ) from exc
+
+    @app.post("/suggestions")
+    def suggestions(body: SuggestionRequest, user: CurrentUser) -> dict[str, Any]:
+        del user
+        return _suggest(body)
 
     @app.post("/ocr", response_model=OcrResponse)
     async def recognize_image(
@@ -729,265 +711,50 @@ def create_app(
         if not hmac.compare_digest(sig, _open_link_signature(task_id, u)):
             raise HTTPException(status_code=403, detail="連結無效")
         task = db.get_task(task_id, u)
-        if not task or task.status not in {"scheduled", "monitoring", "waiting_human"}:
+        if not task or task.status not in OPEN_STATUSES:
             raise HTTPException(status_code=410, detail="這個任務已結束，連結不再有效")
         url, _ = _official_link(task_id, u)
         return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
 
-    def _build_automator(booking_request: BookingRequest) -> Any:
-        del booking_request
-        if automator_factory is not None:
-            return automator_factory()
-        from .automation import TRCBookingAutomator
+    scheduler.notifier.booking_url_for = _open_link_url
 
-        return TRCBookingAutomator(headless=False, verification_provider=verification)
-
-    def _start_booking(task_id: str, user_id: int) -> BookingSessionResponse:
+    def _cancel_task(task_id: str, user_id: int) -> None:
         task = db.get_task(task_id, user_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        active = sessions.active
-        if (
-            active is not None and active.task_id == task_id and active.user_id == user_id
-            and sessions.resolve(active.token) is not None
-        ):
-            return BookingSessionResponse(
-                task_id=task_id,
-                session_url=f"/booking-session/{active.token}/",
-                expires_at=active.expires_at.isoformat(),
-                notice=BOOKING_SESSION_NOTICE,
-            )
-        if task.status not in {"scheduled", "monitoring", "waiting_human"}:
-            raise HTTPException(status_code=409, detail="Task is not open for booking")
-        try:
-            payload = db.get_task_payload(task_id, user_id)
-            payload.pop("member_login", None)  # Older tasks may still contain saved credentials.
-            booking = BookingRequest.from_dict(payload)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Task not found") from exc
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if task.status not in OPEN_STATUSES:
+            raise HTTPException(status_code=409, detail="Task cannot be cancelled")
+        if not db.update_task_status(task_id, user_id, "cancelled"):
+            raise HTTPException(status_code=409, detail="Task has already finished")
 
-        automator = _build_automator(booking)
-        session = sessions.acquire(task_id, user_id)
-        try:
-            if task.monitor_until:
-                session.expires_at = min(session.expires_at, datetime.fromisoformat(task.monitor_until))
-            if not db.pause_monitoring(task_id, user_id, "waiting_human"):
-                raise HTTPException(status_code=409, detail="Task was cancelled or its window ended")
-        except Exception:
-            sessions.release(session.token)
-            raise
-
-        def on_ready(ready: Any) -> None:
-            record = db.get_task(ready.task_id, ready.user_id)
-            if record and record.status == "waiting_human" and scheduler.notifier.enabled:
-                scheduler.notifier.notify(record, payload)
-
-        finish_lock = threading.RLock()
-        finish_done = False
-
-        def on_finish(finished: Any) -> None:
-            nonlocal finish_done
-            with finish_lock:
-                if finish_done:
-                    record = db.get_task(finished.task_id, finished.user_id)
-                    # Recovery may unblock cleanup after a code was already
-                    # read. Keep that late real result, but never retry twice.
-                    if not finished.booking_code or not record or record.booking_code:
-                        return
-                finish_done = True
-                finish_once(finished)
-
-        def finish_once(finished: Any) -> None:
-            try:
-                updated = db.update_task_status(
-                    finished.task_id,
-                    finished.user_id,
-                    finished.status,
-                    last_error=finished.message if finished.status != "completed" else None,
-                    booking_code=finished.booking_code,
-                )
-                if not updated:
-                    record = db.get_task(finished.task_id, finished.user_id)
-                    if record:
-                        finished.status = record.status
-                        finished.booking_code = record.booking_code
-            finally:
-                sessions.release(finished.token)
-            # A round that produced no booking code means this attempt did not
-            # get there, so the task goes back in the poll loop and prepares
-            # again one interval later. Cancellation is the person saying stop,
-            # and a booking code means there is nothing left to retry.
-            if (
-                finished.handed_off
-                and finished.status in {"failed", "timeout"}
-                and not finished.booking_code
-            ):
-                db.resume_monitoring(
-                    finished.task_id,
-                    finished.user_id,
-                    delay_seconds=task.poll_interval_seconds,
-                )
-            record = db.get_task(finished.task_id, finished.user_id)
-            active = sessions.active
-            if (finished.booking_code and active is not None
-                    and active.task_id == finished.task_id and active.token != finished.token):
-                active.request_stop()
-            if record and scheduler.notifier.enabled:
-                try:
-                    scheduler.notifier.notify_result(
-                        record, finished.status, finished.booking_code
-                    )
-                except Exception:
-                    logger.exception(
-                        "booking result webhook failed",
-                        extra={
-                            "event": "notification.webhook_failed",
-                            "task_id": finished.task_id,
-                        },
-                    )
-
-        def recover() -> None:
-            # A stopped Python thread cannot be killed safely. Reset its actual
-            # browser first; a late worker callback must not finish a new round.
-            with finish_lock:
-                if finish_done:
-                    return
-                automator.reset_browser()
-                if not session.booking_code:
-                    session.status = "cancelled" if session.cancelled_by_user else "timeout"
-                    session.message = "瀏覽器未正常退出，已重新啟動並結束本輪。"
-                on_finish(session)
-
-        session.recover = recover
-
-        try:
-            threading.Thread(
-                target=run_booking_session,
-                args=(session,),
-                kwargs={
-                    "automator": automator,
-                    "request": booking,
-                    "on_finish": on_finish,
-                    "on_ready": on_ready,
-                },
-                name=f"booking-session-{task_id}",
-                daemon=True,
-            ).start()
-        except Exception:
-            session.status = "failed"
-            session.message = "無法啟動訂票工作"
-            on_finish(session)
-            raise
-
-        logger.info(
-            "booking session started",
-            extra={"event": "booking_session.started", "task_id": task_id},
-        )
-        return BookingSessionResponse(
-            task_id=task_id,
-            session_url=f"/booking-session/{session.token}/",
-            expires_at=session.expires_at.isoformat(),
-            notice=BOOKING_SESSION_NOTICE,
-        )
-
-    def prepare_scheduled_booking(task: TaskRecord) -> None:
-        _start_booking(task.id, task.user_id)
-
-    scheduler.prepare_booking = prepare_scheduled_booking
-    scheduler.notifier.booking_url_for = _open_link_url
-
-    @app.post(
-        "/tasks/{task_id}/booking-session",
-        response_model=BookingSessionResponse,
-        status_code=201,
-    )
-    def start_booking_session(task_id: str, user: CurrentUser) -> BookingSessionResponse:
-        try:
-            return _start_booking(task_id, user.id)
-        except SessionBusyError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"另一個訂票 session 進行中（任務 {exc.active_task_id}），"
-                    f"約 {exc.remaining_seconds} 秒後釋放。一次只能解一個驗證。"
-                ),
-                headers={"Retry-After": str(max(1, exc.remaining_seconds))},
-            ) from exc
-
-    @app.get("/booking-session/{session_token}/verify", status_code=204)
-    def verify_booking_session(session_token: str) -> Response:
-        """nginx auth_request target guarding the noVNC stream."""
-        if sessions.resolve(session_token) is None:
-            raise HTTPException(status_code=403, detail="Session is invalid or expired")
-        return Response(status_code=204)
-
-    @app.websocket("/booking-session/{session_token}/websockify")
-    async def booking_stream(websocket: WebSocket, session_token: str) -> None:
-        from .automation import ipv4_host  # Lazy: automation pulls the browser extra.
-
-        host = urlsplit(os.getenv("TRA_BROWSER_CDP_URL", "")).hostname
-        if not host:
-            await websocket.close(code=1011)
-            return
-        # x11vnc binds IPv4 only, and Docker's DNS answers AAAA first.
-        await relay_vnc(websocket, sessions, session_token, ipv4_host(host))
-
-    @app.get("/tasks/{task_id}/booking-result", response_model=BookingResultResponse)
-    def booking_result(
-        task_id: str, user: CurrentUser,
-        session_token: Annotated[str | None, Header(alias="X-Booking-Session")] = None,
-    ) -> BookingResultResponse:
-        task = db.get_task(task_id, user.id)
-        if not task:
+    def _report_booked(task_id: str, user_id: int, booking_code: str) -> TaskRecord:
+        """Record the code the person got on the official page; that ends the task."""
+        if not db.get_task(task_id, user_id):
             raise HTTPException(status_code=404, detail="Task not found")
-        active = sessions.active
-        if (active and active.task_id == task_id and active.user_id == user.id
-                and (session_token is None or session_token == active.token)):
-            return BookingResultResponse(
-                task_id=task_id,
-                status=active.status,
-                booking_code=active.booking_code,
-                message=active.message,
-            )
-        if session_token and task.status in {"scheduled", "monitoring", "waiting_human"}:
-            return BookingResultResponse(
-                task_id=task_id, status="ended", booking_code=None,
-                message="本輪已結束，請關閉畫面；下一輪就緒後可從任務重新開啟。",
-            )
-        return BookingResultResponse(
-            task_id=task_id,
-            status=task.status,
-            booking_code=task.booking_code,
-            message=task.last_error or "",
-        )
+        # Allowed from any state: a task cancelled here may still have been
+        # booked by hand, and update_task_status lets a code complete it.
+        db.update_task_status(task_id, user_id, "completed", booking_code=booking_code.upper())
+        task = db.get_task(task_id, user_id)
+        assert task is not None
+        if scheduler.notifier.enabled:
+            try:
+                scheduler.notifier.notify_result(task, "completed", task.booking_code)
+            except Exception:
+                logger.exception(
+                    "booking result webhook failed",
+                    extra={"event": "notification.webhook_failed", "task_id": task_id},
+                )
+        return task
 
-    @app.delete("/booking-session/{session_token}", status_code=204)
-    def cancel_booking_session(session_token: str, user: CurrentUser) -> Response:
-        session = sessions.resolve(session_token)
-        if session is None or session.user_id != user.id:
-            raise HTTPException(status_code=403, detail="Session is invalid or expired")
-        # Closing the viewer ends this round only. The task goes back in the
-        # poll loop and prepares the page again one interval later; stopping
-        # for good is POST /tasks/{id}/cancel, which the person asks for by name.
-        session.request_stop(cancelled=False)
-        return Response(status_code=204)
+    @app.post("/tasks/{task_id}/booked", response_model=TaskResponse)
+    def report_booked(task_id: str, body: BookedReport, user: CurrentUser) -> TaskResponse:
+        return _task_response(_report_booked(task_id, user.id, body.booking_code))
 
     @app.delete("/tasks/{task_id}", status_code=204)
     def delete_task(task_id: str, user: CurrentUser) -> Response:
         task = db.get_task(task_id, user.id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        # Deleting is an explicit instruction, so it always goes through: a
-        # round still open on this task is stopped rather than allowed to block
-        # it. Refusing with 409 left any task whose session never finished
-        # cleaning up -- a wedged worker, a viewer that never detached --
-        # undeletable until the API restarted, with nothing the person could
-        # close to fix it.
-        active = sessions.active
-        if active is not None and active.task_id == task_id and active.user_id == user.id:
-            active.request_stop()
         db.delete_task(task_id, user.id)
         return Response(status_code=204)
 
@@ -996,25 +763,161 @@ def create_app(
         task_id: str,
         user: CurrentUser,
     ) -> Response:
-        task = db.get_task(task_id, user.id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not found")
-        # monitoring belongs here: the dashboard offers 停止並取消任務 for it,
-        # and the patrol loop makes it the state a task spends most time in.
-        if task.status not in {"scheduled", "monitoring", "waiting_human"}:
-            raise HTTPException(status_code=409, detail="Task cannot be cancelled")
-        if not db.update_task_status(task_id, user.id, "cancelled"):
-            raise HTTPException(status_code=409, detail="Task has already finished")
-        active = sessions.active
-        if active is not None and active.task_id == task_id and active.user_id == user.id:
-            active.request_stop()
+        _cancel_task(task_id, user.id)
         return Response(status_code=204)
 
     app.state.database = db
     app.state.scheduler = scheduler
+
+    # ---- MCP tools for an AI agent ------------------------------------------
+    # The agent acts as the dashboard account named by TRA_AGENT_EMAIL. Errors
+    # surface to it as tool errors carrying the same message the dashboard shows.
+
+    def _agent_user() -> UserRecord:
+        user = db.get_user_by_email(os.getenv("TRA_AGENT_EMAIL", "").strip().lower())
+        if not user:
+            raise ValueError("TRA_AGENT_EMAIL 沒有對應的帳號；請先在儀表板註冊這個 email")
+        return user
+
+    def _as_tool_error(call: Any) -> Any:
+        try:
+            return call()
+        except HTTPException as exc:
+            raise ValueError(str(exc.detail)) from exc
+
+    def _agent_task(task: TaskRecord) -> dict[str, Any]:
+        return {
+            "task_id": task.id,
+            "status": task.status,
+            "route": task.route,
+            "ride_date": task.ride_date,
+            "train": task.train_label,
+            "booking_code": task.booking_code,
+            "next_reminder_at": task.next_check_at,
+            "monitor_until": task.monitor_until,
+            "booking_url": _open_link_url(task) if task.status in OPEN_STATUSES else None,
+        }
+
+    @agent.tool()
+    def find_stations(keyword: str) -> list[dict[str, str]]:
+        """Find TRA stations by Chinese name, e.g. "板橋". Pass the returned
+        `value` (like "1020-板橋") to the other tools."""
+        keyword = keyword.strip().replace("台", "臺")
+        found = [
+            station for station in tdx.stations(POPULAR_STATIONS)
+            if keyword and (keyword in station["label"] or keyword in station["value"])
+        ]
+        return found[:20]
+
+    @agent.tool()
+    def search_trains(
+        from_station: str,
+        to_station: str,
+        date: str,
+        start_time: str = "00:00",
+        end_time: str = "23:59",
+    ) -> list[dict[str, Any]]:
+        """List trains departing between start_time and end_time on date
+        (YYYY-MM-DD, Taiwan time). Times are on the half hour, or 23:59.
+        Stations are `value`s from find_stations. Says nothing about free seats."""
+        body = SuggestionRequest(
+            start_station=from_station, end_station=to_station, ride_date=date,
+            start_time=start_time, end_time=end_time,
+            preferences=SuggestionPreferences(include_transfers=False),
+        )
+        result = _as_tool_error(lambda: _suggest(body))
+        trains = [*result["primary"], *result["alternatives"]]
+        return sorted(
+            (
+                {key: item[key] for key in (
+                    "train_no", "train_type_name", "departure_time", "arrival_time",
+                    "duration_minutes", "is_reserved_type",
+                )}
+                for item in trains
+            ),
+            key=lambda item: item["departure_time"],
+        )
+
+    @agent.tool()
+    def create_booking_task(
+        from_station: str,
+        to_station: str,
+        date: str,
+        train_numbers: list[str],
+        quantity: int = 1,
+        start_at: str | None = None,
+        remind_every_minutes: int = 5,
+        monitor_until: str | None = None,
+        remind_once: bool = False,
+    ) -> dict[str, Any]:
+        """Watch one to three train numbers on date (YYYY-MM-DD) for 1-6 tickets.
+
+        From start_at (ISO time, Taiwan time if no offset; default now) it sends
+        a webhook reminder every remind_every_minutes (min 1) until booked,
+        cancelled or monitor_until; remind_once sends a single reminder. The
+        returned booking_url opens the pre-filled official page any time the
+        task is open, so it can be sent to the person straight away."""
+        def moment(value: str | None) -> datetime | None:
+            if not value:
+                return None
+            parsed = datetime.fromisoformat(value)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=TAIWAN_TZ)
+
+        body = TaskCreate(
+            scheduled_at=moment(start_at),
+            booking={
+                "start_station": from_station,
+                "end_station": to_station,
+                "quantity": quantity,
+                "outbound": {"ride_date": date.replace("-", "/"), "train_numbers": train_numbers},
+            },
+            train_label="、".join(train_numbers),
+            mode="monitor_only" if remind_once else MODE_BOOK_WHEN_AVAILABLE,
+            poll_interval_seconds=max(remind_every_minutes, 1) * 60,
+            monitor_until=moment(monitor_until),
+        )
+        user = _agent_user()
+        return _agent_task(_as_tool_error(lambda: _create_task(body, user)))
+
+    @agent.tool(name="list_tasks")
+    def agent_list_tasks() -> list[dict[str, Any]]:
+        """All booking tasks, newest first, with status and booking_url."""
+        return [_agent_task(task) for task in db.list_tasks(_agent_user().id)]
+
+    @agent.tool()
+    def get_booking_link(task_id: str) -> dict[str, str]:
+        """A fresh official booking link for the task, to send to the person now.
+        It expires within minutes; the person enters their ID, passes the
+        verification and presses 訂票 themselves."""
+        user = _agent_user()
+        url, train_no = _as_tool_error(lambda: _official_link(task_id, user.id))
+        return {"official_url": url, "train_no": train_no}
+
+    @agent.tool(name="report_booked")
+    def agent_report_booked(task_id: str, booking_code: str) -> dict[str, Any]:
+        """Record the booking code (電腦代碼) the person got. Ends the reminders."""
+        BookedReport(booking_code=booking_code)  # same validation as the dashboard
+        user = _agent_user()
+        return _agent_task(_as_tool_error(lambda: _report_booked(task_id, user.id, booking_code)))
+
+    @agent.tool(name="cancel_task")
+    def agent_cancel_task(task_id: str) -> str:
+        """Stop a task's reminders for good."""
+        user = _agent_user()
+        _as_tool_error(lambda: _cancel_task(task_id, user.id))
+        return "cancelled"
+
+    # Mounted as a plain route so /mcp answers without a trailing-slash redirect.
+    mcp_endpoint = agent.streamable_http_app().routes[0].endpoint
+    app.router.routes.append(
+        Route(
+            "/mcp",
+            BearerGuard(mcp_endpoint, os.getenv("TRA_AGENT_TOKEN", "")),
+            methods=["GET", "POST", "DELETE"],
+        )
+    )
+
     app.state.tdx = tdx
-    app.state.verification = verification
-    app.state.booking_sessions = sessions
     return app
 
 
