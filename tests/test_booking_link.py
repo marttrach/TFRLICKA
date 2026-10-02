@@ -127,9 +127,14 @@ def test_notification_link_needs_no_login_and_redirects_to_a_fresh_tdx_link(tmp_
 
     notifier = client.app.state.scheduler.notifier
     notifier.public_url = "https://tra.example.test"
-    link = notifier.payload_for(task, {})["booking_url"]
+    payload = notifier.payload_for(task, {})
+    # The message link is the TRA page itself, issued as the reminder goes out.
+    assert payload["action_url"] == payload["official_url"] == REDIRECT
+    assert len(mcp.calls) == 3  # one TDX booking-link request (3 JSON-RPC messages)
+
+    # booking_url stays valid after the TDX link expires.
+    link = payload["booking_url"]
     assert link.startswith(f"https://tra.example.test/api/tasks/{task_id}/booking-link/open?")
-    assert not mcp.calls  # building the notification must not spend a TDX call
 
     # nginx strips "/api"; the person tapping the link is not logged in.
     path = link.removeprefix("https://tra.example.test/api")

@@ -717,6 +717,7 @@ def create_app(
         return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
 
     scheduler.notifier.booking_url_for = _open_link_url
+    scheduler.notifier.official_url_for = lambda task: _official_link(task.id, task.user_id)[0]
 
     def _cancel_task(task_id: str, user_id: int) -> None:
         task = db.get_task(task_id, user_id)
@@ -795,7 +796,6 @@ def create_app(
             "booking_code": task.booking_code,
             "next_reminder_at": task.next_check_at,
             "monitor_until": task.monitor_until,
-            "booking_url": _open_link_url(task) if task.status in OPEN_STATUSES else None,
         }
 
     @agent.tool()
@@ -855,8 +855,8 @@ def create_app(
         From start_at (ISO time, Taiwan time if no offset; default now) it sends
         a webhook reminder every remind_every_minutes (min 1) until booked,
         cancelled or monitor_until; remind_once sends a single reminder. The
-        returned booking_url opens the pre-filled official page any time the
-        task is open, so it can be sent to the person straight away."""
+        returned official_url is the pre-filled TRA booking page; send it to
+        the person straight away (it expires within minutes)."""
         def moment(value: str | None) -> datetime | None:
             if not value:
                 return None
@@ -877,11 +877,18 @@ def create_app(
             monitor_until=moment(monitor_until),
         )
         user = _agent_user()
-        return _agent_task(_as_tool_error(lambda: _create_task(body, user)))
+        task = _as_tool_error(lambda: _create_task(body, user))
+        created = _agent_task(task)
+        try:
+            created["official_url"] = _official_link(task.id, user.id)[0]
+        except HTTPException as exc:
+            created["official_url_error"] = str(exc.detail)
+        return created
 
     @agent.tool(name="list_tasks")
     def agent_list_tasks() -> list[dict[str, Any]]:
-        """All booking tasks, newest first, with status and booking_url."""
+        """All booking tasks, newest first, with status. Use get_booking_link
+        for a task's booking page."""
         return [_agent_task(task) for task in db.list_tasks(_agent_user().id)]
 
     @agent.tool()

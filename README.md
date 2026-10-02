@@ -195,12 +195,19 @@ Header Auth credential。
 **不會傳送身分證、台鐵會員帳密，也不會傳送 token 本身**。
 通知失敗只會寫入日誌，不會改變任務狀態。
 
-設定了 TDX 金鑰時，`task.waiting_human` 會多一個 `booking_url`，可直接轉發到
-Telegram 等通訊軟體讓人點開：它不需登入，點下去才向 TDX 取一條新的官方訂票連結並
-轉址過去（TDX 連結只有幾分鐘效期，所以不直接放進通知）。連結以
-`TRA_TOKEN_SECRET` 簽章、只在任務進行中有效，網址為
-`TRA_PUBLIC_URL` 加上 `/api/tasks/<id>/booking-link/open`，所以 `TRA_PUBLIC_URL`
-必須是收訊裝置連得到的位址。拿到連結的人都能開啟，請只轉給訂票的本人。
+設定了 TDX 金鑰時，`task.waiting_human` 的連結欄位：
+
+| 欄位 | 內容 |
+|---|---|
+| `action_url` | 訊息裡要放的那條連結：有官方連結就是官方連結，否則退回 `booking_url`，最後才是儀表板 |
+| `official_url` | 台鐵官方訂票頁（TDX 導訂連結），已帶入日期、起訖站、車次與張數；幾分鐘內有效 |
+| `booking_url` | 不會過期的備用連結：點下去才向 TDX 取一條新的官方連結並轉址 |
+| `task_url` | 儀表板上的這個任務 |
+
+n8n／Hermes 的訊息範本放 `action_url` 即可直接開到台鐵訂票頁。`booking_url` 以
+`TRA_TOKEN_SECRET` 簽章、只在任務進行中有效，網址為 `TRA_PUBLIC_URL` 加上
+`/api/tasks/<id>/booking-link/open`，所以 `TRA_PUBLIC_URL` 必須是收訊裝置連得到的位址。
+兩條連結都不需登入、也不含身分證，拿到的人都能開啟，請只轉給訂票的本人。
 
 ## 🛡️ 免責聲明
 

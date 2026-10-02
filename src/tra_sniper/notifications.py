@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.request
 from collections.abc import Callable
@@ -9,10 +10,11 @@ from urllib.parse import urlparse
 
 from .storage import TaskRecord
 
-NOTICE = "候選僅為時刻建議，不代表有位；驗證碼與送出仍須人工完成於官方頁面"
+NOTICE = "提醒不代表有位；請點連結到台鐵官方頁面，輸入身分證、完成驗證後自行送出"
 RESULT_NOTICE = "訂位成功，請於台鐵規定期限內完成付款取票"
 TOKEN_HEADER = "X-TRA-Token"
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+logger = logging.getLogger(__name__)
 
 # The receiver authenticates with a shared token instead of verifying a
 # signature, so the token is a bearer credential: whoever holds it can post a
@@ -21,10 +23,10 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # but cannot start a booking. Adding either to a payload invalidates this and
 # the receiver would need a verifiable signature again. See PLAN.md 12.9.
 #
-# booking_url stays inside that rule: it only opens the official page with the
-# route, date and train filled in. The traveller's ID is not in it and nothing
-# is submitted. It is signed and needs no login, so whoever receives the
-# payload can open it -- forward it only to the person doing the booking.
+# official_url and booking_url stay inside that rule: they only open the
+# official page with the route, date and train filled in. The traveller's ID is
+# not in them and nothing is submitted. Neither needs a login, so whoever
+# receives the payload can open them -- forward them only to the person booking.
 Sender = Callable[[str, bytes, dict[str, str], float], None]
 
 
@@ -83,6 +85,7 @@ class WebhookNotifier:
         timeout_seconds: float = 5.0,
         sender: Sender | None = None,
         booking_url_for: Callable[[TaskRecord], str | None] | None = None,
+        official_url_for: Callable[[TaskRecord], str] | None = None,
     ) -> None:
         self.url = url.strip()
         # TRA_WEBHOOK_SECRET now carries the Header Auth token rather than a
@@ -93,6 +96,7 @@ class WebhookNotifier:
         self._sender = sender or _default_sender
         # Set by the API once it knows whether TDX can issue official links.
         self.booking_url_for = booking_url_for
+        self.official_url_for = official_url_for
 
     @classmethod
     def from_env(cls) -> WebhookNotifier:
@@ -113,19 +117,43 @@ class WebhookNotifier:
         return parsed.scheme == "https" or (parsed.hostname or "") in LOOPBACK_HOSTS
 
     def payload_for(self, task: TaskRecord, stored_payload: dict[str, Any]) -> dict[str, Any]:
+        task_url = f"{self.public_url}/tasks/{task.id}"
         payload = {
             "event": "task.waiting_human",
             "task_id": task.id,
             "route": task.route,
             "ride_date": task.ride_date,
             "candidates": _candidate_rows(stored_payload),
-            "action_url": f"{self.public_url}/tasks/{task.id}",
+            "task_url": task_url,
             "note": NOTICE,
         }
+        # The TRA page itself, issued now; TDX links expire within minutes.
+        official_url = self._official_url(task)
+        if official_url:
+            payload["official_url"] = official_url
+        # Never expires while the task is open; redirects to a fresh TDX link.
         booking_url = self.booking_url_for(task) if self.booking_url_for else None
         if booking_url:
             payload["booking_url"] = booking_url
+        # action_url is the link receivers already put in the message, so it is
+        # the most direct way into booking there is, the dashboard only as a
+        # last resort.
+        payload["action_url"] = official_url or booking_url or task_url
         return payload
+
+    def _official_url(self, task: TaskRecord) -> str | None:
+        if not self.official_url_for:
+            return None
+        try:
+            return self.official_url_for(task)
+        except Exception:
+            # The stable booking_url still gets the person there.
+            logger.warning(
+                "official booking link unavailable",
+                extra={"event": "notification.official_link_failed", "task_id": task.id},
+                exc_info=True,
+            )
+            return None
 
     def result_payload_for(
         self, task: TaskRecord, status: str, booking_code: str | None

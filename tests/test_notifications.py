@@ -65,6 +65,8 @@ def test_webhook_signs_minimal_payload_and_excludes_secrets() -> None:
         "route": "臺北 → 臺中",
         "ride_date": "2026/11/21",
         "candidates": [{"train_no": "109", "depart": "08:13", "seat_type": "對號列車"}],
+        "task_url": "https://tra.example.test/tasks/task-123",
+        # No TDX link configured, so the dashboard is the only way in.
         "action_url": "https://tra.example.test/tasks/task-123",
         "note": NOTICE,
     }
@@ -285,7 +287,8 @@ def test_both_event_payloads_carry_the_agreed_fields() -> None:
     waiting = json.loads(sent["body"])
     assert waiting["event"] == "task.waiting_human"
     assert set(waiting) == {
-        "event", "task_id", "route", "ride_date", "candidates", "action_url", "note"
+        "event", "task_id", "route", "ride_date", "candidates", "task_url", "action_url",
+        "note",
     }
 
     notifier.notify_result(task_record(), "failed", None)

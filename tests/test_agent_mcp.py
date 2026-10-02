@@ -109,8 +109,7 @@ def test_an_agent_runs_the_flow_up_to_the_persons_booking(client) -> None:
 
     task = call(client, "create_booking_task", from_station="1000-臺北",
                 to_station="3300-臺中", date=ride, train_numbers=["110"], quantity=2)
-    assert task["status"] == "scheduled"
-    assert f"/api/tasks/{task['task_id']}/booking-link/open?" in task["booking_url"]
+    assert (task["status"], task["official_url"]) == ("scheduled", OFFICIAL)
     assert [item["task_id"] for item in call(client, "list_tasks")] == [task["task_id"]]
 
     link = call(client, "get_booking_link", task_id=task["task_id"])
@@ -118,9 +117,7 @@ def test_an_agent_runs_the_flow_up_to_the_persons_booking(client) -> None:
     assert client.tdx.links[-1] == ("1000-臺北", "3300-臺中", "110", ride.replace("-", "/"), 2)
 
     done = call(client, "report_booked", task_id=task["task_id"], booking_code="ab123456")
-    assert (done["status"], done["booking_code"], done["booking_url"]) == (
-        "completed", "AB123456", None
-    )
+    assert (done["status"], done["booking_code"]) == ("completed", "AB123456")
     with pytest.raises(AssertionError, match="cannot be cancelled"):
         call(client, "cancel_task", task_id=task["task_id"])
 
