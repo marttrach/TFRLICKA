@@ -29,6 +29,14 @@ Flow:
 TRA has no public seat-availability data, so a reminder never means a seat is
 free; it means "try now". Ticket sales open 28 days before the ride date.
 Dates are Taiwan local dates (YYYY-MM-DD); times are Taiwan time (HH:MM).
+
+Auto-submit mode (reCAPTCHA v3, headless browser): if the server runs with
+TRA_AUTOBOOK_ENABLED, create_booking_task with auto_submit=true (or call
+set_auto_submit) makes every round drive the official page itself — the page
+mints its own reCAPTCHA v3 token, the ID comes from the task's stored
+identity, and success records the booking code automatically. Any round the
+browser cannot finish falls back to the normal reminder, so nothing is lost.
+try_auto_booking forces an attempt immediately.
 """
 
 

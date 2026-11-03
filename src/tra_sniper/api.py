@@ -30,6 +30,7 @@ from starlette.routing import Route
 from .agent import INSTRUCTIONS as AGENT_INSTRUCTIONS
 from .agent import BearerGuard
 from .auth import TokenManager, hash_password, verify_password
+from .autobook import build_autobook_submitter_from_env
 from .logging_config import configure_logging
 from .models import BOOKING_TIME_LABELS, TAIWAN_TZ, BookingRequest
 from .ocr import MAX_IMAGE_BYTES, OcrService
@@ -37,6 +38,7 @@ from .scheduler import TaskScheduler
 from .storage import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     MIN_POLL_INTERVAL_SECONDS,
+    MODE_AUTO_SUBMIT,
     MODE_BOOK_WHEN_AVAILABLE,
     TASK_MODES,
     Database,
@@ -238,10 +240,15 @@ def create_app(
     tdx_client: TdxClient | None = None,
     *,
     start_scheduler: bool = True,
+    autobook: Any | None = None,
 ) -> FastAPI:
     db = database or Database()
     tokens = token_manager or TokenManager()
-    scheduler = TaskScheduler(db)
+    # autobook=None means "decide from the environment"; tests inject a stub.
+    scheduler = TaskScheduler(
+        db,
+        autobook=build_autobook_submitter_from_env() if autobook is None else autobook,
+    )
     ocr = ocr_service or OcrService()
     tra_ocr = TraOcrService(ocr)
     tdx = tdx_client or TdxClient()
@@ -751,6 +758,32 @@ def create_app(
     def report_booked(task_id: str, body: BookedReport, user: CurrentUser) -> TaskResponse:
         return _task_response(_report_booked(task_id, user.id, body.booking_code))
 
+    def _autobook_attempt(task_id: str, user_id: int) -> dict[str, Any]:
+        """One immediate browser booking attempt, for testing the waters."""
+        task = db.get_task(task_id, user_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if scheduler.autobook is None:
+            raise HTTPException(
+                status_code=409,
+                detail="自動訂票未啟用：請設 TRA_AUTOBOOK_ENABLED=1 並安裝 playwright",
+            )
+        payload = db.get_task_payload(task_id, user_id)
+        identity = str(payload.get("identity", "")).strip()
+        if not identity:
+            raise HTTPException(status_code=422, detail="任務沒有身分證資料，無法自動訂票")
+        url, _ = _official_link(task_id, user_id)
+        result = scheduler.autobook.submit(url, identity)
+        if result.ok:
+            code = result.booking_code or "AUTO"
+            db.update_task_status(task_id, user_id, "completed", booking_code=code)
+        return {"task_id": task_id, **result.as_dict()}
+
+    @app.post("/tasks/{task_id}/autobook/try")
+    def try_autobook(task_id: str, user: CurrentUser) -> dict[str, Any]:
+        """Drive the official page once, right now, and report what happened."""
+        return _autobook_attempt(task_id, user.id)
+
     @app.delete("/tasks/{task_id}", status_code=204)
     def delete_task(task_id: str, user: CurrentUser) -> Response:
         task = db.get_task(task_id, user.id)
@@ -790,6 +823,7 @@ def create_app(
         return {
             "task_id": task.id,
             "status": task.status,
+            "mode": task.mode,
             "route": task.route,
             "ride_date": task.ride_date,
             "train": task.train_label,
@@ -849,6 +883,7 @@ def create_app(
         remind_every_minutes: int = 5,
         monitor_until: str | None = None,
         remind_once: bool = False,
+        auto_submit: bool = False,
     ) -> dict[str, Any]:
         """Watch one to three train numbers on date (YYYY-MM-DD) for 1-6 tickets.
 
@@ -856,13 +891,24 @@ def create_app(
         a webhook reminder every remind_every_minutes (min 1) until booked,
         cancelled or monitor_until; remind_once sends a single reminder. The
         returned official_url is the pre-filled TRA booking page; send it to
-        the person straight away (it expires within minutes)."""
+        the person straight away (it expires within minutes).
+
+        auto_submit (needs TRA_AUTOBOOK_ENABLED) makes every round open the
+        official page in a headless browser, enter the person's stored ID and
+        submit -- the page mints its own reCAPTCHA v3 token. A round that the
+        browser cannot finish falls back to the reminder, so booking is never
+        lost. Requires identity saved on the task."""
         def moment(value: str | None) -> datetime | None:
             if not value:
                 return None
             parsed = datetime.fromisoformat(value)
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=TAIWAN_TZ)
 
+        mode = (
+            MODE_AUTO_SUBMIT
+            if auto_submit
+            else ("monitor_only" if remind_once else MODE_BOOK_WHEN_AVAILABLE)
+        )
         body = TaskCreate(
             scheduled_at=moment(start_at),
             booking={
@@ -872,7 +918,7 @@ def create_app(
                 "outbound": {"ride_date": date.replace("-", "/"), "train_numbers": train_numbers},
             },
             train_label="、".join(train_numbers),
-            mode="monitor_only" if remind_once else MODE_BOOK_WHEN_AVAILABLE,
+            mode=mode,
             poll_interval_seconds=max(remind_every_minutes, 1) * 60,
             monitor_until=moment(monitor_until),
         )
@@ -913,6 +959,27 @@ def create_app(
         user = _agent_user()
         _as_tool_error(lambda: _cancel_task(task_id, user.id))
         return "cancelled"
+
+    @agent.tool()
+    def set_auto_submit(task_id: str, enabled: bool) -> dict[str, Any]:
+        """Switch a task between auto-submit (the server books in a headless
+        browser) and plain reminders. Use it to turn auto-booking on or off
+        for an open task."""
+        user = _agent_user()
+        mode = MODE_AUTO_SUBMIT if enabled else MODE_BOOK_WHEN_AVAILABLE
+        if not _as_tool_error(lambda: db.set_task_mode(task_id, user.id, mode)):
+            raise ValueError("任務不存在或已結束")
+        updated = db.get_task(task_id, user.id)
+        if updated is None:
+            raise ValueError("任務不存在或已結束")
+        return _agent_task(updated)
+
+    @agent.tool()
+    def try_auto_booking(task_id: str) -> dict[str, Any]:
+        """Attempt the auto-submit booking right now (do not wait for the next
+        round). Returns ok, booking_code and reason; ok=True ends the task."""
+        user = _agent_user()
+        return _as_tool_error(lambda: _autobook_attempt(task_id, user.id))
 
     # Mounted as a plain route so /mcp answers without a trailing-slash redirect.
     mcp_endpoint = agent.streamable_http_app().routes[0].endpoint

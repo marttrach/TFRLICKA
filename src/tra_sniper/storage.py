@@ -34,7 +34,11 @@ class UserRecord:
 # task is ready for a person, never "there is a seat". See PLAN.md section 13.
 MODE_MONITOR_ONLY = "monitor_only"
 MODE_BOOK_WHEN_AVAILABLE = "book_when_available"
-TASK_MODES = frozenset({MODE_MONITOR_ONLY, MODE_BOOK_WHEN_AVAILABLE})
+# auto_submit: the scheduler drives the official page itself (headless browser
+# generating its own reCAPTCHA v3 token) and only falls back to reminders when
+# a page it does not understand appears.
+MODE_AUTO_SUBMIT = "auto_submit"
+TASK_MODES = frozenset({MODE_MONITOR_ONLY, MODE_BOOK_WHEN_AVAILABLE, MODE_AUTO_SUBMIT})
 
 DEFAULT_POLL_INTERVAL_SECONDS = 300
 MIN_POLL_INTERVAL_SECONDS = 60
@@ -599,6 +603,16 @@ class Database:
                 "DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id)
             )
         return cursor.rowcount > 0
+
+    def set_task_mode(self, task_id: str, user_id: int, mode: str) -> bool:
+        """Switch an open task's run mode. Finished tasks stay finished."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET mode = ?, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND status NOT IN ('completed', 'cancelled', 'expired')",
+                (mode, utc_now(), task_id, user_id),
+            )
+        return cursor.rowcount == 1
 
     def get_task(self, task_id: str, user_id: int) -> TaskRecord | None:
         with self.connect() as connection:

@@ -32,7 +32,7 @@ export interface Task {
   updated_at: string;
   last_error: string | null;
   booking_code: string | null;
-  mode: "monitor_only" | "book_when_available";
+  mode: "monitor_only" | "book_when_available" | "auto_submit";
   poll_interval_seconds: number;
   monitor_until: string | null;
   last_checked_at: string | null;

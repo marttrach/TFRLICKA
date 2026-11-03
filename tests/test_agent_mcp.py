@@ -96,6 +96,7 @@ def test_the_endpoint_needs_the_agent_token(client) -> None:
     assert names == {
         "find_stations", "search_trains", "create_booking_task", "list_tasks",
         "get_booking_link", "report_booked", "cancel_task",
+        "set_auto_submit", "try_auto_booking",
     }
 
 

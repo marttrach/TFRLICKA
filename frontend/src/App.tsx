@@ -100,7 +100,7 @@ interface BookingFormState {
   endCounty: string;
   startStation: string;
   endStation: string;
-  mode: "monitor_only" | "book_when_available";
+  mode: "monitor_only" | "book_when_available" | "auto_submit";
   startNow: boolean;
   pollIntervalMinutes: number;
   monitorUntil: string;
@@ -794,6 +794,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                 <legend>執行模式</legend>
                 <label><input type="radio" checked={form.mode === "monitor_only"} onChange={() => setForm({ ...form, mode: "monitor_only" })} /> 只監控，到點提醒我</label>
                 <label><input type="radio" checked={form.mode === "book_when_available"} onChange={() => setForm({ ...form, mode: "book_when_available" })} /> 到點就準備訂票頁</label>
+                <label><input type="radio" checked={form.mode === "auto_submit"} onChange={() => setForm({ ...form, mode: "auto_submit" })} /> 自動訂票（reCAPTCHA v3，需伺服器啟用）</label>
               </fieldset>
               <fieldset className="mode-switch wide">
                 <legend>開始時間</legend>
@@ -859,7 +860,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <span className={`status status-${task.status}`}>{LIVE_STATUSES.includes(task.status) && <i className="pulse-dot" />}{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
                     <p className="task-train">{task.train_label ?? "未指定車次"}</p>
-                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : "每輪提醒並附訂票連結"}</p>
+                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : task.mode === "auto_submit" ? "自動訂票，失敗才提醒" : "每輪提醒並附訂票連結"}</p>
                     {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
                   </div>
                   <dl className="task-time">

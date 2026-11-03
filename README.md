@@ -83,8 +83,23 @@ CI 需要 repository secrets `DOCKERHUB_USERNAME` 與 `DOCKERHUB_TOKEN`（Read &
 驗證（reCAPTCHA／圖形驗證碼）在你自己的瀏覽器裡完成，系統不辨識、不代填、不送出。
 「常用乘車人」仍可保存，但官方連結不會帶入身分證；需要時可用瀏覽器的自動填入。
 
-## 🤖 AI 助理（Hermes 等 MCP client）
+## 🚀 自動訂票（auto_submit，reCAPTCHA v3）
 
+第三種執行模式：到點不再只提醒你，而是由伺服器**自己開官方訂票頁、輸入身分證、按下訂票**。
+reCAPTCHA v3 沒有圖要認——它只看不動聲色地打分數，所以「破解」的做法是讓頁面在**真正的
+headless Chromium**（真實指紋、逐字鍵入、隨機停留）裡自己生出 v3 token，不偽造、不重放。
+
+- 啟用：`.env` 設 `TRA_AUTOBOOK_ENABLED=1`，並安裝 `pip install 'tra-sniper[autobook]'`
+  與 `playwright install chromium`（Docker 映像已內建）
+- 每一輪：成功 → 自動記錄電腦代碼、任務結束並通知；失敗（售完、驗證沒過、頁面改版）
+  → 自動**退回原本的提醒**，訂票機會不會遺失
+- 任務需有身分證（乘車人帶入）；失敗原因顯示在任務的 `last_error`
+- 手動試單：`POST /api/tasks/{id}/autobook/try`，或 MCP 工具 `try_auto_booking`
+- 開關：MCP `set_auto_submit(task_id, true/false)`；建立任務時 `auto_submit=true`
+
+> 官方頁面改版時，只需更新 `src/tra_sniper/autobook.py` 頂部的 selector 與結果字樣。
+
+## 🤖 AI 助理（Hermes 等 MCP client）
 API 內建 MCP 端點 `/mcp`（Streamable HTTP），讓 agent 走完整個流程，只把最後
 「輸入身分證與驗證碼、按訂票」留給你：
 
