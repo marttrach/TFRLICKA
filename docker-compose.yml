@@ -20,10 +20,23 @@ services:
       # "Authorization: Bearer <TRA_AGENT_TOKEN>". Empty token disables it.
       TRA_AGENT_TOKEN: ${TRA_AGENT_TOKEN:-}
       TRA_AGENT_EMAIL: ${TRA_AGENT_EMAIL:-}
+      # Auto-submit (reCAPTCHA v3 + picture-code OCR baked into the image).
+      # Leave TRA_AUTOBOOK_ENABLED empty to keep pure reminder behaviour.
+      TRA_AUTOBOOK_ENABLED: ${TRA_AUTOBOOK_ENABLED:-}
+      TRA_AUTOBOOK_HEADLESS: ${TRA_AUTOBOOK_HEADLESS:-1}
+      TRA_AUTOBOOK_TIMEOUT_MS: ${TRA_AUTOBOOK_TIMEOUT_MS:-30000}
+      TRA_AUTOBOOK_CAPTCHA_RETRIES: ${TRA_AUTOBOOK_CAPTCHA_RETRIES:-3}
+      # The self-trained keras CRNN lives on the GB10 host (arch-specific);
+      # mount it only when the container arch matches, e.g.
+      #   volumes: ["/path/to/tra_ocr:/opt/tra_ocr:ro"] + TRA_OCR_HOME=/opt/tra_ocr
+      # Otherwise the OCR chain uses the in-image ddddocr.
+      TRA_OCR_HOME: ${TRA_OCR_HOME:-/opt/tra_ocr}
     volumes:
       - /mnt/NEW_PA9A1_2T/Truenas_App/TRA/data:/app/data
     ports:
       - "48100:8000"
+    # Chromium needs more than Docker's default 64 MB /dev/shm.
+    shm_size: 256mb
     restart: unless-stopped
     networks:
       - default

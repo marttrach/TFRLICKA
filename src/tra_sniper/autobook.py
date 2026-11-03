@@ -221,7 +221,14 @@ class PlaywrightAutoSubmitter:
     def _submit(self, playwright: Any, official_url: str, identity: str, error_type: Any) -> SubmitResult:
         browser = playwright.chromium.launch(
             headless=self.headless,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                # Docker reality: the container runs Chromium as root and ships
+                # a small /dev/shm; without these two the browser crashes on
+                # launch or mid-page-load instead of failing gracefully.
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
         try:
             context = browser.new_context(
@@ -352,8 +359,14 @@ class PlaywrightAutoSubmitter:
 
 
 def build_captcha_solver_from_env() -> OcrChain | None:
-    """Keras CRNN first, ddddocr second; only entries installed on this host count."""
+    """Keras CRNN first, ddddocr second; only entries installed here count.
+
+    Outside this host (e.g. inside the API container) the venv paths will not
+    exist; a ddddocr importable by the running interpreter is then used so
+    picture-code OCR travels with the image instead of the filesystem.
+    """
     import os
+    import sys
     from pathlib import Path
 
     root = Path(os.getenv("TRA_OCR_HOME", "/home/hermesbot/projects/tra_ocr"))
@@ -364,7 +377,16 @@ def build_captcha_solver_from_env() -> OcrChain | None:
         commands.append(("keras", [keras_py, keras_script]))
     dddd_py = os.getenv("TRA_AUTOBOOK_DDDD_PY", str(root / "ocrvenv/bin/python"))
     if Path(dddd_py).exists():
-        commands.append(("ddddocr", [dddd_py, "-c",
+        dddd_python = dddd_py
+    else:
+        try:
+            import ddddocr  # noqa: F401
+        except ImportError:
+            dddd_python = ""
+        else:
+            dddd_python = sys.executable
+    if dddd_python:
+        commands.append(("ddddocr", [dddd_python, "-c",
             "import sys,ddddocr; print(ddddocr.DdddOcr(show_ad=False).classification(open(sys.argv[1],'rb').read()))"]))
     return OcrChain(commands) if commands else None
 

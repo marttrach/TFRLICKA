@@ -16,9 +16,10 @@ COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
 # [autobook] adds Playwright for auto_submit mode (reCAPTCHA v3 via a real
-# headless browser). Drop the extra to slim the image; auto_submit tasks then
-# fall back to plain reminders.
-RUN pip install --no-cache-dir ".[autobook]" \
+# headless browser); [autobook-captcha] bakes ddddocr in so the picture-code
+# fallback works without host-mounted venvs. Drop both extras to slim the
+# image; auto_submit tasks then fall back to plain reminders at captchas.
+RUN pip install --no-cache-dir ".[autobook,autobook-captcha]" \
     && python -m playwright install --with-deps chromium
 
 EXPOSE 8000
