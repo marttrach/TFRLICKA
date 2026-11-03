@@ -18,6 +18,7 @@ import random
 import re
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,6 +72,67 @@ Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
 window.chrome = window.chrome || {runtime: {}};
 """
 
+# ---- image-captcha fallback (live-verified 2026-11-03, see skill
+# tra-online-booking): reCAPTCHA Enterprise v3 scores a datacenter IP 0 and the
+# official page then shows a picture code. TRA accepts it case-insensitively.
+CAPTCHA_MARKER = "驗證碼"
+CAPTCHA_IMG_SELECTORS = (
+    "img[src*='player/picture']",
+    "#capImg",
+    "img.captcha",
+)
+CAPTCHA_INPUT_SELECTORS = (
+    "#verifyCode",
+    "input[name='g-recaptcha-response']",
+)
+CAPTCHA_TYPE_FIELD = "input[name='verifyType']"
+CAPTCHA_FALLBACK_IMAGE_PATH = "/tra-tip-web/tip/player/picture"
+
+
+def page_shows_captcha(page_text: str) -> bool:
+    return CAPTCHA_MARKER in (page_text or "")
+
+
+class OcrChain:
+    """Ranked subprocess OCRs: tries each until one prints a usable code.
+
+    Defaults follow this host's verified pipeline (keras-ocr-pipeline.md):
+    a self-trained CRNN first, ddddocr as fallback. Subprocess isolation keeps
+    TensorFlow out of the API process entirely.
+    """
+
+    def __init__(self, commands, runner=None, timeout_s: float = 60.0) -> None:
+        # commands: sequence of (name, argv_prefix); the image path is appended.
+        self.commands = list(commands)
+        self._run = runner or self._subprocess_run
+        self.timeout_s = timeout_s
+        self.last_used = ""
+
+    @staticmethod
+    def _subprocess_run(argv, timeout):
+        import subprocess
+
+        return subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
+
+    def solve(self, image_path: str) -> str | None:
+        for name, argv in self.commands:
+            try:
+                done = self._run([*argv, image_path], self.timeout_s)
+            except Exception:  # noqa: BLE001, S112 - a broken OCR entry must not stop the chain
+                continue
+            if done.returncode != 0:
+                continue
+            # The keras predictor prints per-image lines; take the last one.
+            lines = [line.strip() for line in done.stdout.strip().splitlines() if line.strip()]
+            if not lines:
+                continue
+            code = lines[-1]
+            if len(code) >= 4:
+                self.last_used = name
+                # TRA verification is case-insensitive (live A/B proven).
+                return code.upper()
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class SubmitResult:
@@ -116,12 +178,18 @@ class PlaywrightAutoSubmitter:
         headless: bool = True,
         timeout_ms: int = 30_000,
         user_agent: str = DEFAULT_USER_AGENT,
+        captcha_solver: OcrChain | None = None,
+        captcha_retries: int = 3,
         sleeper: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
     ) -> None:
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.user_agent = user_agent
+        # None disables the picture-code fallback entirely: a captcha page
+        # then reads as "page not understood" and the task falls to reminders.
+        self.captcha_solver = captcha_solver
+        self.captcha_retries = captcha_retries
         self._sleep = sleeper
         self._rng = rng or random.Random()
 
@@ -186,26 +254,92 @@ class PlaywrightAutoSubmitter:
                 return SubmitResult(False, reason="找不到訂票按鈕（頁面可能已改版）")
 
             # The v3 token is minted on this interaction; wait for the result
-            # page instead of a fixed sleep.
+            # page instead of a fixed sleep. A datacenter IP answers with the
+            # picture-code fallback instead — read it, OCR it, try again.
             submit_button.click()
             deadline = self.timeout_ms / 1000.0
             waited = 0.0
+            captcha_attempts = 0
             while waited < deadline:
-                outcome = parse_booking_outcome(page.content())
+                content = page.content()
+                outcome = parse_booking_outcome(content)
                 if outcome.ok or "官方頁面回報" in outcome.reason:
                     return outcome
+                if (
+                    self.captcha_solver is not None
+                    and page_shows_captcha(content)
+                    and captcha_attempts < self.captcha_retries
+                ):
+                    captcha_attempts += 1
+                    if self._solve_captcha(page):
+                        outcome = parse_booking_outcome(page.content())
+                        if outcome.ok or "官方頁面回報" in outcome.reason:
+                            return outcome
+                        continue
                 self._sleep(1.0)
                 waited += 1.0
             outcome = parse_booking_outcome(page.content())
             if outcome.ok:
                 return outcome
+            if captcha_attempts and not page_shows_captcha(page.content()):
+                raise error_type("圖形驗證碼連續失敗")
             raise error_type(outcome.reason or "等了很久仍讀不到訂票結果")
         finally:
             browser.close()
 
+    def _solve_captcha(self, page: Any) -> bool:
+        """Read the picture code, fill the form and resubmit. True on success.
+
+        The image is fetched through the page's own request context so the
+        session cookie (the picture is session-bound) comes along for free.
+        """
+        import os
+        import tempfile
+        from urllib.parse import urljoin
+
+        assert self.captcha_solver is not None
+        image = self._first_visible(page, CAPTCHA_IMG_SELECTORS)
+        if image is None:
+            return False
+        src = image.get_attribute("src") or CAPTCHA_FALLBACK_IMAGE_PATH
+        try:
+            response = page.request.get(urljoin(page.url, f"{src.split('?')[0]}?r={os.getpid()}"))
+            body = response.body()
+        except Exception:  # noqa: BLE001 - unreadable picture means the round falls back
+            return False
+        code_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+                handle.write(body)
+                code_path = handle.name
+            code = self.captcha_solver.solve(code_path)
+        finally:
+            if code_path:
+                with suppress(OSError):
+                    os.unlink(code_path)
+        if not code:
+            return False
+
+        field = self._first_visible(page, CAPTCHA_INPUT_SELECTORS)
+        if field is None:
+            return False
+        field.fill(code)
+        type_field = page.query_selector(CAPTCHA_TYPE_FIELD)
+        if type_field is not None:
+            type_field.evaluate("el => { el.value = 'text'; }")
+        submit_button = self._first_visible(page, SUBMIT_BUTTON_SELECTORS)
+        if submit_button is None:
+            return False
+        self._human_pause(0.2, 0.6)
+        submit_button.click()
+        return True
+
     @staticmethod
     def _first_visible(page: Any, selectors: tuple[str, ...]) -> Any | None:
-        from playwright.sync_api import Error as PlaywrightError
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+        except ImportError:  # unit tests run without playwright installed
+            PlaywrightError = Exception
 
         for selector in selectors:
             try:
@@ -215,6 +349,24 @@ class PlaywrightAutoSubmitter:
             except PlaywrightError:
                 continue
         return None
+
+
+def build_captcha_solver_from_env() -> OcrChain | None:
+    """Keras CRNN first, ddddocr second; only entries installed on this host count."""
+    import os
+    from pathlib import Path
+
+    root = Path(os.getenv("TRA_OCR_HOME", "/home/hermesbot/projects/tra_ocr"))
+    commands = []
+    keras_py = os.getenv("TRA_AUTOBOOK_KERAS_PY", str(root / "kerasvenv/bin/python"))
+    keras_script = os.getenv("TRA_AUTOBOOK_KERAS_SCRIPT", str(root / "data/tra_predict.py"))
+    if Path(keras_py).exists() and Path(keras_script).exists():
+        commands.append(("keras", [keras_py, keras_script]))
+    dddd_py = os.getenv("TRA_AUTOBOOK_DDDD_PY", str(root / "ocrvenv/bin/python"))
+    if Path(dddd_py).exists():
+        commands.append(("ddddocr", [dddd_py, "-c",
+            "import sys,ddddocr; print(ddddocr.DdddOcr(show_ad=False).classification(open(sys.argv[1],'rb').read()))"]))
+    return OcrChain(commands) if commands else None
 
 
 def build_autobook_submitter_from_env() -> PlaywrightAutoSubmitter | None:
@@ -234,4 +386,10 @@ def build_autobook_submitter_from_env() -> PlaywrightAutoSubmitter | None:
         return None
     headless = os.getenv("TRA_AUTOBOOK_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
     timeout_ms = int(os.getenv("TRA_AUTOBOOK_TIMEOUT_MS", "30000"))
-    return PlaywrightAutoSubmitter(headless=headless, timeout_ms=timeout_ms)
+    retries = int(os.getenv("TRA_AUTOBOOK_CAPTCHA_RETRIES", "3"))
+    return PlaywrightAutoSubmitter(
+        headless=headless,
+        timeout_ms=timeout_ms,
+        captcha_solver=build_captcha_solver_from_env(),
+        captcha_retries=retries,
+    )

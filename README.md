@@ -91,6 +91,9 @@ headless Chromium**（真實指紋、逐字鍵入、隨機停留）裡自己生�
 
 - 啟用：`.env` 設 `TRA_AUTOBOOK_ENABLED=1`，並安裝 `pip install 'tra-sniper[autobook]'`
   與 `playwright install chromium`（Docker 映像已內建）
+- **圖形驗證碼後備**：reCAPTCHA Enterprise v3 對 datacenter IP 分數歸零時，官方頁會改出
+  圖形驗證碼；內建 OCR 鏈（自訓 Keras CRNN 為主、ddddocr 為備，見 `TRA_OCR_HOME`）
+  抓圖、認字、重填再送，預設重試 3 次（台鐵驗證碼大小寫不敏感）
 - 每一輪：成功 → 自動記錄電腦代碼、任務結束並通知；失敗（售完、驗證沒過、頁面改版）
   → 自動**退回原本的提醒**，訂票機會不會遺失
 - 任務需有身分證（乘車人帶入）；失敗原因顯示在任務的 `last_error`

@@ -2,7 +2,9 @@
 
 The browser itself is never launched here: parse_booking_outcome is pure and
 the scheduler runs against a stub submitter, so the suite stays fast and does
-not require the optional playwright extra.
+not require the optional playwright extra. The picture-code fallback (the
+official response when v3 scores a datacenter IP zero) is covered with a fake
+OCR chain and a duck-typed fake page.
 """
 
 from types import SimpleNamespace
@@ -13,7 +15,13 @@ from fastapi.testclient import TestClient
 
 from tra_sniper.api import create_app
 from tra_sniper.auth import TokenManager
-from tra_sniper.autobook import SubmitResult, parse_booking_outcome
+from tra_sniper.autobook import (
+    OcrChain,
+    PlaywrightAutoSubmitter,
+    SubmitResult,
+    page_shows_captcha,
+    parse_booking_outcome,
+)
 from tra_sniper.notifications import WebhookNotifier
 from tra_sniper.scheduler import TaskScheduler
 from tra_sniper.storage import (
@@ -197,3 +205,121 @@ def test_api_autobook_try_books_and_completes(client) -> None:
     assert body["booking_code"] == "A1234567"
     updated = client.get("/tasks", headers=headers).json()[0]
     assert updated["status"] == "completed"
+
+
+# ---- picture-code fallback ---------------------------------------------------
+
+
+class FakeChain:
+    def __init__(self, code: str | None) -> None:
+        self.code = code
+        self.calls = 0
+
+    def solve(self, image_path):
+        self.calls += 1
+        return self.code
+
+
+class FakeElement:
+    def __init__(self, src=None, visible=True) -> None:
+        self.src = src
+        self._visible = visible
+        self.filled = None
+        self.clicked = False
+        self.evaluated = None
+
+    def is_visible(self):
+        return self._visible
+
+    def get_attribute(self, name):
+        return self.src
+
+    def fill(self, value):
+        self.filled = value
+
+    def click(self):
+        self.clicked = True
+
+    def evaluate(self, script):
+        self.evaluated = script
+
+
+class FakeResponse:
+    def body(self):
+        return b"fake-jpeg-bytes"
+
+
+class FakeRequest:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def get(self, url):
+        self.urls.append(url)
+        return FakeResponse()
+
+
+class FakePage:
+    url = "https://tb.trans.railway.gov.tw/tra-tip-web/tip/tip001/tip121/booking"
+
+    def __init__(self) -> None:
+        self.picture = FakeElement(src="/tra-tip-web/tip/player/picture?r=99")
+        self.verify = FakeElement()
+        self.verify_type = FakeElement()
+        self.button = FakeElement()
+        self.request = FakeRequest()
+
+    def query_selector(self, selector):
+        return {
+            "img[src*='player/picture']": self.picture,
+            "#verifyCode": self.verify,
+            "input[name='verifyType']": self.verify_type,
+            "button:has-text('確認訂票')": self.button,
+        }.get(selector)
+
+
+def test_ocr_chain_prefers_primary_and_falls_back() -> None:
+    results = [
+        SimpleNamespace(returncode=1, stdout=""),          # keras dies
+        SimpleNamespace(returncode=0, stdout="24p8k7\n"),  # ddddocr saves it
+    ]
+    chain = OcrChain(
+        [("keras", ["/bin/keras"]), ("ddddocr", ["/bin/dddd"])],
+        runner=lambda argv, timeout: results.pop(0),
+    )
+    assert chain.solve("x.jpg") == "24P8K7"  # TRA is case-insensitive: upper is fine
+    assert chain.last_used == "ddddocr"
+
+
+def test_ocr_chain_rejects_short_noise() -> None:
+    chain = OcrChain(
+        [("keras", ["/bin/keras"])],
+        runner=lambda argv, timeout: SimpleNamespace(returncode=0, stdout="ab\n"),
+    )
+    assert chain.solve("x.jpg") is None
+
+
+def test_page_shows_captcha_marker() -> None:
+    assert page_shows_captcha("請輸入下圖驗證碼")
+    assert not page_shows_captcha("訂票成功")
+
+
+def test_solve_captcha_reads_image_fills_and_resubmits() -> None:
+    page = FakePage()
+    submitter = PlaywrightAutoSubmitter(
+        captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
+    )
+    assert submitter._solve_captcha(page) is True
+    # the picture is fetched with the page's own (session-bearing) request
+    assert page.request.urls and "/tra-tip-web/tip/player/picture" in page.request.urls[0]
+    assert page.verify.filled == "AB3D9F"
+    assert page.verify_type.evaluated is not None  # verifyType set to 'text'
+    assert page.button.clicked is True
+
+
+def test_solve_captcha_without_readable_code_gives_up_quietly() -> None:
+    page = FakePage()
+    submitter = PlaywrightAutoSubmitter(
+        captcha_solver=FakeChain(None), sleeper=lambda seconds: None
+    )
+    assert submitter._solve_captcha(page) is False
+    assert page.verify.filled is None
