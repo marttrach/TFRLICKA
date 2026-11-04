@@ -228,9 +228,11 @@ def client(tmp_path, monkeypatch):
         def booking_link(self, *args):
             return OFFICIAL
 
+    submitter = StubSubmitter(SubmitResult(True, booking_code="A1234567"))
     app = create_app(database=db, token_manager=TokenManager(), tdx_client=FakeTdx(),
-                     start_scheduler=False, autobook=StubSubmitter(SubmitResult(True, booking_code="A1234567")))
+                     start_scheduler=False, autobook=submitter)
     with TestClient(app) as client:
+        client.submitter = submitter
         yield client
 
 
@@ -265,6 +267,21 @@ def test_api_autobook_try_books_and_completes(client) -> None:
     assert body["booking_code"] == "A1234567"
     updated = client.get("/tasks", headers=headers).json()[0]
     assert updated["status"] == "completed"
+    # Trying again on a booked task must not book a second ticket.
+    again = client.post(f"/tasks/{task['id']}/autobook/try", headers=headers).json()
+    assert again["ok"] is False
+    assert len(client.submitter.calls) == 1
+
+
+def test_try_now_refuses_while_a_round_is_running() -> None:
+    db = StubDb({"identity": "A123456789"})
+    submitter = StubSubmitter(SubmitResult(True))
+    scheduler = _scheduler(db, submitter)
+    assert scheduler._claim("t1")  # a scheduled round holds the task
+    assert scheduler.autobook_now("t1", 1, OFFICIAL, "A123456789") is None
+    assert submitter.calls == []
+    scheduler._release("t1")
+    assert scheduler.autobook_now("t1", 1, OFFICIAL, "A123456789").ok
 
 
 # ---- picture-code fallback ---------------------------------------------------

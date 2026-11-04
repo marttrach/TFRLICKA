@@ -4,6 +4,7 @@ import logging
 import threading
 from typing import Any
 
+from .autobook import SubmitResult
 from .notifications import WebhookNotifier
 from .storage import MODE_AUTO_SUBMIT, MODE_MONITOR_ONLY, Database, TaskRecord
 
@@ -90,13 +91,53 @@ class TaskScheduler:
         A skipped round loses nothing: the attempt in flight reminds the person
         itself if it cannot finish.
         """
-        with self._in_flight_lock:
-            if task.id in self._in_flight:
-                return
-            self._in_flight.add(task.id)
+        if not self._claim(task.id):
+            return
         threading.Thread(
             target=self._autobook_round, args=(task,), name=f"tra-autobook-{task.id}", daemon=True
         ).start()
+
+    def _claim(self, task_id: str) -> bool:
+        """Reserve the task for one browser attempt; False if one already runs.
+
+        Scheduled rounds and the on-demand attempt share this, so one task
+        never has two bookings going to the official page at once.
+        """
+        with self._in_flight_lock:
+            if task_id in self._in_flight:
+                return False
+            self._in_flight.add(task_id)
+            return True
+
+    def _release(self, task_id: str) -> None:
+        with self._in_flight_lock:
+            self._in_flight.discard(task_id)
+
+    def autobook_now(
+        self, task_id: str, user_id: int, official_url: str, identity: str
+    ) -> SubmitResult | None:
+        """One attempt right away, for the try endpoint. None means busy.
+
+        The completed status is written before the reservation is released,
+        so no scheduled round can slip in between a booking and its record.
+        """
+        assert self.autobook is not None
+        if not self._claim(task_id):
+            return None
+        try:
+            with self._browser_slot:
+                current = self.database.get_task(task_id, user_id)
+                if current is None or current.status in FINISHED_STATUSES:
+                    return SubmitResult(False, reason="任務已結束，不再訂票")
+                result = self.autobook.submit(official_url, identity)
+                if result.ok:
+                    self.database.update_task_status(
+                        task_id, user_id, "completed",
+                        booking_code=result.booking_code or "AUTO", last_error=None,
+                    )
+                return result
+        finally:
+            self._release(task_id)
 
     def _autobook_round(self, task: TaskRecord) -> None:
         try:
@@ -114,8 +155,7 @@ class TaskScheduler:
                 extra={"event": "autobook.round_failed", "task_id": task.id},
             )
         finally:
-            with self._in_flight_lock:
-                self._in_flight.discard(task.id)
+            self._release(task.id)
 
     def _run_check(self, task: TaskRecord) -> bool:
         """Return whether to remind now."""

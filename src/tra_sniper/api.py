@@ -773,10 +773,9 @@ def create_app(
         if not identity:
             raise HTTPException(status_code=422, detail="任務沒有身分證資料，無法自動訂票")
         url, _ = _official_link(task_id, user_id)
-        result = scheduler.autobook.submit(url, identity)
-        if result.ok:
-            code = result.booking_code or "AUTO"
-            db.update_task_status(task_id, user_id, "completed", booking_code=code)
+        result = scheduler.autobook_now(task_id, user_id, url, identity)
+        if result is None:
+            raise HTTPException(status_code=409, detail="這個任務正在自動訂票中，請稍候")
         return {"task_id": task_id, **result.as_dict()}
 
     @app.post("/tasks/{task_id}/autobook/try")
