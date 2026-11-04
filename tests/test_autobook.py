@@ -7,6 +7,8 @@ official response when v3 scores a datacenter IP zero) is covered with a fake
 OCR chain and a duck-typed fake page.
 """
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -102,26 +104,50 @@ class StubSubmitter:
         return self.result
 
 
-def _scheduler(db, submitter, notifier=None) -> TaskScheduler:
-    notifier = notifier or WebhookNotifier()
+class RecordingNotifier(WebhookNotifier):
+    enabled = True  # type: ignore[assignment]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reminded: list[str] = []
+
+    def notify(self, task, payload):
+        self.reminded.append(task.id)
+
+    def notify_result(self, task, status, code):
+        pass
+
+
+def _scheduler(db, submitter) -> TaskScheduler:
+    notifier = RecordingNotifier()
     notifier.official_url_for = lambda task: OFFICIAL
     return TaskScheduler(db, notifier=notifier, autobook=submitter)  # type: ignore[arg-type]
+
+
+def _wait_for_browser_rounds() -> None:
+    for thread in threading.enumerate():
+        if thread.name.startswith("tra-autobook-"):
+            thread.join(timeout=5)
 
 
 def test_auto_submit_books_completes_task_without_reminder() -> None:
     db = StubDb({"identity": "A123456789"})
     submitter = StubSubmitter(SubmitResult(True, booking_code="A1234567"))
     scheduler = _scheduler(db, submitter)
-    assert scheduler.tick() == 0  # booked; the person does not need a reminder
+    scheduler.tick()
+    _wait_for_browser_rounds()
     assert submitter.calls == [(OFFICIAL, "A123456789")]
     assert ("completed", "A1234567") in db.statuses
+    assert scheduler.notifier.reminded == []  # booked; no reminder needed
 
 
 def test_auto_submit_failure_falls_back_to_reminder() -> None:
     db = StubDb({"identity": "A123456789"})
     submitter = StubSubmitter(SubmitResult(False, reason="已售完"))
     scheduler = _scheduler(db, submitter)
-    assert scheduler.tick() == 1  # the reminder covers for the browser
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    assert scheduler.notifier.reminded == ["t1"]  # the reminder covers for the browser
     assert not any(status == "completed" for status, _ in db.statuses)
 
 
@@ -129,8 +155,42 @@ def test_auto_submit_without_identity_reminds_and_explains() -> None:
     db = StubDb({"identity": ""})
     submitter = StubSubmitter(SubmitResult(True))
     scheduler = _scheduler(db, submitter)
-    assert scheduler.tick() == 1
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    assert scheduler.notifier.reminded == ["t1"]
     assert submitter.calls == []  # never sends an empty ID to the page
+
+
+def test_slow_browser_round_does_not_block_the_tick() -> None:
+    release = threading.Event()
+
+    class SlowSubmitter(StubSubmitter):
+        def submit(self, url, identity):
+            self.calls.append((url, identity))
+            release.wait(5)
+            return self.result
+
+    db = StubDb({"identity": "A123456789"})
+    submitter = SlowSubmitter(SubmitResult(False, reason="已售完"))
+    scheduler = _scheduler(db, submitter)
+    started = time.monotonic()
+    scheduler.tick()
+    scheduler.tick()  # next round while the browser is still busy
+    assert time.monotonic() - started < 1
+    release.set()
+    _wait_for_browser_rounds()
+    assert len(submitter.calls) == 1  # no second browser for the same task
+    assert scheduler.notifier.reminded == ["t1"]
+
+
+def test_round_skips_task_cancelled_while_queued() -> None:
+    db = StubDb({"identity": "A123456789"})
+    submitter = StubSubmitter(SubmitResult(True))
+    scheduler = _scheduler(db, submitter)
+    db.task = SimpleNamespace(**{**vars(db.task), "status": "cancelled"})
+    scheduler._autobook_round(db.task)
+    assert submitter.calls == []
+    assert scheduler.notifier.reminded == []
 
 
 def test_auto_submit_without_submitter_behaves_like_plain_mode() -> None:

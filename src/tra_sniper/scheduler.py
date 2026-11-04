@@ -9,6 +9,8 @@ from .storage import MODE_AUTO_SUBMIT, MODE_MONITOR_ONLY, Database, TaskRecord
 
 logger = logging.getLogger(__name__)
 
+FINISHED_STATUSES = frozenset({"completed", "cancelled", "expired"})
+
 
 class TaskScheduler:
     """Send a booking reminder, carrying the official link, for every due round.
@@ -37,6 +39,12 @@ class TaskScheduler:
         self.autobook = autobook
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # A browser round takes up to minutes (page load, OCR retries), so it
+        # runs off the tick thread or every other task's reminder waits on it.
+        # ponytail: one browser at a time; widen the semaphore if RAM allows.
+        self._browser_slot = threading.Semaphore(1)
+        self._in_flight: set[str] = set()
+        self._in_flight_lock = threading.Lock()
 
     def tick(self) -> int:
         # Close finished windows before claiming work, so a task whose deadline
@@ -49,28 +57,68 @@ class TaskScheduler:
 
         # Claiming already schedules the next round, so a reminder that fails
         # to send is simply retried one interval later.
-        due = [task for task in self.database.claim_due_checks() if self._run_check(task)]
+        due = []
+        for task in self.database.claim_due_checks():
+            if task.mode == MODE_AUTO_SUBMIT and self.autobook is not None:
+                self._start_autobook(task)
+            elif self._run_check(task):
+                due.append(task)
         if due:
             logger.info(
                 "due tasks claimed",
                 extra={"event": "scheduler.tasks_claimed", "claimed_count": len(due)},
             )
-        if self.notifier.enabled:
-            for task in due:
-                try:
-                    payload = self.database.get_task_payload(task.id, task.user_id)
-                    self.notifier.notify(task, payload)
-                except Exception:
-                    logger.exception(
-                        "task webhook failed; the next round reminds again",
-                        extra={"event": "notification.webhook_failed", "task_id": task.id},
-                    )
+        for task in due:
+            self._remind(task)
         return len(due)
+
+    def _remind(self, task: TaskRecord) -> None:
+        if not self.notifier.enabled:
+            return
+        try:
+            payload = self.database.get_task_payload(task.id, task.user_id)
+            self.notifier.notify(task, payload)
+        except Exception:
+            logger.exception(
+                "task webhook failed; the next round reminds again",
+                extra={"event": "notification.webhook_failed", "task_id": task.id},
+            )
+
+    def _start_autobook(self, task: TaskRecord) -> None:
+        """Hand the round to a browser thread; skip it if one is still on it.
+
+        A skipped round loses nothing: the attempt in flight reminds the person
+        itself if it cannot finish.
+        """
+        with self._in_flight_lock:
+            if task.id in self._in_flight:
+                return
+            self._in_flight.add(task.id)
+        threading.Thread(
+            target=self._autobook_round, args=(task,), name=f"tra-autobook-{task.id}", daemon=True
+        ).start()
+
+    def _autobook_round(self, task: TaskRecord) -> None:
+        try:
+            with self._browser_slot:
+                # The task may have been booked, cancelled or switched to plain
+                # reminders while this round queued for the browser.
+                current = self.database.get_task(task.id, task.user_id)
+                if current is None or current.status in FINISHED_STATUSES:
+                    return
+                if current.mode != MODE_AUTO_SUBMIT or not self._try_autobook(current):
+                    self._remind(current)
+        except Exception:
+            logger.exception(
+                "auto-submit round crashed",
+                extra={"event": "autobook.round_failed", "task_id": task.id},
+            )
+        finally:
+            with self._in_flight_lock:
+                self._in_flight.discard(task.id)
 
     def _run_check(self, task: TaskRecord) -> bool:
         """Return whether to remind now."""
-        if task.mode == MODE_AUTO_SUBMIT and self.autobook is not None and self._try_autobook(task):
-            return False
         if task.mode == MODE_MONITOR_ONLY:
             # Reminding once means leaving the poll loop after this round.
             return self.database.pause_monitoring(task.id, task.user_id, "waiting_human")
