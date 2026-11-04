@@ -51,14 +51,24 @@ DEFAULT_USER_AGENT = (
 )
 
 # Selectors for the official pre-filled page, tried in order. One place to fix
-# when TRC ships a new booking UI.
+# when TRC ships a new booking UI. The ``#pid``/``#queryForm`` pair is the
+# live-verified shape of tip121/query (probed 2026-11-05): the identity field
+# is ``input#pid`` with an empty placeholder, and the submit control is the
+# only ``[type=submit]`` inside ``form#queryForm``. The older guesses stay as
+# fallbacks, but ``:has-text`` is substring-matched — plain
+# ``button:has-text('訂票')`` also hits the 個人訂票/團體訂票 tabs — so the
+# specific selectors must stay first.
 IDENTITY_INPUT_SELECTORS = (
+    "input#pid",
+    "input[name='pid']",
     "input#txtId",
     "input[name='id']",
     "input[placeholder*='身分證']",
     "input[placeholder*='身份']",
 )
 SUBMIT_BUTTON_SELECTORS = (
+    "form#queryForm button[type=submit]",
+    "form#queryForm input[type=submit]",
     "button:has-text('確認訂票')",
     "button:has-text('確定訂票')",
     "button:has-text('訂票')",
@@ -248,7 +258,11 @@ class PlaywrightAutoSubmitter:
                 outcome = parse_booking_outcome(page.content())
                 if outcome.ok or "官方頁面回報" in outcome.reason:
                     return outcome  # the page already resolved before we typed
-                return SubmitResult(False, reason="找不到身分證欄位（頁面可能已改版）")
+                # Name the page we actually landed on: the last incident was a
+                # selector miss, and "頁面可能已改版" alone could not tell a
+                # wrong page from a redesigned one.
+                where = page.url().split("?", 1)[0].rsplit("//", 1)[-1][:60]
+                return SubmitResult(False, reason=f"找不到身分證欄位（頁面可能已改版：{where}）")
 
             identity_input.click()
             self._human_pause(0.2, 0.5)
