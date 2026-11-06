@@ -28,6 +28,13 @@ autobook = [
 autobook-captcha = [
   "ddddocr>=1.5,<2",
 ]
+# The self-trained CRNN, THSR-Sniper style: weights live in src/tra_sniper/_ocr
+# and tensorflow rides in the image, so no host venv ever needs to exist.
+# CPU-only wheel; the pinned version matches the trained keras 3 format.
+autobook-keras = [
+  "tensorflow==2.17.0",
+  "numpy>=1.26,<2",
+]
 dev = [
   "httpx>=0.28,<1",
   "pytest>=8.3,<9",

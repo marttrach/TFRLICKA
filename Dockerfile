@@ -19,7 +19,7 @@ COPY src ./src
 # headless browser); [autobook-captcha] bakes ddddocr in so the picture-code
 # fallback works without host-mounted venvs. Drop both extras to slim the
 # image; auto_submit tasks then fall back to plain reminders at captchas.
-RUN pip install --no-cache-dir ".[autobook,autobook-captcha]" \
+RUN pip install --no-cache-dir ".[autobook,autobook-captcha,autobook-keras]" \
     && python -m playwright install --with-deps chromium
 
 EXPOSE 8000

@@ -644,6 +644,14 @@ def build_captcha_solver_from_env() -> OcrChain | None:
     if dddd_python:
         commands.append(("ddddocr", [dddd_python, "-c",
             "import sys,ddddocr; print(ddddocr.DdddOcr(show_ad=False).classification(open(sys.argv[1],'rb').read()))"]))
+    # Baked CRNN: weights ship inside the package, so a tensorflow importable
+    # by THIS interpreter is all the image needs (no TRA_OCR_HOME mount).
+    # THSR-Sniper pattern: model in git, deps in the image, zero host venvs.
+    import importlib.util
+
+    baked = Path(__file__).parent / "_ocr/tra_predict.py"
+    if importlib.util.find_spec("tensorflow") and baked.exists():
+        commands.insert(0, ("keras-baked", [sys.executable, str(baked)]))
     return OcrChain(commands) if commands else None
 
 

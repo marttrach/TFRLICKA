@@ -430,6 +430,38 @@ def test_ocr_chain_rejects_short_noise() -> None:
     assert chain.solve("x.jpg") is None
 
 
+def test_captcha_chain_prefers_the_baked_crnn_when_tensorflow_is_present(monkeypatch, tmp_path) -> None:
+    # The THSR-Sniper deployment shape: no host venvs at all, tensorflow and
+    # the in-package weights are everything the image has.
+    import importlib.util as ilu
+
+    monkeypatch.setenv("TRA_OCR_HOME", str(tmp_path / "absent"))  # no kerasvenv/ocrvenv
+    monkeypatch.setenv("TRA_AUTOBOOK_DDDD_PY", str(tmp_path / "no-dddd"))
+    monkeypatch.setattr(ilu, "find_spec",
+                        lambda name: object() if name == "tensorflow" else None)
+    monkeypatch.setitem(__import__("sys").modules, "ddddocr", None)  # no importable ddddocr
+
+    from tra_sniper.autobook import build_captcha_solver_from_env
+
+    chain = build_captcha_solver_from_env()
+    assert chain is not None
+    name, argv = chain.commands[0]
+    assert name == "keras-baked" and argv[-1].endswith("_ocr/tra_predict.py")
+
+
+def test_captcha_chain_is_none_without_any_ocr(monkeypatch, tmp_path) -> None:
+    import importlib.util as ilu
+
+    monkeypatch.setenv("TRA_OCR_HOME", str(tmp_path / "absent"))
+    monkeypatch.setenv("TRA_AUTOBOOK_DDDD_PY", str(tmp_path / "no-dddd"))
+    monkeypatch.setattr(ilu, "find_spec", lambda name: None)
+    monkeypatch.setitem(__import__("sys").modules, "ddddocr", None)
+
+    from tra_sniper.autobook import build_captcha_solver_from_env
+
+    assert build_captcha_solver_from_env() is None
+
+
 def test_page_shows_captcha_marker() -> None:
     assert page_shows_captcha("請輸入下圖驗證碼")
     assert not page_shows_captcha("訂票成功")
