@@ -330,9 +330,13 @@ class FakeChain:
     def __init__(self, code: str | None) -> None:
         self.code = code
         self.calls = 0
+        self.commands = [("fake", ["/bin/fake"])]  # OcrChain-shaped for the logs
+        self.last_used = ""
 
     def solve(self, image_path):
         self.calls += 1
+        if self.code:
+            self.last_used = "fake"
         return self.code
 
 
@@ -922,6 +926,9 @@ def test_captcha_strikes_out_requeues_instead_of_freezing(monkeypatch) -> None:
     _fake_playwright(monkeypatch, page, error_type=RuntimeError)
 
     class NeverSolves:
+        commands = [("never", ["/bin/never"])]
+        last_used = ""
+
         def solve(self, image_path):
             return None
 

@@ -16,6 +16,9 @@ SAFE_EXTRA_FIELDS = (
     "url",
     "page_text",
     "captcha",
+    "tried",
+    "chain",
+    "len",
 )
 
 

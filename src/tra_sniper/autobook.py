@@ -575,7 +575,25 @@ class PlaywrightAutoSubmitter:
                 with suppress(OSError):
                     os.unlink(code_path)
         if not code:
+            # Distinguish "every OCR subprocess died" from "OCR answered but
+            # the server refused the code": WARNING + tried-chain list makes
+            # a dead chain visible in docker logs (2026-11-07 NAS lesson).
+            logger.warning(
+                "captcha OCR produced no code",
+                extra={
+                    "event": "autobook.captcha_ocr_empty",
+                    "tried": "+".join(n for n, _ in self.captcha_solver.commands),
+                },
+            )
             return False
+        logger.warning(
+            "captcha OCR answered",
+            extra={
+                "event": "autobook.captcha_ocr_ok",
+                "chain": self.captcha_solver.last_used,
+                "len": len(code),
+            },
+        )
 
         field = self._first_visible(page, CAPTCHA_INPUT_SELECTORS)
         if field is None:
@@ -696,7 +714,10 @@ def build_autobook_submitter_from_env() -> PlaywrightAutoSubmitter | None:
     solver = build_captcha_solver_from_env()
     # State the OCR chain out loud at startup: a parked captcha round is
     # ambiguous without it (baked OCR dead vs codes OCR'd wrong 3x).
-    logger.info(
+    # WARNING, not INFO: this runs before configure_logging() attaches the
+    # handler, and INFO was silently swallowed (live miss 2026-11-07 NAS --
+    # the armed line never appeared even on the right image).
+    logger.warning(
         "auto-submit armed",
         extra={
             "event": "autobook.armed",
