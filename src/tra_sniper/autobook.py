@@ -340,7 +340,13 @@ class PlaywrightAutoSubmitter:
                         and captcha_attempts < self.captcha_retries
                     ):
                         captcha_attempts += 1
-                        if self._solve_captcha(page, prefill):
+                        try:
+                            solved = self._solve_captcha(page, prefill)
+                        except error_type:
+                            # page detached under us: retry with a fresh page
+                            # next tick instead of parking the whole round
+                            solved = False
+                        if solved:
                             outcome = parse_booking_outcome(page.content())
                             if outcome.ok or "官方頁面回報" in outcome.reason:
                                 return outcome
@@ -409,7 +415,13 @@ class PlaywrightAutoSubmitter:
         field = self._first_visible(page, CAPTCHA_INPUT_SELECTORS)
         if field is None:
             return False
-        field.fill(code)
+        try:
+            # A stale handle (page navigating mid-solve) must burn seconds of
+            # the round budget, not the whole 30s default timeout — and the
+            # loop retries with a fresh handle next tick.
+            field.fill(code, timeout=8000)
+        except Exception:  # noqa: BLE001 - stale element means retry next tick
+            return False
         type_field = page.query_selector(CAPTCHA_TYPE_FIELD)
         if type_field is not None:
             type_field.evaluate("el => { el.value = 'text'; }")

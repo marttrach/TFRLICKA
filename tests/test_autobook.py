@@ -349,7 +349,7 @@ class FakeElement:
     def get_attribute(self, name):
         return self.src
 
-    def fill(self, value):
+    def fill(self, value, timeout=None):
         self.filled = value
 
     def click(self):
@@ -454,6 +454,21 @@ def test_solve_captcha_refills_wiped_form_before_resubmit() -> None:
     )]
     second_verify = [s for s, _ in page.evaluates if "isSecondVerify" in s]
     assert second_verify, "empty v3 token must not ride along on resubmit"
+
+
+def test_solve_captcha_gives_up_when_field_goes_stale() -> None:
+    # Navigation mid-solve must cost one tick, not the whole round budget.
+    page = FakePage()
+
+    def boom(value, timeout=None):
+        raise RuntimeError("ElementHandle.fill: Timeout 30000ms exceeded.")
+
+    page.verify.fill = boom
+    submitter = PlaywrightAutoSubmitter(
+        captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
+    )
+    assert submitter._solve_captcha(page, {"values": {}, "checked": ""}) is False
+    assert page.button.clicked is False
 
 
 def test_solve_captcha_without_readable_code_gives_up_quietly() -> None:
