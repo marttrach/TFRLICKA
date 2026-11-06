@@ -5,7 +5,10 @@ import logging
 import os
 from datetime import UTC, datetime
 
-SAFE_EXTRA_FIELDS = ("event", "promoted_count", "duration_ms", "task_id")
+# url/page_text: the autobook.unreadable evidence trail -- without them a
+# parked round tells us nothing about WHICH page froze (live incident
+# 2026-11-07). They carry no credentials: input VALUES never reach innerText.
+SAFE_EXTRA_FIELDS = ("event", "promoted_count", "duration_ms", "task_id", "url", "page_text")
 
 
 class JsonFormatter(logging.Formatter):
