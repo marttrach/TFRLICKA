@@ -118,3 +118,61 @@ def test_terminal_states_resist_late_callbacks_but_keep_a_real_booking_code(tmp_
     assert not database.update_task_status(task.id, user.id, "cancelled")
     assert not database.resume_monitoring(task.id, user.id)
     assert database.get_task(task.id, user.id).booking_code == "1234567890"
+
+
+def test_scheduled_completion_cannot_resurrect_a_cancelled_task(tmp_path) -> None:
+    database = Database(tmp_path / "only-from.db", encryption_key=Fernet.generate_key().decode())
+    user = database.create_user("guard@example.com", "password-hash")
+    payload = booking_data()
+    task = database.create_task(
+        user.id, BookingRequest.from_dict(payload),
+        (datetime.now(UTC) + timedelta(minutes=5)).isoformat(), payload,
+    )
+    assert database.update_task_status(task.id, user.id, "cancelled")
+
+    # The scheduler's automated completed write is refused by the guard...
+    assert not database.update_task_status(
+        task.id, user.id, "completed", booking_code="AB12345678",
+        only_from=("autobooking", "monitoring", "scheduled"),
+    )
+    assert database.get_task(task.id, user.id).status == "cancelled"
+    # ...while the person's own report_booked path keeps its carve-out.
+    assert database.update_task_status(task.id, user.id, "completed", booking_code="AB12345678")
+    assert database.get_task(task.id, user.id).booking_code == "AB12345678"
+
+
+def test_park_for_human_review_leaves_the_poll_loop(tmp_path) -> None:
+    database = Database(tmp_path / "park.db", encryption_key=Fernet.generate_key().decode())
+    user = database.create_user("park@example.com", "password-hash")
+    payload = booking_data()
+    task = database.create_task(
+        user.id, BookingRequest.from_dict(payload),
+        (datetime.now(UTC) - timedelta(minutes=5)).isoformat(), payload,
+    )
+    assert database.park_for_human_review(task.id, user.id, last_error="結果未知")
+    parked = database.get_task(task.id, user.id)
+    assert parked.status == "waiting_human"
+    assert parked.next_check_at is None
+    assert parked.last_error == "結果未知"
+    assert database.claim_due_checks((datetime.now(UTC) + timedelta(hours=1)).isoformat()) == []
+    assert database.list_tasks_by_status("waiting_human")[0].id == task.id
+
+
+def test_check_failure_counter_round_trip(tmp_path) -> None:
+    database = Database(tmp_path / "strikes.db", encryption_key=Fernet.generate_key().decode())
+    user = database.create_user("strike@example.com", "password-hash")
+    payload = booking_data()
+    task = database.create_task(
+        user.id, BookingRequest.from_dict(payload),
+        (datetime.now(UTC) + timedelta(minutes=5)).isoformat(), payload,
+    )
+    assert database.record_check_failure(task.id) == 1
+    assert database.record_check_failure(task.id) == 2
+    database.clear_check_failures(task.id)
+    assert database.record_check_failure(task.id) == 1
+
+
+def test_database_runs_in_wal_mode(tmp_path) -> None:
+    database = Database(tmp_path / "wal.db", encryption_key=Fernet.generate_key().decode())
+    with database.connect() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"

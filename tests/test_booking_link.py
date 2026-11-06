@@ -5,7 +5,8 @@ import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
-from tra_sniper.api import create_app
+import tra_sniper.api
+from tra_sniper.api import OFFICIAL_LINK_FAIL_TTL_SECONDS, create_app
 from tra_sniper.auth import TokenManager
 from tra_sniper.storage import Database
 from tra_sniper.tdx import TdxClient, TdxError
@@ -21,7 +22,7 @@ class FakeMcp:
         self.is_error = is_error
         self.calls: list[tuple[dict, dict]] = []
 
-    def __call__(self, message, headers):
+    def __call__(self, message, headers, timeout=None):
         self.calls.append((message, headers))
         if message["method"] == "tools/call":
             result = {"content": [{"type": "text", "text": self.text}], "isError": self.is_error}
@@ -155,3 +156,97 @@ def test_notification_has_no_booking_link_without_tdx_credentials(tmp_path) -> N
     user_id = client.get("/auth/me", headers=headers).json()["id"]
     task = client.database.get_task(task_id, user_id)
     assert "booking_url" not in client.app.state.scheduler.notifier.payload_for(task, {})
+
+
+# ---- R4: official link off the reminder hot path ------------------------------
+
+
+class CountingTdx:
+    configured = True
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.error: Exception | None = None
+
+    def stations(self, fallback):
+        return list(fallback)
+
+    def load_cached_stations(self):
+        return []
+
+    def booking_link(self, *args):
+        self.calls.append(args)
+        if self.error is not None:
+            raise self.error
+        return REDIRECT
+
+
+def test_two_reminders_share_one_tdx_call_inside_the_ttl(tmp_path) -> None:
+    tdx = CountingTdx()
+    client = _api(tmp_path, tdx)
+    task_id, _headers = _task(client)
+    task = client.database.get_task(task_id, 1)
+
+    notifier = client.app.state.scheduler.notifier
+    first = notifier.payload_for(task, {})
+    second = notifier.payload_for(task, {})
+    assert first["official_url"] == second["official_url"] == REDIRECT
+    assert len(tdx.calls) == 1  # the reminder cadence does not hammer TDX
+
+
+def test_a_failed_link_is_tombstoned_then_retried(tmp_path, monkeypatch) -> None:
+    tdx = CountingTdx()
+    tdx.error = TdxError("TDX is temporarily unavailable")
+    client = _api(tmp_path, tdx)
+    task_id, _headers = _task(client)
+    task = client.database.get_task(task_id, 1)
+    notifier = client.app.state.scheduler.notifier
+
+    assert "official_url" not in notifier.payload_for(task, {})  # swallow stands
+    assert "official_url" not in notifier.payload_for(task, {})
+    assert len(tdx.calls) == 1  # the failure is remembered, not retried per reminder
+
+    # ...but never for longer than the short negative TTL.
+    cache = client.app.state.official_links
+    url, expires_at = cache[task_id]
+    assert url == ""
+    assert expires_at - tra_sniper.api._link_clock() <= OFFICIAL_LINK_FAIL_TTL_SECONDS
+    monkeypatch.setattr(tra_sniper.api, "_link_clock", lambda: tra_sniper.api.time.monotonic() + OFFICIAL_LINK_FAIL_TTL_SECONDS + 1)
+    tdx.error = None
+    assert notifier.payload_for(task, {})["official_url"] == REDIRECT
+    assert len(tdx.calls) == 2
+
+
+def test_booking_link_gives_the_transport_the_short_leash(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("TDX_LINK_TIMEOUT_SECONDS", raising=False)
+    timeouts: list[float] = []
+
+    def timeout_spy(message, headers, timeout=None):
+        timeouts.append(timeout)
+        if message["method"] == "tools/call":
+            return "s", {
+                "jsonrpc": "2.0", "id": message["id"],
+                "result": {"content": [{"type": "text", "text": REDIRECT}], "isError": False},
+            }
+        return "s", None
+
+    client = TdxClient(
+        client_id="id", client_secret="secret", data_dir=tmp_path, mcp_post=timeout_spy
+    )
+    assert client.booking_link("1020-板橋", "1080-桃園", "149", "2026-10-01", 1) == REDIRECT
+    assert timeouts == [5.0, 5.0, 5.0]  # three round-trips, each on the short leash
+
+    timeouts.clear()
+    monkeypatch.setenv("TDX_LINK_TIMEOUT_SECONDS", "2")
+    client = TdxClient(
+        client_id="id", client_secret="secret", data_dir=tmp_path, mcp_post=timeout_spy
+    )
+    client.booking_link("1020-板橋", "1080-桃園", "149", "2026-10-01", 1)
+    assert set(timeouts) == {2.0}  # the knob is settable without a code change
+
+
+def test_a_fake_without_a_timeout_parameter_still_works(tmp_path) -> None:
+    # Older fakes/callers keep working: the short leash is passed only where
+    # the transport understands it.
+    mcp = FakeMcp(REDIRECT)
+    assert _client(tmp_path, mcp).booking_link("1020-板橋", "1080-桃園", "149", "2026-10-01", 1) == REDIRECT

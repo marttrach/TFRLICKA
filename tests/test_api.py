@@ -376,3 +376,31 @@ def test_a_clearly_past_start_time_is_still_refused(tmp_path) -> None:
         )
         assert created.status_code == 422
         assert "past" in created.json()["detail"]
+
+
+def test_health_reports_automation_truth(tmp_path, monkeypatch) -> None:
+    for var in ("TRA_WEBHOOK_URL", "TRA_WEBHOOK_SECRET", "TRA_AUTOBOOK_ENABLED"):
+        monkeypatch.delenv(var, raising=False)
+    _, app = _new_app(tmp_path)  # start_scheduler=False
+    with TestClient(app) as client:
+        body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["scheduler"] == "stopped"
+    assert body["notifier"] == "disabled"
+    assert body["autobook"] == "disabled"
+
+
+def test_health_reports_running_and_insecure_without_silence(tmp_path, monkeypatch) -> None:
+    for var in ("TRA_AUTOBOOK_ENABLED",):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TRA_WEBHOOK_URL", "http://hooks.example.test/tra")  # cleartext
+    monkeypatch.setenv("TRA_WEBHOOK_SECRET", "token")
+    database = Database(tmp_path / "api.db", encryption_key=Fernet.generate_key().decode())
+    app = create_app(
+        database, TokenManager("t" * 32), start_scheduler=True, autobook=object()
+    )
+    with TestClient(app) as client:
+        assert client.get("/health").json()["scheduler"] == "running"
+        assert client.get("/health").json()["notifier"] == "insecure"
+        assert client.get("/health").json()["autobook"] == "enabled"
+    assert not app.state.scheduler.is_running  # lifespan shut it down again

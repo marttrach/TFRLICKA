@@ -127,3 +127,23 @@ def test_tool_errors_carry_the_dashboard_message(client) -> None:
     with pytest.raises(AssertionError, match="出發站與抵達站不可相同"):
         call(client, "search_trains", from_station="1000-臺北", to_station="1000-臺北",
              date=(datetime.now(TAIWAN_TZ).date() + timedelta(days=1)).isoformat())
+
+
+def test_every_registered_agent_tool_is_async(tmp_path, monkeypatch) -> None:
+    """Tools run blocking DB/TDX/browser work in a worker thread, so none of
+    them may be a plain sync function — it would freeze the event loop."""
+    import inspect
+
+    monkeypatch.setenv("TRA_AGENT_TOKEN", TOKEN)
+    monkeypatch.setenv("TRA_AGENT_EMAIL", "me@example.com")
+    database = Database(tmp_path / "async-tools.db", encryption_key=Fernet.generate_key().decode())
+    app = create_app(
+        database, TokenManager("t" * 32), tdx_client=FakeTdx(), start_scheduler=False
+    )
+    tools = app.state.agent._tool_manager.list_tools()  # the tools registry itself
+    assert {tool.name for tool in tools} == {
+        "find_stations", "search_trains", "create_booking_task", "list_tasks",
+        "get_booking_link", "report_booked", "cancel_task",
+        "set_auto_submit", "try_auto_booking",
+    }
+    assert all(tool.is_async and inspect.iscoroutinefunction(tool.fn) for tool in tools)

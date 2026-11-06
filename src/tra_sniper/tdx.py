@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import os
 import re
@@ -89,7 +91,7 @@ def _county_of(record: dict[str, Any]) -> str:
 
 
 def _mcp_post(
-    message: dict[str, Any], headers: dict[str, str]
+    message: dict[str, Any], headers: dict[str, str], timeout: float = 20.0
 ) -> tuple[str, dict[str, Any] | None]:
     """POST one JSON-RPC message; return (session id, reply or None)."""
     request = urllib.request.Request(
@@ -103,7 +105,7 @@ def _mcp_post(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             session_id = response.headers.get("mcp-session-id", "")
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
@@ -120,7 +122,7 @@ def _mcp_post(
         raise TdxError("TDX returned an unexpected response") from exc
 
 
-McpPost = Callable[[dict[str, Any], dict[str, str]], tuple[str, dict[str, Any] | None]]
+McpPost = Callable[..., tuple[str, dict[str, Any] | None]]
 
 
 @dataclass(slots=True)
@@ -141,6 +143,7 @@ class TdxClient:
         mcp_post: McpPost = _mcp_post,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        link_timeout_seconds: float | None = None,
     ) -> None:
         self.client_id = client_id if client_id is not None else os.getenv("TDX_CLIENT_ID", "")
         self.client_secret = (
@@ -153,6 +156,12 @@ class TdxClient:
         self.cache_ttl_seconds = max(configured_ttl, 0.01) * 3600
         self.transport = transport or UrllibTransport()
         self.mcp_post = mcp_post
+        # The booking link sits on the reminder hot path, so it gets a short
+        # leash instead of _mcp_post's general 20 s; a stalled TDX must not
+        # hold the round hostage.
+        if link_timeout_seconds is None:
+            link_timeout_seconds = float(os.getenv("TDX_LINK_TIMEOUT_SECONDS", "5"))
+        self.link_timeout_seconds = link_timeout_seconds
         self.clock = clock
         self.sleep = sleep
         self._token: CacheEntry | None = None
@@ -199,7 +208,12 @@ class TdxClient:
                 )
             except HttpError as exc:
                 if exc.status == 401:
+                    # Token revoked or expired server-side: drop it and retry
+                    # once with a fresh one instead of failing the round.
                     self._token = None
+                    if attempt == 2:
+                        raise TdxError("TDX is temporarily unavailable") from exc
+                    continue
                 if exc.status != 429 or attempt == 2:
                     raise TdxError("TDX is temporarily unavailable") from exc
                 # TDX testing showed that calls less than four seconds apart can
@@ -232,6 +246,17 @@ class TdxClient:
         self._timetables[key] = CacheEntry(records, now + self.cache_ttl_seconds)
         return records
 
+    def _link_post(self) -> McpPost:
+        # Tests and older callers may hand in an mcp_post without a timeout
+        # parameter; give the short leash only where it is understood.
+        try:
+            understands = "timeout" in inspect.signature(self.mcp_post).parameters
+        except (TypeError, ValueError):  # exotic callables just get the default
+            understands = False
+        if understands:
+            return functools.partial(self.mcp_post, timeout=self.link_timeout_seconds)
+        return self.mcp_post
+
     def booking_link(
         self, start_station: str, end_station: str, train_no: str, ride_date: str, quantity: int
     ) -> str:
@@ -243,7 +268,8 @@ class TdxClient:
         if not self.configured:
             raise TdxError("TDX credentials are not configured")
         auth = {"cid": self.client_id, "cst": self.client_secret}
-        session_id, _ = self.mcp_post(
+        post = self._link_post()
+        session_id, _ = post(
             {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -257,8 +283,8 @@ class TdxClient:
             auth,
         )
         headers = {**auth, "mcp-session-id": session_id}
-        self.mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, headers)
-        _, reply = self.mcp_post(
+        post({"jsonrpc": "2.0", "method": "notifications/initialized"}, headers)
+        _, reply = post(
             {
                 "jsonrpc": "2.0",
                 "id": 2,

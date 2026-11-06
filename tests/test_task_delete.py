@@ -90,3 +90,49 @@ def test_a_monitoring_task_can_still_be_cancelled(tmp_path) -> None:
         database.update_task_status(task_id, 1, "monitoring")
 
         assert client.post(f"/tasks/{task_id}/cancel", headers=headers).status_code == 204
+
+
+def test_delete_refuses_while_a_booking_round_holds_the_task(tmp_path) -> None:
+    _database, app = _app(tmp_path)
+    with TestClient(app) as client:
+        headers = _register(client)
+        task_id = _create(client, headers)["id"]
+        scheduler = app.state.scheduler
+        assert scheduler._claim(task_id)  # a browser round is on the official page
+
+        refused = client.delete(f"/tasks/{task_id}", headers=headers)
+        assert refused.status_code == 409
+        assert "自動訂票" in refused.json()["detail"]
+        assert len(client.get("/tasks", headers=headers).json()) == 1  # row survives
+
+        scheduler._release(task_id)
+        assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 204
+
+
+def test_delete_refuses_a_task_left_in_autobooking(tmp_path) -> None:
+    database, app = _app(tmp_path)
+    with TestClient(app) as client:
+        headers = _register(client)
+        task_id = _create(client, headers)["id"]
+        database.update_task_status(task_id, 1, "autobooking")
+
+        assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 409
+        database.update_task_status(task_id, 1, "monitoring")
+        assert client.delete(f"/tasks/{task_id}", headers=headers).status_code == 204
+
+
+def test_a_reported_code_still_completes_a_cancelled_task(tmp_path) -> None:
+    # The person may have booked by hand before cancelling; report_booked keeps
+    # its carve-out (only the scheduler's automated writes are guarded).
+    _, app = _app(tmp_path)
+    with TestClient(app) as client:
+        headers = _register(client)
+        task_id = _create(client, headers)["id"]
+        assert client.post(f"/tasks/{task_id}/cancel", headers=headers).status_code == 204
+
+        done = client.post(
+            f"/tasks/{task_id}/booked", headers=headers, json={"booking_code": "ab123456"}
+        )
+        assert done.status_code == 200
+        assert done.json()["status"] == "completed"
+        assert done.json()["booking_code"] == "AB123456"

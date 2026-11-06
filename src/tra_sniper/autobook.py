@@ -146,14 +146,25 @@ class OcrChain:
 
 @dataclass(frozen=True, slots=True)
 class SubmitResult:
-    """Outcome of one auto-submit attempt. ``reason`` explains any failure."""
+    """Outcome of one auto-submit attempt. ``reason`` explains any failure.
+
+    ``unknown`` marks the one failure the scheduler must never re-queue: the
+    訂票 click happened and the final page could not be read, so a second
+    attempt might book a second real, paid ticket.
+    """
 
     ok: bool
     booking_code: str | None = None
     reason: str = ""
+    unknown: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "booking_code": self.booking_code, "reason": self.reason}
+        return {
+            "ok": self.ok,
+            "booking_code": self.booking_code,
+            "reason": self.reason,
+            "unknown": self.unknown,
+        }
 
 
 def parse_booking_outcome(page_text: str) -> SubmitResult:
@@ -228,7 +239,9 @@ class PlaywrightAutoSubmitter:
             )
             return SubmitResult(False, reason=f"瀏覽器錯誤：{str(exc).splitlines()[0]}")
 
-    def _submit(self, playwright: Any, official_url: str, identity: str, error_type: Any) -> SubmitResult:
+    def _submit(
+        self, playwright: Any, official_url: str, identity: str, error_type: Any
+    ) -> SubmitResult:
         browser = playwright.chromium.launch(
             headless=self.headless,
             args=[
@@ -277,34 +290,54 @@ class PlaywrightAutoSubmitter:
             # The v3 token is minted on this interaction; wait for the result
             # page instead of a fixed sleep. A datacenter IP answers with the
             # picture-code fallback instead — read it, OCR it, try again.
-            submit_button.click()
-            deadline = self.timeout_ms / 1000.0
-            waited = 0.0
-            captcha_attempts = 0
-            while waited < deadline:
-                content = page.content()
-                outcome = parse_booking_outcome(content)
-                if outcome.ok or "官方頁面回報" in outcome.reason:
+            # The click is issued on the next line; from there on a raised
+            # browser error can only mean an outcome we cannot read.
+            try:
+                submit_button.click()
+                deadline = self.timeout_ms / 1000.0
+                waited = 0.0
+                captcha_attempts = 0
+                while waited < deadline:
+                    content = page.content()
+                    outcome = parse_booking_outcome(content)
+                    if outcome.ok or "官方頁面回報" in outcome.reason:
+                        return outcome
+                    if (
+                        self.captcha_solver is not None
+                        and page_shows_captcha(content)
+                        and captcha_attempts < self.captcha_retries
+                    ):
+                        captcha_attempts += 1
+                        if self._solve_captcha(page):
+                            outcome = parse_booking_outcome(page.content())
+                            if outcome.ok or "官方頁面回報" in outcome.reason:
+                                return outcome
+                            continue
+                    self._sleep(1.0)
+                    waited += 1.0
+                outcome = parse_booking_outcome(page.content())
+                if outcome.ok:
                     return outcome
-                if (
-                    self.captcha_solver is not None
-                    and page_shows_captcha(content)
-                    and captcha_attempts < self.captcha_retries
-                ):
-                    captcha_attempts += 1
-                    if self._solve_captcha(page):
-                        outcome = parse_booking_outcome(page.content())
-                        if outcome.ok or "官方頁面回報" in outcome.reason:
-                            return outcome
-                        continue
-                self._sleep(1.0)
-                waited += 1.0
-            outcome = parse_booking_outcome(page.content())
-            if outcome.ok:
-                return outcome
-            if captcha_attempts and not page_shows_captcha(page.content()):
-                raise error_type("圖形驗證碼連續失敗")
-            raise error_type(outcome.reason or "等了很久仍讀不到訂票結果")
+                # The click happened and the page cannot be read: outcome unknown.
+                # Raising here used to hide that behind an error_type the scheduler
+                # re-queued — a second accepted submit would book a second ticket.
+                if captcha_attempts and not page_shows_captcha(page.content()):
+                    return SubmitResult(False, unknown=True, reason="圖形驗證碼連續失敗")
+                return SubmitResult(
+                    False, unknown=True, reason=outcome.reason or "等了很久仍讀不到訂票結果"
+                )
+            except error_type as exc:
+                # click() raising usually means the click WAS accepted and the
+                # navigation detached the page — a retry could book a second
+                # real, paid ticket. Everything raised from the moment the
+                # click was issued is an unknown outcome, never a clean failure.
+                logger.warning(
+                    "auto-submit browser error after the click; outcome unknown",
+                    extra={"event": "autobook.browser_error_post_click"},
+                    exc_info=True,
+                )
+                message = str(exc).splitlines()[0] if str(exc) else "點擊後瀏覽器錯誤"
+                return SubmitResult(False, unknown=True, reason=f"瀏覽器錯誤：{message}")
         finally:
             browser.close()
 

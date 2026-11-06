@@ -2,6 +2,7 @@ import hmac
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.routing import Route
 
 from .agent import INSTRUCTIONS as AGENT_INSTRUCTIONS
@@ -58,8 +60,17 @@ DEFAULT_DEV_ORIGINS = (
 )
 LOGIN_RETRY_AFTER_SECONDS = 15 * 60
 OPEN_STATUSES = frozenset({"scheduled", "monitoring", "waiting_human"})
+# Reminders for one task repeat every poll interval; a TDX link asked for
+# twice inside the TTL is one question to TDX, not two. A failed call gets a
+# much shorter tombstone so a recovering TDX is retried almost at once.
+OFFICIAL_LINK_TTL_SECONDS = 60.0
+OFFICIAL_LINK_FAIL_TTL_SECONDS = 15.0
 logger = logging.getLogger(__name__)
 DUMMY_PASSWORD_HASH = hash_password("not-a-real-user-password")
+
+
+def _link_clock() -> float:
+    return time.monotonic()  # monkeypatch seam for TTL tests
 
 
 class LoginCredentials(BaseModel):
@@ -318,7 +329,19 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "scheduler": "human-in-the-loop"}
+        notifier = scheduler.notifier
+        if not notifier.enabled:
+            notifier_state = "disabled"
+        elif not notifier.transport_is_safe:
+            notifier_state = "insecure"
+        else:
+            notifier_state = "enabled"
+        return {
+            "status": "ok",
+            "scheduler": "running" if scheduler.is_running else "stopped",
+            "notifier": notifier_state,
+            "autobook": "enabled" if scheduler.autobook is not None else "disabled",
+        }
 
     @app.get("/stations")
     def stations() -> list[dict[str, str]]:
@@ -724,7 +747,33 @@ def create_app(
         return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
 
     scheduler.notifier.booking_url_for = _open_link_url
-    scheduler.notifier.official_url_for = lambda task: _official_link(task.id, task.user_id)[0]
+    # Reminders for one task repeat every poll interval; only the first one
+    # inside the TTL pays for a TDX round-trip. A raised failure is remembered
+    # briefly (empty url) so the next reminders do not hammer a down TDX, and
+    # retry as soon as the tombstone expires. notifications._official_url
+    # keeps swallowing whatever this raises.
+    official_links: dict[str, tuple[str, float]] = {}
+    official_links_lock = threading.Lock()
+
+    def _official_url_for_reminder(task: TaskRecord) -> str:
+        now = _link_clock()
+        with official_links_lock:
+            hit = official_links.get(task.id)
+            if hit is not None and hit[1] > now:
+                if not hit[0]:
+                    raise TdxError("官方訂票連結暫時無法取得")
+                return hit[0]
+        try:
+            url = _official_link(task.id, task.user_id)[0]
+        except Exception:
+            with official_links_lock:
+                official_links[task.id] = ("", _link_clock() + OFFICIAL_LINK_FAIL_TTL_SECONDS)
+            raise
+        with official_links_lock:
+            official_links[task.id] = (url, _link_clock() + OFFICIAL_LINK_TTL_SECONDS)
+        return url
+
+    scheduler.notifier.official_url_for = _official_url_for_reminder
 
     def _cancel_task(task_id: str, user_id: int) -> None:
         task = db.get_task(task_id, user_id)
@@ -788,6 +837,10 @@ def create_app(
         task = db.get_task(task_id, user.id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        # Deleting mid-submit would strand a possibly-accepted ticket with no
+        # task and no code to report; a 'autobooking' row is the crash twin.
+        if scheduler.is_busy(task_id) or task.status == "autobooking":
+            raise HTTPException(status_code=409, detail="這個任務正在自動訂票中，請稍後再刪除")
         db.delete_task(task_id, user.id)
         return Response(status_code=204)
 
@@ -801,6 +854,8 @@ def create_app(
 
     app.state.database = db
     app.state.scheduler = scheduler
+    app.state.agent = agent
+    app.state.official_links = official_links
 
     # ---- MCP tools for an AI agent ------------------------------------------
     # The agent acts as the dashboard account named by TRA_AGENT_EMAIL. Errors
@@ -831,10 +886,12 @@ def create_app(
             "monitor_until": task.monitor_until,
         }
 
-    @agent.tool()
-    def find_stations(keyword: str) -> list[dict[str, str]]:
-        """Find TRA stations by Chinese name, e.g. "板橋". Pass the returned
-        `value` (like "1020-板橋") to the other tools."""
+    # Every tool body touches SQLite, TDX or the browser — blocking calls that
+    # would freeze the event loop for the whole API. They run in worker threads
+    # and the tools themselves are thin awaitables (names, docstrings and
+    # return shapes unchanged).
+
+    def _find_stations(keyword: str) -> list[dict[str, str]]:
         keyword = keyword.strip().replace("台", "臺")
         found = [
             station for station in tdx.stations(POPULAR_STATIONS)
@@ -843,16 +900,18 @@ def create_app(
         return found[:20]
 
     @agent.tool()
-    def search_trains(
+    async def find_stations(keyword: str) -> list[dict[str, str]]:
+        """Find TRA stations by Chinese name, e.g. "板橋". Pass the returned
+        `value` (like "1020-板橋") to the other tools."""
+        return await run_in_threadpool(_find_stations, keyword)
+
+    def _search_trains(
         from_station: str,
         to_station: str,
         date: str,
-        start_time: str = "00:00",
-        end_time: str = "23:59",
+        start_time: str,
+        end_time: str,
     ) -> list[dict[str, Any]]:
-        """List trains departing between start_time and end_time on date
-        (YYYY-MM-DD, Taiwan time). Times are on the half hour, or 23:59.
-        Stations are `value`s from find_stations. Says nothing about free seats."""
         body = SuggestionRequest(
             start_station=from_station, end_station=to_station, ride_date=date,
             start_time=start_time, end_time=end_time,
@@ -872,31 +931,32 @@ def create_app(
         )
 
     @agent.tool()
-    def create_booking_task(
+    async def search_trains(
+        from_station: str,
+        to_station: str,
+        date: str,
+        start_time: str = "00:00",
+        end_time: str = "23:59",
+    ) -> list[dict[str, Any]]:
+        """List trains departing between start_time and end_time on date
+        (YYYY-MM-DD, Taiwan time). Times are on the half hour, or 23:59.
+        Stations are `value`s from find_stations. Says nothing about free seats."""
+        return await run_in_threadpool(
+            _search_trains, from_station, to_station, date, start_time, end_time
+        )
+
+    def _create_booking_task(
         from_station: str,
         to_station: str,
         date: str,
         train_numbers: list[str],
-        quantity: int = 1,
-        start_at: str | None = None,
-        remind_every_minutes: int = 5,
-        monitor_until: str | None = None,
-        remind_once: bool = False,
-        auto_submit: bool = False,
+        quantity: int,
+        start_at: str | None,
+        remind_every_minutes: int,
+        monitor_until: str | None,
+        remind_once: bool,
+        auto_submit: bool,
     ) -> dict[str, Any]:
-        """Watch one to three train numbers on date (YYYY-MM-DD) for 1-6 tickets.
-
-        From start_at (ISO time, Taiwan time if no offset; default now) it sends
-        a webhook reminder every remind_every_minutes (min 1) until booked,
-        cancelled or monitor_until; remind_once sends a single reminder. The
-        returned official_url is the pre-filled TRA booking page; send it to
-        the person straight away (it expires within minutes).
-
-        auto_submit (needs TRA_AUTOBOOK_ENABLED) makes every round open the
-        official page in a headless browser, enter the person's stored ID and
-        submit -- the page mints its own reCAPTCHA v3 token. A round that the
-        browser cannot finish falls back to the reminder, so booking is never
-        lost. Requires identity saved on the task."""
         def moment(value: str | None) -> datetime | None:
             if not value:
                 return None
@@ -930,55 +990,109 @@ def create_app(
             created["official_url_error"] = str(exc.detail)
         return created
 
+    @agent.tool()
+    async def create_booking_task(
+        from_station: str,
+        to_station: str,
+        date: str,
+        train_numbers: list[str],
+        quantity: int = 1,
+        start_at: str | None = None,
+        remind_every_minutes: int = 5,
+        monitor_until: str | None = None,
+        remind_once: bool = False,
+        auto_submit: bool = False,
+    ) -> dict[str, Any]:
+        """Watch one to three train numbers on date (YYYY-MM-DD) for 1-6 tickets.
+
+        From start_at (ISO time, Taiwan time if no offset; default now) it sends
+        a webhook reminder every remind_every_minutes (min 1) until booked,
+        cancelled or monitor_until; remind_once sends a single reminder. The
+        returned official_url is the pre-filled TRA booking page; send it to
+        the person straight away (it expires within minutes).
+
+        auto_submit (needs TRA_AUTOBOOK_ENABLED) makes every round open the
+        official page in a headless browser, enter the person's stored ID and
+        submit -- the page mints its own reCAPTCHA v3 token. A round that the
+        browser cannot finish falls back to the reminder, so booking is never
+        lost. Requires identity saved on the task."""
+        return await run_in_threadpool(
+            _create_booking_task,
+            from_station, to_station, date, train_numbers, quantity,
+            start_at, remind_every_minutes, monitor_until, remind_once, auto_submit,
+        )
+
     @agent.tool(name="list_tasks")
-    def agent_list_tasks() -> list[dict[str, Any]]:
+    async def agent_list_tasks() -> list[dict[str, Any]]:
         """All booking tasks, newest first, with status. Use get_booking_link
         for a task's booking page."""
-        return [_agent_task(task) for task in db.list_tasks(_agent_user().id)]
+        return await run_in_threadpool(
+            lambda: [_agent_task(task) for task in db.list_tasks(_agent_user().id)]
+        )
 
     @agent.tool()
-    def get_booking_link(task_id: str) -> dict[str, str]:
+    async def get_booking_link(task_id: str) -> dict[str, str]:
         """A fresh official booking link for the task, to send to the person now.
         It expires within minutes; the person enters their ID, passes the
         verification and presses 訂票 themselves."""
-        user = _agent_user()
-        url, train_no = _as_tool_error(lambda: _official_link(task_id, user.id))
-        return {"official_url": url, "train_no": train_no}
+
+        def _call() -> dict[str, str]:
+            user = _agent_user()
+            url, train_no = _as_tool_error(lambda: _official_link(task_id, user.id))
+            return {"official_url": url, "train_no": train_no}
+
+        return await run_in_threadpool(_call)
 
     @agent.tool(name="report_booked")
-    def agent_report_booked(task_id: str, booking_code: str) -> dict[str, Any]:
+    async def agent_report_booked(task_id: str, booking_code: str) -> dict[str, Any]:
         """Record the booking code (電腦代碼) the person got. Ends the reminders."""
         BookedReport(booking_code=booking_code)  # same validation as the dashboard
-        user = _agent_user()
-        return _agent_task(_as_tool_error(lambda: _report_booked(task_id, user.id, booking_code)))
+
+        def _call() -> dict[str, Any]:
+            user = _agent_user()
+            return _agent_task(_as_tool_error(lambda: _report_booked(task_id, user.id, booking_code)))
+
+        return await run_in_threadpool(_call)
 
     @agent.tool(name="cancel_task")
-    def agent_cancel_task(task_id: str) -> str:
+    async def agent_cancel_task(task_id: str) -> str:
         """Stop a task's reminders for good."""
-        user = _agent_user()
-        _as_tool_error(lambda: _cancel_task(task_id, user.id))
-        return "cancelled"
+
+        def _call() -> str:
+            user = _agent_user()
+            _as_tool_error(lambda: _cancel_task(task_id, user.id))
+            return "cancelled"
+
+        return await run_in_threadpool(_call)
 
     @agent.tool()
-    def set_auto_submit(task_id: str, enabled: bool) -> dict[str, Any]:
+    async def set_auto_submit(task_id: str, enabled: bool) -> dict[str, Any]:
         """Switch a task between auto-submit (the server books in a headless
         browser) and plain reminders. Use it to turn auto-booking on or off
         for an open task."""
-        user = _agent_user()
-        mode = MODE_AUTO_SUBMIT if enabled else MODE_BOOK_WHEN_AVAILABLE
-        if not _as_tool_error(lambda: db.set_task_mode(task_id, user.id, mode)):
-            raise ValueError("任務不存在或已結束")
-        updated = db.get_task(task_id, user.id)
-        if updated is None:
-            raise ValueError("任務不存在或已結束")
-        return _agent_task(updated)
+
+        def _call() -> dict[str, Any]:
+            user = _agent_user()
+            mode = MODE_AUTO_SUBMIT if enabled else MODE_BOOK_WHEN_AVAILABLE
+            if not _as_tool_error(lambda: db.set_task_mode(task_id, user.id, mode)):
+                raise ValueError("任務不存在或已結束")
+            updated = db.get_task(task_id, user.id)
+            if updated is None:
+                raise ValueError("任務不存在或已結束")
+            return _agent_task(updated)
+
+        return await run_in_threadpool(_call)
 
     @agent.tool()
-    def try_auto_booking(task_id: str) -> dict[str, Any]:
+    async def try_auto_booking(task_id: str) -> dict[str, Any]:
         """Attempt the auto-submit booking right now (do not wait for the next
         round). Returns ok, booking_code and reason; ok=True ends the task."""
-        user = _agent_user()
-        return _as_tool_error(lambda: _autobook_attempt(task_id, user.id))
+
+        def _call() -> dict[str, Any]:
+            user = _agent_user()
+            return _as_tool_error(lambda: _autobook_attempt(task_id, user.id))
+
+        return await run_in_threadpool(_call)
 
     # Mounted as a plain route so /mcp answers without a trailing-slash redirect.
     mcp_endpoint = agent.streamable_http_app().routes[0].endpoint

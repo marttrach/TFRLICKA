@@ -48,6 +48,12 @@ MIN_POLL_INTERVAL_SECONDS = 60
 # reopen a browser behind the person's back.
 POLLABLE_STATUSES = ("scheduled", "monitoring")
 
+# Statuses an automated round may claim from and may write 'completed' to.
+# 'autobooking' is the crash-durable sentinel written immediately before a
+# submit: the poll loop never claims it (it is not POLLABLE), but the round
+# already holding it may keep going and record its own outcome.
+AUTOBOOK_CLAIMABLE_STATUSES = ("autobooking", "monitoring", "scheduled")
+
 TASK_COLUMNS = (
     "id, user_id, status, scheduled_at, route, ride_date, order_type, "
     "created_at, updated_at, last_error, booking_code, mode, "
@@ -147,6 +153,12 @@ class Database:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # WAL keeps the API readable while the scheduler writes; a filesystem
+        # that refuses WAL (some tmpfs/network mounts) simply keeps the default.
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
         try:
             yield connection
             connection.commit()
@@ -640,22 +652,70 @@ class Database:
         *,
         last_error: str | None = None,
         booking_code: str | None = None,
+        only_from: tuple[str, ...] | None = None,
     ) -> bool:
         # COALESCE keeps a code that was already recorded: a later status update
         # must never erase the one output the whole booking flow exists to produce.
+        # only_from is the guard automated rounds use: a person who cancelled or
+        # deleted the task while a browser was on the page wins, and the stale
+        # round's write matches nothing.
+        guard = ""
+        params: list[Any] = [
+            status, utc_now(), last_error, booking_code, task_id, user_id,
+            status, status, booking_code,
+        ]
+        if only_from:
+            guard = f" AND status IN ({', '.join('?' for _ in only_from)})"
+            params.extend(only_from)
         with self.connect() as connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE tasks SET status = ?, updated_at = ?, last_error = ?,
                                  booking_code = COALESCE(?, booking_code)
                 WHERE id = ? AND user_id = ?
                   AND (status NOT IN ('cancelled', 'completed') OR status = ?
-                       OR (? = 'completed' AND ? IS NOT NULL))
+                       OR (? = 'completed' AND ? IS NOT NULL)){guard}
                 """,
-                (status, utc_now(), last_error, booking_code, task_id, user_id,
-                 status, status, booking_code),
+                params,
             )
         return cursor.rowcount == 1
+
+    def park_for_human_review(self, task_id: str, user_id: int, *, last_error: str) -> bool:
+        """One atomic write taking a task out of the poll loop for a person.
+
+        Status leaves POLLABLE_STATUSES and next_check_at goes NULL, so no
+        tick can claim it again; the reason stays visible on the task.
+        """
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tasks SET status = 'waiting_human', updated_at = ?, last_error = ?, "
+                "next_check_at = NULL WHERE id = ? AND user_id = ?",
+                (utc_now(), last_error, task_id, user_id),
+            )
+        return cursor.rowcount == 1
+
+    def list_tasks_by_status(self, status: str) -> list[TaskRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT {TASK_COLUMNS} FROM tasks WHERE status = ? ORDER BY created_at DESC",
+                (status,),
+            ).fetchall()
+        return [TaskRecord(**dict(row)) for row in rows]
+
+    def record_check_failure(self, task_id: str) -> int:
+        """Count one failed automated round; return the running total."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET check_failures = check_failures + 1 WHERE id = ?", (task_id,)
+            )
+            row = connection.execute(
+                "SELECT check_failures FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def clear_check_failures(self, task_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE tasks SET check_failures = 0 WHERE id = ?", (task_id,))
 
     def claim_due_checks(self, now: str | None = None, *, limit: int = 20) -> list[TaskRecord]:
         """Take ownership of every task due for a check, atomically.

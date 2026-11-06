@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from tra_sniper.api import POPULAR_STATIONS
-from tra_sniper.tdx import STATION_COUNTIES, HttpError, TdxClient
+from tra_sniper.tdx import STATION_COUNTIES, HttpError, TdxClient, TdxError
 
 
 class FakeTransport:
@@ -140,3 +140,43 @@ def test_shipped_counties_are_well_formed() -> None:
     # Taiwan has 22 divisions; the four with no TRA line must not appear.
     assert all(value.endswith(("市", "縣")) for value in STATION_COUNTIES.values())
     assert not {"南投縣", "澎湖縣", "金門縣", "連江縣"} & set(STATION_COUNTIES.values())
+
+
+class FlakyTokenTransport(FakeTransport):
+    """Fails every GET with 401 for the first `failures` attempts."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.token_requests = 0
+
+    def request_json(self, method, url, *, headers=None, form=None):
+        if method == "POST":
+            self.token_requests += 1
+            return {"access_token": f"token-{self.token_requests}", "expires_in": 3600}
+        if self.failures:
+            self.failures -= 1
+            raise HttpError(401)
+        return {"TrainTimetables": [{"TrainInfo": {"TrainNo": "110"}}]}
+
+
+def test_a_401_clears_the_token_and_gets_one_fresh_retry(tmp_path) -> None:
+    transport = FlakyTokenTransport(failures=1)
+    client = TdxClient(
+        client_id="id", client_secret="secret", data_dir=tmp_path, transport=transport
+    )
+    payload = client._get("DailyTrainTimetable/OD/1000/to/3300/2026-09-03")
+    assert payload == {"TrainTimetables": [{"TrainInfo": {"TrainNo": "110"}}]}
+    assert transport.token_requests == 2  # the stale token was dropped and re-minted
+
+
+def test_persistent_401s_become_a_safe_tdx_error(tmp_path) -> None:
+    transport = FlakyTokenTransport(failures=99)
+    client = TdxClient(
+        client_id="id", client_secret="secret", data_dir=tmp_path, transport=transport
+    )
+    try:
+        client._get("DailyTrainTimetable/OD/1000/to/3300/2026-09-03")
+        raise AssertionError("expected TdxError")
+    except TdxError:
+        pass

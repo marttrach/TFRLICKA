@@ -6,11 +6,22 @@ from typing import Any
 
 from .autobook import SubmitResult
 from .notifications import WebhookNotifier
-from .storage import MODE_AUTO_SUBMIT, MODE_MONITOR_ONLY, Database, TaskRecord
+from .storage import (
+    AUTOBOOK_CLAIMABLE_STATUSES,
+    MODE_AUTO_SUBMIT,
+    MODE_MONITOR_ONLY,
+    Database,
+    TaskRecord,
+)
 
 logger = logging.getLogger(__name__)
 
 FINISHED_STATUSES = frozenset({"completed", "cancelled", "expired"})
+
+# Rounds that end with a submit already clicked are never retried (R1); this
+# budget covers the rounds that failed before an accepted submit. After MAX
+# consecutive failures a person takes over instead of a browser burning tries.
+MAX_AUTOBOOK_FAILURES = 5
 
 
 class TaskScheduler:
@@ -19,9 +30,11 @@ class TaskScheduler:
     No seat-availability source exists, so a round cannot know whether a seat
     freed up; it reminds the person, whose browser does the booking. Reminders
     repeat every poll interval until the task is booked, cancelled or its
-    window closes. monitor_only reminds once. auto_submit asks the browser
-    submitter to book on the person's behalf first; the reminder only goes out
-    when that attempt could not finish the job.
+    window closes. monitor_only reminds once, and only parks after that
+    reminder actually left — a reminder nobody received is not a sent reminder.
+    auto_submit asks the browser submitter to book on the person's behalf
+    first; the reminder only goes out when that attempt could not finish the
+    job and did not end with a click whose outcome we cannot read.
     """
 
     def __init__(
@@ -47,10 +60,24 @@ class TaskScheduler:
         self._in_flight: set[str] = set()
         self._in_flight_lock = threading.Lock()
 
-    def tick(self) -> int:
+    @property
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def is_busy(self, task_id: str) -> bool:
+        """True while a browser round holds this task; deletions must wait."""
+        with self._in_flight_lock:
+            return task_id in self._in_flight
+
+    def tick(self, now: str | None = None) -> int:
         # Close finished windows before claiming work, so a task whose deadline
         # passed is never reminded one last time.
-        for expired in self.database.expire_finished_monitors():
+        closed = (
+            self.database.expire_finished_monitors(now)
+            if now is not None
+            else self.database.expire_finished_monitors()
+        )
+        for expired in closed:
             logger.info(
                 "monitor window closed",
                 extra={"event": "monitor.expired", "task_id": expired.id},
@@ -59,10 +86,15 @@ class TaskScheduler:
         # Claiming already schedules the next round, so a reminder that fails
         # to send is simply retried one interval later.
         due = []
-        for task in self.database.claim_due_checks():
+        claimed = (
+            self.database.claim_due_checks(now)
+            if now is not None
+            else self.database.claim_due_checks()
+        )
+        for task in claimed:
             if task.mode == MODE_AUTO_SUBMIT and self.autobook is not None:
                 self._start_autobook(task)
-            elif self._run_check(task):
+            else:
                 due.append(task)
         if due:
             logger.info(
@@ -70,20 +102,25 @@ class TaskScheduler:
                 extra={"event": "scheduler.tasks_claimed", "claimed_count": len(due)},
             )
         for task in due:
-            self._remind(task)
+            # Park monitor_only only after the reminder is out: a failed send
+            # leaves the task monitoring so the next interval retries it.
+            if self._remind(task) and task.mode == MODE_MONITOR_ONLY:
+                self.database.pause_monitoring(task.id, task.user_id, "waiting_human")
         return len(due)
 
-    def _remind(self, task: TaskRecord) -> None:
+    def _remind(self, task: TaskRecord) -> bool:
+        """True when the reminder may be counted as sent (or none exists)."""
         if not self.notifier.enabled:
-            return
+            return True  # a disabled notifier has no reminder to lose
         try:
             payload = self.database.get_task_payload(task.id, task.user_id)
-            self.notifier.notify(task, payload)
+            return bool(self.notifier.notify(task, payload))
         except Exception:
             logger.exception(
                 "task webhook failed; the next round reminds again",
                 extra={"event": "notification.webhook_failed", "task_id": task.id},
             )
+            return False
 
     def _start_autobook(self, task: TaskRecord) -> None:
         """Hand the round to a browser thread; skip it if one is still on it.
@@ -127,14 +164,50 @@ class TaskScheduler:
         try:
             with self._browser_slot:
                 current = self.database.get_task(task_id, user_id)
-                if current is None or current.status in FINISHED_STATUSES:
+                if current is None or current.status not in AUTOBOOK_CLAIMABLE_STATUSES:
                     return SubmitResult(False, reason="任務已結束，不再訂票")
-                result = self.autobook.submit(official_url, identity)
-                if result.ok:
-                    self.database.update_task_status(
-                        task_id, user_id, "completed",
-                        booking_code=result.booking_code or "AUTO", last_error=None,
+                # Last durable trace that a submit may have been accepted.
+                self.database.update_task_status(task_id, user_id, "autobooking")
+                try:
+                    result = self.autobook.submit(official_url, identity)
+                except Exception as exc:
+                    logger.exception(
+                        "auto-submit attempt raised; the outcome is unknown",
+                        extra={"event": "autobook.attempt_failed", "task_id": task_id},
                     )
+                    self._count_autobook_failure(current)
+                    self._park_unreadable(current, f"自動訂票出錯：{str(exc)[:80]}")
+                    return SubmitResult(False, unknown=True, reason=f"自動訂票出錯：{str(exc)[:80]}")
+                if result.ok:
+                    self.database.clear_check_failures(task_id)
+                    self.database.update_task_status(
+                        task_id,
+                        user_id,
+                        "completed",
+                        booking_code=result.booking_code or "AUTO",
+                        last_error=None,
+                        only_from=AUTOBOOK_CLAIMABLE_STATUSES,
+                    )
+                    return result
+                failures = self._count_autobook_failure(current)
+                if result.unknown:
+                    self._park_unreadable(
+                        current,
+                        f"自動訂票結果未知：{result.reason}；請至台鐵訂票紀錄確認後回報電腦代碼或取消任務",
+                    )
+                    return result
+                if self._strike_out(current, failures):
+                    return result
+                # A clean (un-clicked, understood) result reverts the sentinel.
+                self.database.update_task_status(
+                    task_id,
+                    user_id,
+                    current.status if current.status != "autobooking" else "monitoring",
+                    last_error=f"自動訂票未完成（{result.reason}），改發提醒",
+                )
+                # A failed manual try-now owes the person the same reminder a
+                # scheduled round would have sent.
+                self._remind(current)
                 return result
         finally:
             self._release(task_id)
@@ -157,22 +230,18 @@ class TaskScheduler:
         finally:
             self._release(task.id)
 
-    def _run_check(self, task: TaskRecord) -> bool:
-        """Return whether to remind now."""
-        if task.mode == MODE_MONITOR_ONLY:
-            # Reminding once means leaving the poll loop after this round.
-            return self.database.pause_monitoring(task.id, task.user_id, "waiting_human")
-        return True
-
     def _try_autobook(self, task: TaskRecord) -> bool:
-        """Book through the official page; True means the task is completed.
+        """Book through the official page; True means no reminder is owed.
 
-        Every failure path — no identity, no link, browser trouble, an
-        unrecognised page — lands in the same place: log why, keep the task in
-        the poll loop, and let the reminder reach a human instead. Auto-submit
-        may fail, but it may not lose the booking.
+        Every trouble found *before* the click — no identity, no link, page
+        state — lands in the same place: log why, keep the task in the poll
+        loop, and let the reminder reach a human instead. Auto-submit may
+        fail, but it may not lose the booking. Once the click may have
+        happened, an unreadable outcome never re-queues: it parks for a human,
+        because a second accepted submit books a second real, paid ticket.
         """
         assert self.autobook is not None
+        clicked = False
         try:
             payload = self.database.get_task_payload(task.id, task.user_id)
             identity = str(payload.get("identity", "")).strip()
@@ -181,12 +250,23 @@ class TaskScheduler:
                 reason = "任務沒有身分證資料" if not identity else "無法取得官方訂票連結"
                 self.database.update_task_status(task.id, task.user_id, task.status, last_error=f"自動訂票：{reason}，改發提醒")
                 return False
+            # Last re-read before the submit: cancelled/deleted/parked wins.
+            fresh = self.database.get_task(task.id, task.user_id)
+            if fresh is None or fresh.status not in AUTOBOOK_CLAIMABLE_STATUSES:
+                return True
+            # Durable trace that a submit may have been accepted (crash-safe).
+            self.database.update_task_status(task.id, task.user_id, "autobooking")
+            clicked = True
             result = self.autobook.submit(official_url, identity)
         except Exception as exc:
             logger.exception(
-                "auto-submit attempt failed; the reminder covers for it",
+                "auto-submit attempt failed",
                 extra={"event": "autobook.attempt_failed", "task_id": task.id},
             )
+            if clicked:
+                self._count_autobook_failure(task)
+                self._park_unreadable(task, f"自動訂票出錯：{str(exc)[:80]}")
+                return True
             try:
                 self.database.update_task_status(
                     task.id, task.user_id, task.status,
@@ -198,9 +278,17 @@ class TaskScheduler:
 
         if result.ok:
             code = result.booking_code or "AUTO"
-            self.database.update_task_status(
-                task.id, task.user_id, "completed", booking_code=code, last_error=None
-            )
+            self.database.clear_check_failures(task.id)
+            if not self.database.update_task_status(
+                task.id, task.user_id, "completed",
+                booking_code=code, last_error=None,
+                only_from=AUTOBOOK_CLAIMABLE_STATUSES,
+            ):
+                logger.warning(
+                    "a person ended this task while the browser was on the page",
+                    extra={"event": "autobook.completed_refused", "task_id": task.id},
+                )
+                return True
             booked = self.database.get_task(task.id, task.user_id)
             if booked is not None and self.notifier.enabled:
                 try:
@@ -224,7 +312,17 @@ class TaskScheduler:
                 "reason": result.reason,
             },
         )
+        failures = self._count_autobook_failure(task)
+        if result.unknown:
+            self._park_unreadable(
+                task,
+                f"自動訂票結果未知：{result.reason}；請至台鐵訂票紀錄確認後回報電腦代碼或取消任務",
+            )
+            return True
+        if self._strike_out(task, failures):
+            return True
         try:
+            # A clean (un-clicked, understood) result reverts the sentinel.
             self.database.update_task_status(
                 task.id, task.user_id, task.status,
                 last_error=f"自動訂票未完成（{result.reason}），改發提醒",
@@ -233,9 +331,84 @@ class TaskScheduler:
             pass
         return False
 
+    def _count_autobook_failure(self, task: TaskRecord) -> int:
+        try:
+            return self.database.record_check_failure(task.id)
+        except Exception:  # noqa: BLE001 - bookkeeping must never outrank the round
+            return 0
+
+    def _strike_out(self, task: TaskRecord, count: int) -> bool:
+        """Park the task once the strike budget is gone; True if parked."""
+        if count < MAX_AUTOBOOK_FAILURES:
+            return False
+        self._park(task, "自動訂票連續失敗,改由人工處理", "failed")
+        return True
+
+    def _park_unreadable(self, task: TaskRecord, reason: str) -> None:
+        """The 訂票 click may have been accepted and nobody read the page.
+
+        Never re-queue this outcome for another click; a person checks the
+        official 訂票紀錄 and reports the code or cancels.
+        """
+        self._park(
+            task,
+            f"{reason}；自動訂票結果未知，請至台鐵訂票紀錄確認後回報電腦代碼或取消任務",
+            "unknown",
+        )
+
+    def _park(self, task: TaskRecord, last_error: str, event: str) -> None:
+        logger.warning(
+            "auto-submit parked for human review",
+            extra={"event": f"autobook.{event}", "task_id": task.id},
+        )
+        try:
+            self.database.park_for_human_review(task.id, task.user_id, last_error=last_error)
+        except Exception:
+            logger.exception(
+                "could not park task for human review",
+                extra={"event": "autobook.park_failed", "task_id": task.id},
+            )
+        if self.notifier.enabled:
+            try:
+                self.notifier.notify_result(task, event, None)
+            except Exception:
+                logger.exception(
+                    "auto-submit result webhook failed",
+                    extra={"event": "notification.webhook_failed", "task_id": task.id},
+                )
+
+    def recover_unfinished_submissions(self) -> int:
+        """Park tasks left in 'autobooking' by an interrupted process.
+
+        Their submits may have been accepted before the crash, so they follow
+        the same rule as any unreadable outcome: no second click, a human
+        decides. 'autobooking' is not pollable, so the tick never re-claims.
+        """
+        try:
+            stale = self.database.list_tasks_by_status("autobooking")
+        except Exception:
+            logger.exception(
+                "startup recovery failed; the scheduler will continue",
+                extra={"event": "scheduler.recovery_failed"},
+            )
+            return 0
+        for task in stale:
+            self._park_unreadable(
+                task,
+                "自動訂票結果未知(進程曾中斷);請至台鐵訂票紀錄確認後回報電腦代碼或取消任務",
+            )
+        return len(stale)
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.is_running:
             return
+        if self.autobook is not None and not self.notifier.enabled:
+            logger.warning(
+                "auto-submit is enabled but no webhook is configured; "
+                "a parked task will wait on a human nobody is told about",
+                extra={"event": "autobook.no_notifier"},
+            )
+        self.recover_unfinished_submissions()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="tra-task-scheduler", daemon=True)
         self._thread.start()

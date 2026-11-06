@@ -299,3 +299,70 @@ def test_both_event_payloads_carry_the_agreed_fields() -> None:
     }
     assert result["status"] == "failed"
     assert result["booking_code"] is None
+
+
+# ---- R5: a monitor_only reminder is never lost to a paused task ---------------
+
+
+def _monitor_only_task(database, *, interval: int = 60):
+    from tra_sniper.models import BookingRequest
+    from tra_sniper.storage import MODE_MONITOR_ONLY
+
+    user = database.create_user("once@example.com", "hash")
+    booking_data = {
+        "identity": "A123456789",
+        "start_station": "1000-臺北",
+        "end_station": "3300-臺中",
+        "outbound": {
+            "ride_date": (datetime.now(UTC) + timedelta(days=2)).date().isoformat(),
+            "train_numbers": ["109"],
+        },
+    }
+    task = database.create_task(
+        user.id,
+        BookingRequest.from_dict(booking_data),
+        (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        booking_data,
+        mode=MODE_MONITOR_ONLY,
+        poll_interval_seconds=interval,
+    )
+    return user.id, task.id
+
+
+def test_monitor_only_parks_only_after_the_reminder_actually_left(tmp_path) -> None:
+    database = Database(tmp_path / "lost-remind.db")
+    user_id, task_id = _monitor_only_task(database)
+
+    state = {"fail": True, "sent": 0}
+
+    def sender(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+        if state["fail"]:
+            raise OSError("webhook unavailable")
+        state["sent"] += 1
+
+    notifier = WebhookNotifier("https://hooks.invalid", "secret", sender=sender)
+    scheduler = TaskScheduler(database, notifier=notifier)
+
+    assert scheduler.tick() == 1
+    task = database.get_task(task_id, user_id)
+    # The failed send must not have parked the task: it stays pollable, with
+    # the claim already having scheduled the retry one interval later.
+    assert task.status == "monitoring"
+    assert task.next_check_at is not None
+
+    state["fail"] = False
+    with database.connect() as connection:
+        connection.execute("UPDATE tasks SET next_check_at = NULL WHERE id = ?", (task_id,))
+    assert scheduler.tick() == 1
+    assert state["sent"] == 1
+    assert database.get_task(task_id, user_id).status == "waiting_human"
+
+
+def test_monitor_only_with_disabled_notifier_still_parks_once(tmp_path) -> None:
+    database = Database(tmp_path / "disabled-remind.db")
+    user_id, task_id = _monitor_only_task(database)
+    scheduler = TaskScheduler(database, notifier=WebhookNotifier())
+    assert scheduler.tick() == 1
+    assert database.get_task(task_id, user_id).status == "waiting_human"
+    # And it never comes back on its own: no loop without a webhook.
+    assert scheduler.tick() == 0

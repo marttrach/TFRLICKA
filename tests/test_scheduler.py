@@ -14,6 +14,9 @@ class QuietMonitorMixin:
     def claim_due_checks(self) -> list[object]:
         return []
 
+    def list_tasks_by_status(self, status: str) -> list[object]:
+        return []
+
 
 class FlakyDatabase(QuietMonitorMixin):
     def __init__(self) -> None:

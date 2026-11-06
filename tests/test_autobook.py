@@ -9,6 +9,7 @@ OCR chain and a duck-typed fake page.
 
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -24,10 +25,12 @@ from tra_sniper.autobook import (
     page_shows_captcha,
     parse_booking_outcome,
 )
+from tra_sniper.models import BookingRequest
 from tra_sniper.notifications import WebhookNotifier
-from tra_sniper.scheduler import TaskScheduler
+from tra_sniper.scheduler import MAX_AUTOBOOK_FAILURES, TaskScheduler
 from tra_sniper.storage import (
     MODE_AUTO_SUBMIT,
+    POLLABLE_STATUSES,
     Database,
 )
 
@@ -62,12 +65,20 @@ def test_parser_flags_unknown_pages_as_not_understood() -> None:
 
 
 class StubDb:
-    """The scheduler surface _try_autobook touches, with an assertion journal."""
+    """The scheduler surface _try_autobook touches, with an assertion journal.
+
+    Mechanical adaptation for the hardening spec: update_task_status accepts
+    the new keyword-only only_from guard, and the strike/park/list helpers the
+    scheduler now calls exist here as in-memory equivalents. No existing
+    assertion changed.
+    """
 
     def __init__(self, payload: dict) -> None:
         self.task = SimpleNamespace(id="t1", user_id=1, status="monitoring", mode=MODE_AUTO_SUBMIT)
         self.payload = payload
         self.statuses: list[tuple[str, str | None]] = []
+        self.check_failures = 0
+        self.parked: list[tuple[str, str]] = []
 
     def expire_finished_monitors(self):
         return []
@@ -81,17 +92,40 @@ class StubDb:
     def get_task(self, task_id, user_id):
         return self.task
 
-    def update_task_status(self, task_id, user_id, status, *, last_error=None, booking_code=None):
+    def update_task_status(
+        self, task_id, user_id, status, *, last_error=None, booking_code=None, only_from=None
+    ):
+        if only_from is not None and self.task.status not in only_from:
+            return False
         self.statuses.append((status, booking_code))
         self.task = SimpleNamespace(
             id=task_id, user_id=user_id, status=status, mode=self.task.mode,
-            booking_code=booking_code,
+            booking_code=booking_code, last_error=last_error,
         )
         return True
 
     def pause_monitoring(self, task_id, user_id, status):
         self.statuses.append((status, None))
         return True
+
+    def park_for_human_review(self, task_id, user_id, *, last_error):
+        self.parked.append((task_id, last_error))
+        self.statuses.append(("waiting_human", None))
+        self.task = SimpleNamespace(
+            id=task_id, user_id=user_id, status="waiting_human", mode=self.task.mode,
+            booking_code=None, last_error=last_error,
+        )
+        return True
+
+    def record_check_failure(self, task_id):
+        self.check_failures += 1
+        return self.check_failures
+
+    def clear_check_failures(self, task_id):
+        self.check_failures = 0
+
+    def list_tasks_by_status(self, status):
+        return [self.task] if self.task.status == status else []
 
 
 class StubSubmitter:
@@ -110,12 +144,15 @@ class RecordingNotifier(WebhookNotifier):
     def __init__(self) -> None:
         super().__init__()
         self.reminded: list[str] = []
+        self.results: list[tuple[str, str, str | None]] = []
 
     def notify(self, task, payload):
         self.reminded.append(task.id)
+        return True
 
     def notify_result(self, task, status, code):
-        pass
+        self.results.append((task.id, status, code))
+        return True
 
 
 def _scheduler(db, submitter) -> TaskScheduler:
@@ -400,3 +437,405 @@ def test_solve_captcha_without_readable_code_gives_up_quietly() -> None:
     )
     assert submitter._solve_captcha(page) is False
     assert page.verify.filled is None
+
+
+# ---- hardening spec: never re-book an unknown outcome (R1) -------------------
+
+
+def _scheduler_with(db, submitter, notifier) -> TaskScheduler:
+    notifier.official_url_for = lambda task: OFFICIAL
+    return TaskScheduler(db, notifier=notifier, autobook=submitter)  # type: ignore[arg-type]
+
+
+def test_submit_result_as_dict_carries_unknown() -> None:
+    assert SubmitResult(False).unknown is False
+    assert SubmitResult(False, unknown=True, reason="x").as_dict() == {
+        "ok": False, "booking_code": None, "reason": "x", "unknown": True,
+    }
+
+
+def test_sentinel_written_before_submit_and_clean_result_reverts() -> None:
+    db = StubDb({"identity": "A123456789"})
+    seen_at_submit: list[str] = []
+
+    class PeekingSubmitter(StubSubmitter):
+        def submit(self, url, identity):
+            seen_at_submit.append(db.task.status)
+            return super().submit(url, identity)
+
+    submitter = PeekingSubmitter(SubmitResult(False, reason="已售完"))
+    scheduler = _scheduler_with(db, submitter, RecordingNotifier())
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    # The durable trace exists before the click can be accepted...
+    assert seen_at_submit == ["autobooking"]
+    # ...and a clean (understood) result puts the task back in the poll loop.
+    assert db.task.status == "monitoring"
+    # The poll loop must never hand out an 'autobooking' task.
+    assert "autobooking" not in POLLABLE_STATUSES
+
+
+def test_stale_autobooking_task_is_never_claimed(tmp_path) -> None:
+    db = Database(tmp_path / "sentinel.db", encryption_key=Fernet.generate_key().decode())
+    user = db.create_user("a@b.com", "hash")
+    now = datetime.now(UTC)
+    task = db.create_task(
+        user.id, BookingRequest.from_dict(_booking()),
+        (now - timedelta(minutes=5)).isoformat(), _booking(), mode=MODE_AUTO_SUBMIT,
+    )
+    db.claim_due_checks(now.isoformat())
+    db.update_task_status(task.id, user.id, "autobooking")
+    later = (now + timedelta(hours=1)).isoformat()
+    assert db.claim_due_checks(later) == []
+
+
+def _boom_submitter():
+    class BoomSubmitter(StubSubmitter):
+        def submit(self, url, identity):
+            self.calls.append((url, identity))
+            raise RuntimeError("browser died after the click")
+
+    return BoomSubmitter(SubmitResult(True))
+
+
+def test_raising_submitter_parks_for_human_and_notifies_unknown_once() -> None:
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    scheduler = _scheduler_with(db, _boom_submitter(), notifier)
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    assert db.task.status == "waiting_human"
+    assert len(db.parked) == 1 and "自動訂票出錯" in db.parked[0][1]
+    assert notifier.results == [("t1", "unknown", None)]
+    assert notifier.reminded == []  # parked, never silently re-queued
+
+
+def test_unknown_submit_result_parks_for_human_and_notifies_unknown_once() -> None:
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    submitter = StubSubmitter(SubmitResult(False, unknown=True, reason="讀不到訂票結果（頁面可能已改版）"))
+    scheduler = _scheduler_with(db, submitter, notifier)
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    assert submitter.calls == [(OFFICIAL, "A123456789")]
+    assert db.task.status == "waiting_human"
+    assert len(db.parked) == 1 and "自動訂票結果未知" in db.parked[0][1]
+    assert notifier.results == [("t1", "unknown", None)]
+    assert notifier.reminded == []
+
+
+def test_try_now_unknown_parks_and_does_not_remind() -> None:
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    submitter = StubSubmitter(SubmitResult(False, unknown=True, reason="圖形驗證碼連續失敗"))
+    scheduler = _scheduler_with(db, submitter, notifier)
+    result = scheduler.autobook_now("t1", 1, OFFICIAL, "A123456789")
+    assert result is not None and result.unknown and not result.ok
+    assert db.task.status == "waiting_human"
+    assert notifier.results == [("t1", "unknown", None)]
+    assert notifier.reminded == []
+
+
+def test_startup_recovery_parks_stale_autobooking_without_resubmitting(tmp_path) -> None:
+    db = Database(tmp_path / "recover.db", encryption_key=Fernet.generate_key().decode())
+    user = db.create_user("a@b.com", "hash")
+    now = datetime.now(UTC)
+    task = db.create_task(
+        user.id, BookingRequest.from_dict(_booking()),
+        (now - timedelta(minutes=5)).isoformat(), _booking(), mode=MODE_AUTO_SUBMIT,
+    )
+    db.claim_due_checks(now.isoformat())
+    db.update_task_status(task.id, user.id, "autobooking")
+
+    notifier = RecordingNotifier()
+    submitter = StubSubmitter(SubmitResult(True, booking_code="A1234567"))
+    scheduler = TaskScheduler(db, notifier=notifier, autobook=submitter, interval_seconds=300)
+    assert scheduler.recover_unfinished_submissions() == 1
+    parked = db.get_task(task.id, user.id)
+    assert parked.status == "waiting_human"
+    assert "進程曾中斷" in parked.last_error
+    assert notifier.results == [(task.id, "unknown", None)]
+    # The tick neither reminds nor re-books the parked task.
+    assert scheduler.tick() == 0
+    assert submitter.calls == []
+
+
+def test_start_recovers_before_the_tick_loop(tmp_path) -> None:
+    db = Database(tmp_path / "recover2.db", encryption_key=Fernet.generate_key().decode())
+    user = db.create_user("a@b.com", "hash")
+    now = datetime.now(UTC)
+    task = db.create_task(
+        user.id, BookingRequest.from_dict(_booking()),
+        (now - timedelta(minutes=5)).isoformat(), _booking(), mode=MODE_AUTO_SUBMIT,
+    )
+    db.claim_due_checks(now.isoformat())
+    db.update_task_status(task.id, user.id, "autobooking")
+    scheduler = TaskScheduler(
+        db, notifier=RecordingNotifier(),
+        autobook=StubSubmitter(SubmitResult(True)), interval_seconds=3600,
+    )
+    scheduler.start()  # recovery runs synchronously, before the tick loop
+    try:
+        assert db.get_task(task.id, user.id).status == "waiting_human"
+    finally:
+        scheduler.stop()
+
+
+# ---- round bail-out before the click (R2c) -----------------------------------
+
+
+def test_round_rechecks_status_before_the_submit() -> None:
+    db = StubDb({"identity": "A123456789"})
+    reads = {"n": 0}
+    original_get_task = db.get_task
+
+    def get_task(task_id, user_id):
+        reads["n"] += 1
+        task = original_get_task(task_id, user_id)
+        if reads["n"] >= 2:  # cancelled after the queue check, before the click
+            return SimpleNamespace(
+                id=task_id, user_id=user_id, status="cancelled", mode=MODE_AUTO_SUBMIT
+            )
+        return task
+
+    db.get_task = get_task
+    submitter = StubSubmitter(SubmitResult(True))
+    scheduler = _scheduler_with(db, submitter, RecordingNotifier())
+    scheduler._autobook_round(db.task)
+    assert submitter.calls == []
+    assert scheduler.notifier.reminded == []  # released everything, owed nothing
+
+
+# ---- strike budget (R6) --------------------------------------------------------
+
+
+def test_five_consecutive_failures_park_the_task_and_stop_submitting() -> None:
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    submitter = StubSubmitter(SubmitResult(False, reason="瀏覽器錯誤"))
+    scheduler = _scheduler_with(db, submitter, notifier)
+    for _ in range(MAX_AUTOBOOK_FAILURES + 2):
+        db.task = SimpleNamespace(
+            id="t1", user_id=1,
+            # A parked task stays parked; the loop only re-arms while pollable.
+            status="monitoring" if db.task.status not in ("waiting_human", "completed")
+            else db.task.status,
+            mode=MODE_AUTO_SUBMIT,
+        )
+        scheduler.tick()
+        _wait_for_browser_rounds()
+    assert len(submitter.calls) == MAX_AUTOBOOK_FAILURES  # no 6th submit
+    assert db.task.status == "waiting_human"
+    assert notifier.results == [("t1", "failed", None)]  # told the human once
+
+
+def test_success_clears_the_failure_counter() -> None:
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    submitter = StubSubmitter(SubmitResult(False, reason="瀏覽器錯誤"))
+    scheduler = _scheduler_with(db, submitter, notifier)
+    for _ in range(2):
+        scheduler.tick()
+        _wait_for_browser_rounds()
+    assert db.check_failures == 2
+    submitter.result = SubmitResult(True, booking_code="A1234567")
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    assert db.task.status == "completed"
+    assert db.check_failures == 0
+
+
+def test_start_warns_when_autobook_has_no_notifier(caplog) -> None:
+    import logging
+
+    db = StubDb({"identity": "A123456789"})
+    scheduler = TaskScheduler(
+        db, notifier=WebhookNotifier(), autobook=StubSubmitter(SubmitResult(True)),
+        interval_seconds=300,
+    )
+    with caplog.at_level(logging.WARNING, logger="tra_sniper.scheduler"):
+        scheduler.start()
+        scheduler.stop()
+    assert "webhook" in caplog.text
+
+
+# ---- manual try-now reminds on failure (R10) -----------------------------------
+
+
+def test_try_now_failure_sends_exactly_one_reminder() -> None:
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    submitter = StubSubmitter(SubmitResult(False, reason="已售完"))
+    scheduler = _scheduler_with(db, submitter, notifier)
+    result = scheduler.autobook_now("t1", 1, OFFICIAL, "A123456789")
+    assert result is not None and not result.ok and not result.unknown
+    assert notifier.reminded == ["t1"]
+    assert notifier.results == []
+    assert db.task.status == "monitoring"  # sentinel reverted, still pollable
+
+
+# ---- post-click unknown inside the submitter itself (R1b) ----------------------
+
+
+def _fake_playwright(monkeypatch, page, error_type=RuntimeError):
+    import sys
+    import types
+
+    class FakeBrowser:
+        def close(self):
+            pass
+
+        def new_context(self, **kwargs):
+            return FakeContext()
+
+    class FakeContext:
+        def set_default_timeout(self, timeout):
+            pass
+
+        def add_init_script(self, script):
+            pass
+
+        def new_page(self):
+            return page
+
+    class FakePlaywright:
+        class chromium:  # playwright's own spelling
+            @staticmethod
+            def launch(**kwargs):
+                return FakeBrowser()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    module = types.ModuleType("playwright.sync_api")
+    module.Error = error_type
+    module.sync_playwright = lambda: FakePlaywright()
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", module)
+
+
+class _Clickable:
+    def __init__(self):
+        self.clicked = False
+
+    def is_visible(self):
+        return True
+
+    def click(self):
+        self.clicked = True
+
+    def type(self, text, delay=0):
+        pass
+
+
+class _DeadPage:
+    url = "https://tb.trans.railway.gov.tw/tra-tip-web/tip/tip001/tip121/query"
+
+    def __init__(self, contents):
+        self._contents = list(contents)
+        self.identity = _Clickable()
+        self.button = _Clickable()
+
+    def goto(self, url, **kwargs):
+        pass
+
+    def content(self):
+        if len(self._contents) > 1:
+            return self._contents.pop(0)
+        return self._contents[-1]
+
+    def query_selector(self, selector):
+        if selector == "input#pid":
+            return self.identity
+        if selector == "form#queryForm button[type=submit]":
+            return self.button
+        return None
+
+
+def test_post_click_unreadable_page_returns_unknown_not_raise(monkeypatch) -> None:
+    page = _DeadPage(["<html>請先選擇乘車日期</html>"])
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(
+        timeout_ms=10, sleeper=lambda seconds: None, captcha_solver=None
+    )
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, True)
+    assert "訂票結果" in result.reason
+    assert page.button.clicked  # the click really happened
+
+
+def test_post_click_captcha_strikes_out_as_unknown(monkeypatch) -> None:
+    # The loop sees the picture code (so the click + captcha attempts happen);
+    # the final page no longer shows it: strikes without progress are unknown.
+    page = _DeadPage([
+        "<html>請輸入下圖驗證碼</html>", "<html>出了點問題</html>",
+    ])
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+
+    class NeverSolves:
+        def solve(self, image_path):
+            return None
+
+    submitter = PlaywrightAutoSubmitter(
+        timeout_ms=100, sleeper=lambda seconds: None,
+        captcha_solver=NeverSolves(), captcha_retries=1,
+    )
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, True)
+
+
+def test_post_click_official_failure_page_stays_a_clean_failure(monkeypatch) -> None:
+    # A confirmed 已售完 page means no ticket was accepted: unknown=False,
+    # so the task keeps its normal reminder/retry life.
+    page = _DeadPage(["<html>此車次已售完，請改選其他時段</html>"])
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(timeout_ms=10, sleeper=lambda seconds: None)
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, False)
+    assert "已售完" in result.reason
+
+
+def test_post_click_browser_error_is_unknown_not_clean_failure(monkeypatch) -> None:
+    # AUDIT-1: a click() that raises the playwright Error (the accepted click
+    # navigated and detached the button) must never return a clean failure,
+    # or the scheduler re-queues it and books a second real ticket.
+    class Boom(_Clickable):
+        def click(self):
+            raise RuntimeError("Element is not attached to the DOM")
+
+    page = _DeadPage(["<html>請先選擇乘車日期</html>"])
+    page.button = Boom()
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(timeout_ms=10, sleeper=lambda seconds: None)
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, True)
+    assert "瀏覽器錯誤" in result.reason
+
+    # The scheduler honours that flag: parked for a human, never re-queued.
+    db = StubDb({"identity": "A123456789"})
+    notifier = RecordingNotifier()
+    scheduler = _scheduler_with(db, StubSubmitter(result), notifier)
+    scheduler.tick()
+    _wait_for_browser_rounds()
+    assert db.task.status == "waiting_human"
+    assert notifier.results == [("t1", "unknown", None)]
+    assert notifier.reminded == []
+
+
+def test_pre_click_browser_error_stays_a_clean_failure(monkeypatch) -> None:
+    # The audit's boundary: errors BEFORE the click was issued stay unknown=False
+    # (nothing could have been accepted), so the task keeps its reminder life.
+    class Boom(_Clickable):
+        def type(self, text, delay=0):
+            raise RuntimeError("page navigated away")
+
+    page = _DeadPage(["<html>請先選擇乘車日期</html>"])
+    page.identity = Boom()
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(timeout_ms=10, sleeper=lambda seconds: None)
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, False)
+    assert "瀏覽器錯誤" in result.reason
