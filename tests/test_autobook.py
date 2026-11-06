@@ -448,6 +448,15 @@ def test_parse_booking_outcome_reads_the_live_tip115_page() -> None:
     assert result.ok and result.booking_code == "2854451"
 
 
+def test_parse_booking_reports_bad_credential_as_clean_failure() -> None:
+    # Live 2026-11-07 fake-id probe: the server answers "身分證字號格式錯誤"
+    # after the submit. That is a known identity failure (no ticket booked), so
+    # it must be a CLEAN failure -- unknown would wrongly freeze re-tries.
+    result = parse_booking_outcome("輸入資料有誤，請依下方提示檢查後重新填寫。 身分證字號格式錯誤")
+    assert (result.ok, result.unknown) == (False, False)
+    assert "身分證字號格式錯誤" in result.reason
+
+
 def test_resolve_deeplink_passes_through_non_deeplinks_and_failures() -> None:
     from tra_sniper.autobook import _resolve_deeplink
 

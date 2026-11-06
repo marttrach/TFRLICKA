@@ -42,6 +42,10 @@ FAILURE_MARKERS = (
     "验证失败",
     "驗證失敗",
     "已被停權",
+    # Live 2026-11-07 (fake-id probe): the server answers a bad credential
+    # with this AFTER the submit -- a clean identity failure, not unreadable.
+    # Not in the initial HTML (grep-verified), so it cannot misfire pre-submit.
+    "身分證字號格式錯誤",
 )
 # TRA's 電腦代碼. Live-verified 2026-11-07 (tip115 success page): the current
 # code is PLAIN digits ("訂票代碼 2854451") — a letters-only pattern silently
