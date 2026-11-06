@@ -447,6 +447,19 @@ class PlaywrightAutoSubmitter:
                         and page_shows_captcha(content)
                         and self._first_visible(page, CAPTCHA_INPUT_SELECTORS) is not None
                     )
+                    if (
+                        self.captcha_solver is None
+                        and page_shows_captcha(content)
+                        and self._first_visible(page, CAPTCHA_INPUT_SELECTORS) is not None
+                    ):
+                        # Live incident 2026-11-07 (NAS): OCR deps silently
+                        # missing in the image meant the gate was never even
+                        # attempted; blind re-submits burned the wizard. A
+                        # captcha page proves the server booked nothing, so
+                        # this is a CLEAN failure the scheduler may re-queue.
+                        return SubmitResult(
+                            False, reason="圖形驗證碼關卡，但此容器沒有可用的 OCR（鏡像 OCR 依賴缺失）"
+                        )
                     outcome = parse_booking_outcome(content)
                     if outcome.ok:
                         return outcome
@@ -468,7 +481,14 @@ class PlaywrightAutoSubmitter:
                             self._human_pause(0.3, 0.7)  # let the captcha reload land
                     if gate:
                         if captcha_budget <= 0:
-                            break
+                            # The server still asks for a picture code: it
+                            # booked NOTHING (the code is a precondition), so
+                            # a clean failure -- the next poll tick retries
+                            # with fresh captcha odds. unknown would freeze
+                            # the task forever after three unlucky OCR reads.
+                            return SubmitResult(
+                                False, reason="圖形驗證碼連續未通過，下一輪自動重試"
+                            )
                         captcha_budget -= 1
                         try:
                             self._solve_captcha(page, prefill, submit=False)

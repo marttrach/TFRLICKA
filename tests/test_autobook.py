@@ -853,10 +853,12 @@ class _DeadPage:
         self._contents = list(contents)
         self.identity = _Clickable()
         self.button = _Clickable()
+        self.verify = _Clickable()
         self.submitted = False
         self.submit_raises = None
         self.evaluates: list[tuple[str, object]] = []
         self.url = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip123/query"
+        self.show_captcha_field = False
 
     def goto(self, url, **kwargs):
         pass
@@ -871,6 +873,8 @@ class _DeadPage:
             return self.identity
         if selector == "form#queryForm button[type=submit]":
             return self.button
+        if selector == "#verifyCode" and self.show_captcha_field:
+            return self.verify
         return None
 
     def evaluate(self, script, arg=None):
@@ -893,6 +897,41 @@ def test_post_click_unreadable_page_returns_unknown_not_raise(monkeypatch) -> No
     assert (result.ok, result.unknown) == (False, True)
     assert "訂票結果" in result.reason
     assert page.submitted  # the native submit really happened
+
+
+def test_captcha_gate_without_ocr_is_a_clean_failure(monkeypatch) -> None:
+    # Live NAS incident 2026-11-07: ddddocr failed to import (slim image had
+    # no libgl), captcha_solver was silently None, the gate was never
+    # attempted, and the wizard burned every step blind. It must fail clean,
+    # with a reason naming OCR -- and must NOT submit past a captcha gate.
+    page = _DeadPage(["<html>因 v3 驗證未通過，請輸入驗證碼 請輸入驗證碼</html>"])
+    page.show_captcha_field = True
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(timeout_ms=10, sleeper=lambda seconds: None)
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, False)
+    assert "OCR" in result.reason
+    assert not page.submitted  # never submits past an unsolved picture code
+
+
+def test_captcha_strikes_out_requeues_instead_of_freezing(monkeypatch) -> None:
+    # A server still asking for a picture code booked NOTHING (code is a
+    # precondition), so three failed OCR reads must stay re-queueable.
+    page = _DeadPage(["<html>因 v3 驗證未通過 請輸入驗證碼</html>"])
+    page.show_captcha_field = True
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+
+    class NeverSolves:
+        def solve(self, image_path):
+            return None
+
+    submitter = PlaywrightAutoSubmitter(
+        timeout_ms=10, sleeper=lambda seconds: None,
+        captcha_solver=NeverSolves(), captcha_retries=2,
+    )
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, False)
+    assert "驗證碼" in result.reason
 
 
 def test_post_click_captcha_strikes_out_as_unknown(monkeypatch) -> None:

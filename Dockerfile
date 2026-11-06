@@ -10,6 +10,11 @@ RUN apt-get update \
         tesseract-ocr \
         tesseract-ocr-chi-tra \
         tesseract-ocr-eng \
+        # ddddocr rides opencv-python, which fails to import on slim without
+        # these (live incident 2026-11-07: silent captcha_solver=None meant
+        # the picture-code gate was never even attempted on NAS).
+        libgl1 \
+        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md LICENSE ./
