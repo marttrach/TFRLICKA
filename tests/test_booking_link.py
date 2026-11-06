@@ -142,7 +142,9 @@ def test_notification_link_needs_no_login_and_redirects_to_a_fresh_tdx_link(tmp_
     opened = client.get(path, follow_redirects=False)
     assert (opened.status_code, opened.headers["location"]) == (303, REDIRECT)
 
-    assert client.get(path[:-1] + "0", follow_redirects=False).status_code == 403
+    # Append a char (replacing risked a no-op when the last hex digit of the
+    # random signature was already '0': a 1/16 flake, CI-caught 2026-11-07).
+    assert client.get(path + "0", follow_redirects=False).status_code == 403
     other_task = path.replace(task_id, "another-task")
     assert client.get(other_task, follow_redirects=False).status_code == 403
 
