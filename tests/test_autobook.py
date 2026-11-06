@@ -9,6 +9,7 @@ OCR chain and a duck-typed fake page.
 
 import threading
 import time
+import typing
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -926,8 +927,8 @@ def test_captcha_strikes_out_requeues_instead_of_freezing(monkeypatch) -> None:
     _fake_playwright(monkeypatch, page, error_type=RuntimeError)
 
     class NeverSolves:
-        commands = [("never", ["/bin/never"])]
-        last_used = ""
+        commands: typing.ClassVar = [("never", ["/bin/never"])]
+        last_used: typing.ClassVar = ""
 
         def solve(self, image_path):
             return None

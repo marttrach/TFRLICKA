@@ -188,6 +188,7 @@ class OcrChain:
         self._run = runner or self._subprocess_run
         self.timeout_s = timeout_s
         self.last_used = ""
+        self.last_stderr = ""
 
     @staticmethod
     def _subprocess_run(argv, timeout):
@@ -196,12 +197,15 @@ class OcrChain:
         return subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
 
     def solve(self, image_path: str) -> str | None:
+        self.last_stderr = ""
         for name, argv in self.commands:
             try:
                 done = self._run([*argv, image_path], self.timeout_s)
             except Exception:  # noqa: BLE001, S112 - a broken OCR entry must not stop the chain
                 continue
             if done.returncode != 0:
+                err = (getattr(done, "stderr", "") or "").strip().splitlines()
+                self.last_stderr = err[-1] if err else ""
                 continue
             # The keras predictor prints per-image lines; take the last one.
             lines = [line.strip() for line in done.stdout.strip().splitlines() if line.strip()]
@@ -583,6 +587,7 @@ class PlaywrightAutoSubmitter:
                 extra={
                     "event": "autobook.captcha_ocr_empty",
                     "tried": "+".join(n for n, _ in self.captcha_solver.commands),
+                    "stderr": getattr(self.captcha_solver, "last_stderr", "")[:300],
                 },
             )
             return False

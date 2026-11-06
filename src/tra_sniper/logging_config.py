@@ -19,6 +19,7 @@ SAFE_EXTRA_FIELDS = (
     "tried",
     "chain",
     "len",
+    "stderr",
 )
 
 
