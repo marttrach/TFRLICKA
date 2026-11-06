@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from tra_sniper.api import create_app
 from tra_sniper.auth import TokenManager
 from tra_sniper.autobook import (
+    _JS_ADVANCE_FORM,
     _JS_RESTORE_FORM,
     OcrChain,
     PlaywrightAutoSubmitter,
@@ -342,6 +343,7 @@ class FakeElement:
         self.filled = None
         self.clicked = False
         self.evaluated = None
+        self.value = None
 
     def is_visible(self):
         return self._visible
@@ -355,8 +357,14 @@ class FakeElement:
     def click(self):
         self.clicked = True
 
-    def evaluate(self, script):
+    def evaluate(self, script, arg=None):
         self.evaluated = script
+        if script.startswith("(el, v)"):   # raw value set, no events (reCAPTCHA pitfall)
+            self.value = arg
+            return None
+        if script == "el => el.value":
+            return self.value
+        return None
 
 
 class FakeResponse:
@@ -386,6 +394,11 @@ class FakePage:
 
     def evaluate(self, script, arg=None):
         self.evaluates.append((script, arg))
+        if "arrayBuffer" in script:  # in-page picture fetch (session cookies ride along)
+            import base64
+
+            return base64.b64encode(b"fake-jpeg-bytes").decode()
+        return None
 
     def query_selector(self, selector):
         return {
@@ -422,15 +435,37 @@ def test_page_shows_captcha_marker() -> None:
     assert not page_shows_captcha("訂票成功")
 
 
+def test_parse_booking_outcome_reads_the_live_tip115_page() -> None:
+    # Verbatim shape of the 2026-11-07 end-to-end success page: the code is
+    # PLAIN 7 digits next to 訂票代碼 -- a letters-only pattern missed it.
+    text = (
+        "訂票人N7654**** 票種與加購台鐵便當 訂票成功！ "
+        "請選擇票種/付款方式，並於 11/07 17:33 (Sat) 前完成付款。 "
+        "訂票代碼 2854451 行程訂購資訊 11/07(星期六) 17:53 新竹 到 18:52 大甲 "
+        "自強(3000) 179 大學生5折 1 237 4車51號 全票 237 元 下一步"
+    )
+    result = parse_booking_outcome(text)
+    assert result.ok and result.booking_code == "2854451"
+
+
+def test_resolve_deeplink_passes_through_non_deeplinks_and_failures() -> None:
+    from tra_sniper.autobook import _resolve_deeplink
+
+    plain = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip123/query"
+    assert _resolve_deeplink(plain) == plain  # not a deeplink: untouched
+    dead = "http://127.0.0.1:1/tra-tip-web/deeplink/redirect?token=x"
+    assert _resolve_deeplink(dead) == dead  # unresolvable: still worth a browser try
+
+
 def test_solve_captcha_reads_image_fills_and_resubmits() -> None:
     page = FakePage()
     submitter = PlaywrightAutoSubmitter(
         captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
     )
     assert submitter._solve_captcha(page) is True
-    # the picture is fetched with the page's own (session-bearing) request
-    assert page.request.urls and "/tra-tip-web/tip/player/picture" in page.request.urls[0]
-    assert page.verify.filled == "AB3D9F"
+    # the picture is fetched inside the page so session cookies ride along
+    assert any("/tra-tip-web/tip/player/picture" in str(a) for _, a in page.evaluates)
+    assert page.verify.value == "AB3D9F"
     assert page.verify_type.evaluated is not None  # verifyType set to 'text'
     assert page.button.clicked is True
 
@@ -460,10 +495,10 @@ def test_solve_captcha_gives_up_when_field_goes_stale() -> None:
     # Navigation mid-solve must cost one tick, not the whole round budget.
     page = FakePage()
 
-    def boom(value, timeout=None):
-        raise RuntimeError("ElementHandle.fill: Timeout 30000ms exceeded.")
+    def boom(script, arg=None):
+        raise RuntimeError("ElementHandle.evaluate: Timeout 30000ms exceeded.")
 
-    page.verify.fill = boom
+    page.verify.evaluate = boom
     submitter = PlaywrightAutoSubmitter(
         captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
     )
@@ -773,12 +808,14 @@ class _Clickable:
 
 
 class _DeadPage:
-    url = "https://tb.trans.railway.gov.tw/tra-tip-web/tip/tip001/tip121/query"
-
     def __init__(self, contents):
         self._contents = list(contents)
         self.identity = _Clickable()
         self.button = _Clickable()
+        self.submitted = False
+        self.submit_raises = None
+        self.evaluates: list[tuple[str, object]] = []
+        self.url = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip123/query"
 
     def goto(self, url, **kwargs):
         pass
@@ -795,6 +832,15 @@ class _DeadPage:
             return self.button
         return None
 
+    def evaluate(self, script, arg=None):
+        self.evaluates.append((script, arg))
+        if script is _JS_ADVANCE_FORM:
+            if self.submit_raises is not None:
+                raise self.submit_raises
+            self.submitted = True
+            return True
+        return None
+
 
 def test_post_click_unreadable_page_returns_unknown_not_raise(monkeypatch) -> None:
     page = _DeadPage(["<html>請先選擇乘車日期</html>"])
@@ -805,7 +851,7 @@ def test_post_click_unreadable_page_returns_unknown_not_raise(monkeypatch) -> No
     result = submitter.submit(OFFICIAL, "A123456789")
     assert (result.ok, result.unknown) == (False, True)
     assert "訂票結果" in result.reason
-    assert page.button.clicked  # the click really happened
+    assert page.submitted  # the native submit really happened
 
 
 def test_post_click_captcha_strikes_out_as_unknown(monkeypatch) -> None:
@@ -840,15 +886,11 @@ def test_post_click_official_failure_page_stays_a_clean_failure(monkeypatch) -> 
 
 
 def test_post_click_browser_error_is_unknown_not_clean_failure(monkeypatch) -> None:
-    # AUDIT-1: a click() that raises the playwright Error (the accepted click
-    # navigated and detached the button) must never return a clean failure,
+    # AUDIT-1: a submit whose page detaches mid-navigation (the accepted
+    # submit navigated away) must never return a clean failure,
     # or the scheduler re-queues it and books a second real ticket.
-    class Boom(_Clickable):
-        def click(self):
-            raise RuntimeError("Element is not attached to the DOM")
-
     page = _DeadPage(["<html>請先選擇乘車日期</html>"])
-    page.button = Boom()
+    page.submit_raises = RuntimeError("Element is not attached to the DOM")
     _fake_playwright(monkeypatch, page, error_type=RuntimeError)
     submitter = PlaywrightAutoSubmitter(timeout_ms=10, sleeper=lambda seconds: None)
     result = submitter.submit(OFFICIAL, "A123456789")

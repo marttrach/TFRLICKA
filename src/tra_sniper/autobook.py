@@ -41,14 +41,25 @@ FAILURE_MARKERS = (
     "訂位失敗",
     "验证失败",
     "驗證失敗",
+    "已被停權",
 )
-# TRA's 電腦代碼: letters plus digits, optionally hyphen-grouped.
+# TRA's 電腦代碼. Live-verified 2026-11-07 (tip115 success page): the current
+# code is PLAIN digits ("訂票代碼 2854451") — a letters-only pattern silently
+# misses it. Label-anchored first so prices/seat numbers never masquerade as
+# a code; the older letters-hyphen shape stays as fallback.
+_BOOKING_CODE_LABELLED = re.compile(r"(?:訂票代碼|電腦訂票代碼|電腦代碼)[^0-9A-Z]{0,4}(\d{4,9})")
 BOOKING_CODE_PATTERN = re.compile(r"[A-Z]{1,2}-?\d{5,9}|[A-Z]-?\d{4,}-?\d*")
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
+
+# tip123 wizard: query → queryTrain → bookingTicket(票種) → confirm → 完成.
+# Six steps is the full walk with room for one re-render; a step's answer is
+# awaited for at most STEP_DEADLINE_SECONDS before it counts as stuck.
+WIZARD_STEPS = 6
+STEP_DEADLINE_SECONDS = 20.0
 
 # Selectors for the official pre-filled page, tried in order. One place to fix
 # when TRC ships a new booking UI. The ``#pid``/``#queryForm`` pair is the
@@ -122,6 +133,36 @@ _JS_CAPTURE_FORM = """(selectors) => {
 _JS_RESTORE_FORM = """([values, checked]) => {
   for (const [s, v] of Object.entries(values)) { const el = document.querySelector(s); if (el) el.value = v; }
   if (checked) for (const r of document.querySelectorAll('input[name=custIdTypeEnum]')) r.checked = r.value === checked;
+}"""
+
+# tip123 (where the TDX deep link lands since 2026-11) is a wizard
+# (query → queryTrain → bookingTicket → 完成) with every step gated by
+# client-side jQuery Validate plus a reCAPTCHA Enterprise token that a
+# headless browser can never mint. Live-verified 2026-11-06: the server
+# itself happily accepts a plain form.submit() and runs its own checks
+# (picture code, 停權, 售完), so every advance is a native submit.
+_JS_ADVANCE_FORM = """() => {
+  const forms = [...document.querySelectorAll('form')];
+  const f = forms.find(x => x.querySelector('input[name^="selectLoc"]'))
+        || document.querySelector('#queryForm')
+        || forms.find(x => x.querySelector('input[type=submit],button[type=submit]'));
+  if (!f) return false;
+  f.submit();
+  return true;
+}"""
+_JS_SELECT_TRAIN = """() => {
+  const rows = [...document.querySelectorAll('input[name^="selectLoc"]')];
+  if (!rows.length) return 0;
+  // Live 2026-11-07: a no-train query lists many rows -- the page's own
+  // pre-filled trainNo hidden input (179) must win over rows[0] or we book
+  // the wrong train.
+  const want = [...document.querySelectorAll('input[name*="trainNoList"]')]
+    .map(i => (i.value || '').trim()).find(Boolean) || '';
+  const target = (want && rows.find(r =>
+      (r.closest('tr')?.innerText || '').includes(want)))
+    || rows.find(r => r.checked) || rows[0];
+  if (!target.checked) target.click();  // real click; the row 選擇 button would
+  return 1;                              // re-fetch a fresh captcha (live pitfall)
 }"""
 
 
@@ -203,12 +244,48 @@ def parse_booking_outcome(page_text: str) -> SubmitResult:
     if not text:
         return SubmitResult(False, reason="頁面沒有內容")
     if any(marker in text for marker in SUCCESS_MARKERS):
+        labeled = _BOOKING_CODE_LABELLED.search(text)
+        if labeled:
+            return SubmitResult(True, booking_code=labeled.group(1))
         match = BOOKING_CODE_PATTERN.search(text.upper())
         return SubmitResult(True, booking_code=match.group(0) if match else None)
     for marker in FAILURE_MARKERS:
         if marker in text:
             return SubmitResult(False, reason=f"官方頁面回報：{marker}")
     return SubmitResult(False, reason="讀不到訂票結果（頁面可能已改版）")
+
+
+def _resolve_deeplink(official_url: str) -> str:
+    """Follow the TDX booking deeplink to its final trc.com.tw URL.
+
+    The link hops through maas.transportdata.tw, which answers a datacenter
+    IP with a Fortinet "Web Page Blocked" wall; the 302 itself is still
+    served, so asking for Location and opening the final URL directly works
+    (live-proven 2026-11-07 end-to-end booking 2854451).
+    shortcut: one hop only; upgrade if TDX ever chains redirects.
+    """
+    if "deeplink/redirect" not in official_url:
+        return official_url
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    request = urllib.request.Request(official_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    try:
+        opener = urllib.request.build_opener(_NoRedirect)
+        with opener.open(request, timeout=15) as response:
+            response.read(0)
+            return official_url  # answered 200: the page itself is usable
+    except urllib.error.HTTPError as exc:
+        target = exc.headers.get("Location") if exc.code in (301, 302, 303, 307, 308) else None
+        from urllib.parse import urljoin
+
+        return urljoin(official_url, target) if target else official_url
+    except Exception:  # noqa: BLE001 - unresolvable link still deserves a browser try
+        return official_url
 
 
 class PlaywrightAutoSubmitter:
@@ -246,6 +323,7 @@ class PlaywrightAutoSubmitter:
     def submit(self, official_url: str, identity: str) -> SubmitResult:
         if not identity.strip():
             return SubmitResult(False, reason="任務沒有身分證資料，無法自動訂票")
+        official_url = _resolve_deeplink(official_url)
         try:
             from playwright.sync_api import Error as PlaywrightError
             from playwright.sync_api import sync_playwright
@@ -290,6 +368,15 @@ class PlaywrightAutoSubmitter:
             context.add_init_script(STEALTH_SCRIPT)
             page = context.new_page()
             page.goto(official_url, wait_until="domcontentloaded")
+            # The cookie banner covers the form on first visit (live pitfall).
+            with suppress(Exception):
+                page.evaluate(
+                    """() => {
+                        const b = [...document.querySelectorAll('button,a')]
+                          .find(e => (e.textContent || '').trim() === '接受並關閉');
+                        if (b) b.click();
+                    }"""
+                )
             self._human_pause()
 
             identity_input = self._first_visible(page, IDENTITY_INPUT_SELECTORS)
@@ -300,7 +387,7 @@ class PlaywrightAutoSubmitter:
                 # Name the page we actually landed on: the last incident was a
                 # selector miss, and "頁面可能已改版" alone could not tell a
                 # wrong page from a redesigned one.
-                where = page.url().split("?", 1)[0].rsplit("//", 1)[-1][:60]
+                where = page.url.split("?", 1)[0].rsplit("//", 1)[-1][:60]
                 return SubmitResult(False, reason=f"找不到身分證欄位（頁面可能已改版：{where}）")
 
             identity_input.click()
@@ -309,77 +396,118 @@ class PlaywrightAutoSubmitter:
             identity_input.type(identity, delay=int(self._rng.uniform(60, 140)))
             self._human_pause()
 
-            submit_button = self._first_visible(page, SUBMIT_BUTTON_SELECTORS)
-            if submit_button is None:
-                return SubmitResult(False, reason="找不到訂票按鈕（頁面可能已改版）")
-
-            # The v3 token is minted on this interaction; wait for the result
-            # page instead of a fixed sleep. A datacenter IP answers with the
-            # picture-code fallback instead — read it, OCR it, try again.
-            # The click is issued on the next line; from there on a raised
-            # browser error can only mean an outcome we cannot read.
             # Capture the full form (station/date/train/pid) the moment before
-            # the first click; captcha resubmits must restore it verbatim.
+            # the first submit; captcha resubmits must restore it verbatim.
             try:
                 prefill = page.evaluate(_JS_CAPTURE_FORM, list(FORM_STATE_SELECTORS))
             except Exception:  # noqa: BLE001 - capture is best-effort recovery aid
                 prefill = {"values": {}, "checked": ""}
-            try:
-                submit_button.click()
-                deadline = self.timeout_ms / 1000.0
+
+            def settle(prev_url: str, prev_content: str) -> bool:
+                """True once the server has answered with a different page."""
                 waited = 0.0
-                captcha_attempts = 0
-                while waited < deadline:
-                    content = page.content()
-                    outcome = parse_booking_outcome(content)
-                    if outcome.ok or "官方頁面回報" in outcome.reason:
-                        return outcome
-                    if (
-                        self.captcha_solver is not None
-                        and page_shows_captcha(content)
-                        and captcha_attempts < self.captcha_retries
-                    ):
-                        captcha_attempts += 1
-                        try:
-                            solved = self._solve_captcha(page, prefill)
-                        except error_type:
-                            # page detached under us: retry with a fresh page
-                            # next tick instead of parking the whole round
-                            solved = False
-                        if solved:
-                            outcome = parse_booking_outcome(page.content())
-                            if outcome.ok or "官方頁面回報" in outcome.reason:
-                                return outcome
-                            continue
+                while waited < STEP_DEADLINE_SECONDS:
                     self._sleep(1.0)
                     waited += 1.0
+                    try:
+                        if (page.url, page.content()) != (prev_url, prev_content):
+                            return True
+                    except error_type:
+                        return False
+                return False
+
+            def advance() -> bool:
+                """Native-submit the current wizard step; False if unadvanceable."""
+                prev_url, prev_content = page.url, page.content()
+                # Live 2026-11-07: a server re-render UNCHECKS the selectLoc
+                # radio; submitting then answers 查詢時出現錯誤 forever. The
+                # click lands only when unchecked, so a solved code is safe.
+                with suppress(error_type):
+                    page.evaluate(_JS_SELECT_TRAIN)
+                if not page.evaluate(_JS_ADVANCE_FORM):
+                    return False
+                # A submit was issued: whether the server answered or stayed
+                # silent, only the page can now tell us if a ticket exists.
+                settle(prev_url, prev_content)
+                return True
+
+            clicked_any = False
+            captcha_budget = self.captcha_retries
+            last_url = ""
+            try:
+                for _step in range(WIZARD_STEPS):
+                    content = page.content()
+                    url_now = page.url
+                    gate = (
+                        self.captcha_solver is not None
+                        and page_shows_captcha(content)
+                        and self._first_visible(page, CAPTCHA_INPUT_SELECTORS) is not None
+                    )
+                    outcome = parse_booking_outcome(content)
+                    if outcome.ok:
+                        return outcome
+                    # A wrong picture code also reads as 驗證失敗; when the
+                    # captcha gate is up that is this round's retry path, not
+                    # a verdict. Anything else the official page reports is.
+                    if (
+                        "官方頁面回報" in outcome.reason
+                        and not (gate and "驗證失敗" in outcome.reason)
+                    ):
+                        return outcome
+                    # Select the row once per fresh page: its click handler
+                    # re-fetches the captcha, so it must never sit between a
+                    # solved code and the submit (replay-proven order).
+                    if url_now != last_url:
+                        last_url = url_now
+                        with suppress(error_type):
+                            page.evaluate(_JS_SELECT_TRAIN)
+                            self._human_pause(0.3, 0.7)  # let the captcha reload land
+                    if gate:
+                        if captcha_budget <= 0:
+                            break
+                        captcha_budget -= 1
+                        try:
+                            self._solve_captcha(page, prefill, submit=False)
+                        except error_type:
+                            pass  # stale page under us: the advance re-reads
+                    try:
+                        clicked_any = clicked_any or advance()
+                    except error_type as exc:
+                        # A raised submit may still have been accepted by the
+                        # server: a retry could book a second real, paid ticket.
+                        logger.warning(
+                            "auto-submit browser error after a submit; outcome unknown",
+                            extra={"event": "autobook.browser_error_post_click"},
+                            exc_info=True,
+                        )
+                        message = str(exc).splitlines()[0] if str(exc) else "送出後瀏覽器錯誤"
+                        return SubmitResult(False, unknown=True, reason=f"瀏覽器錯誤：{message}")
                 outcome = parse_booking_outcome(page.content())
-                if outcome.ok:
+                if outcome.ok or "官方頁面回報" in outcome.reason:
                     return outcome
-                # The click happened and the page cannot be read: outcome unknown.
-                # Raising here used to hide that behind an error_type the scheduler
-                # re-queued — a second accepted submit would book a second ticket.
-                if captcha_attempts and not page_shows_captcha(page.content()):
-                    return SubmitResult(False, unknown=True, reason="圖形驗證碼連續失敗")
+                logger.warning(
+                    "auto-submit stopped unreadable",
+                    extra={
+                        "event": "autobook.unreadable",
+                        "url": page.url[:120],
+                        "page_text": page.evaluate(
+                            "() => document.body.innerText.replace(/\\s+/g,' ').slice(0, 600)"
+                        ),
+                    },
+                )
+                # The wizard ran and the final page cannot be read: unknown.
+                # Never re-queue a blind submit -- it could book twice.
                 return SubmitResult(
                     False, unknown=True, reason=outcome.reason or "等了很久仍讀不到訂票結果"
+                ) if clicked_any else SubmitResult(
+                    False, reason="找不到可送出的表單（頁面可能已改版）"
                 )
-            except error_type as exc:
-                # click() raising usually means the click WAS accepted and the
-                # navigation detached the page — a retry could book a second
-                # real, paid ticket. Everything raised from the moment the
-                # click was issued is an unknown outcome, never a clean failure.
-                logger.warning(
-                    "auto-submit browser error after the click; outcome unknown",
-                    extra={"event": "autobook.browser_error_post_click"},
-                    exc_info=True,
-                )
-                message = str(exc).splitlines()[0] if str(exc) else "點擊後瀏覽器錯誤"
-                return SubmitResult(False, unknown=True, reason=f"瀏覽器錯誤：{message}")
+            finally:
+                pass  # keeps the wizard try honest; browser closes outside
         finally:
             browser.close()
 
-    def _solve_captcha(self, page: Any, prefill: dict | None = None) -> bool:
+    def _solve_captcha(self, page: Any, prefill: dict | None = None, submit: bool = True) -> bool:
         """Read the picture code, refill the form and resubmit. True on success.
 
         The image is fetched through the page's own request context so the
@@ -395,8 +523,21 @@ class PlaywrightAutoSubmitter:
             return False
         src = image.get_attribute("src") or CAPTCHA_FALLBACK_IMAGE_PATH
         try:
-            response = page.request.get(urljoin(page.url, f"{src.split('?')[0]}?r={os.getpid()}"))
-            body = response.body()
+            url = urljoin(page.url, f"{src.split('?')[0]}?r={os.getpid()}")
+            # Fetch inside the page so every session cookie (SameSite included)
+            # rides along -- proven path from the puppeteer replay, 2026-11-06.
+            body_b64 = page.evaluate(
+                """async (u) => {
+                    const r = await fetch(u, { cache: 'no-store' });
+                    const buf = new Uint8Array(await r.arrayBuffer());
+                    let s = ''; for (const c of buf) s += String.fromCharCode(c);
+                    return btoa(s);
+                }""",
+                url,
+            )
+            import base64
+
+            body = base64.b64decode(body_b64)
         except Exception:  # noqa: BLE001 - unreadable picture means the round falls back
             return False
         code_path = ""
@@ -416,10 +557,13 @@ class PlaywrightAutoSubmitter:
         if field is None:
             return False
         try:
-            # A stale handle (page navigating mid-solve) must burn seconds of
-            # the round budget, not the whole 30s default timeout — and the
-            # loop retries with a fresh handle next tick.
-            field.fill(code, timeout=8000)
+            # Raw value set, NO events: #verifyCode is the g-recaptcha-response
+            # field and the page's reCAPTCHA JS clears it on input events
+            # (puppeteer replay proved a bare el.value survives to the server).
+            field.evaluate("(el, v) => { el.value = v; }", code)
+            check = field.evaluate("el => el.value")
+            if check != code:
+                return False
         except Exception:  # noqa: BLE001 - stale element means retry next tick
             return False
         type_field = page.query_selector(CAPTCHA_TYPE_FIELD)
@@ -429,16 +573,19 @@ class PlaywrightAutoSubmitter:
             # The re-rendered page answers "輸入資料有誤" unless every field is
             # put back the instant before this click (run3.mjs pitfall).
             page.evaluate(_JS_RESTORE_FORM, [prefill.get("values", {}), prefill.get("checked", "")])
-        # Picture-code mode is the server's second-verify path: the leftover
-        # empty v3 token must not ride along (run3 disables these inputs).
+        # Picture-code mode is the server's second-verify path: any leftover
+        # EMPTY v3 token must not ride along; a field we just filled with the
+        # picture code (tip123 reuses the g-recaptcha-response name) must.
         page.evaluate(
             """() => {
                 document.querySelectorAll("input[name=g-recaptcha-response]").forEach(
-                    i => { i.value = ''; i.disabled = true; });
+                    i => { if (!i.value) { i.value = ''; i.disabled = true; } });
                 const isv = document.querySelector("input[name=isSecondVerify]");
                 if (isv) isv.value = 'true';
             }"""
         )
+        if not submit:
+            return True
         submit_button = self._first_visible(page, SUBMIT_BUTTON_SELECTORS)
         if submit_button is None:
             return False
