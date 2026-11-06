@@ -665,9 +665,19 @@ def build_autobook_submitter_from_env() -> PlaywrightAutoSubmitter | None:
     headless = os.getenv("TRA_AUTOBOOK_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
     timeout_ms = int(os.getenv("TRA_AUTOBOOK_TIMEOUT_MS", "30000"))
     retries = int(os.getenv("TRA_AUTOBOOK_CAPTCHA_RETRIES", "3"))
+    solver = build_captcha_solver_from_env()
+    # State the OCR chain out loud at startup: a parked captcha round is
+    # ambiguous without it (baked OCR dead vs codes OCR'd wrong 3x).
+    logger.info(
+        "auto-submit armed",
+        extra={
+            "event": "autobook.armed",
+            "captcha": "+".join(name for name, _ in solver.commands) if solver else "none",
+        },
+    )
     return PlaywrightAutoSubmitter(
         headless=headless,
         timeout_ms=timeout_ms,
-        captcha_solver=build_captcha_solver_from_env(),
+        captcha_solver=solver,
         captcha_retries=retries,
     )
