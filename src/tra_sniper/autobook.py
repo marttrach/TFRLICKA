@@ -98,6 +98,32 @@ CAPTCHA_INPUT_SELECTORS = (
 CAPTCHA_TYPE_FIELD = "input[name='verifyType']"
 CAPTCHA_FALLBACK_IMAGE_PATH = "/tra-tip-web/tip/player/picture"
 
+# Live-verified pitfall (run3.mjs, 2026-11-03): resubmitting the picture code
+# on a page the server re-rendered arrives with these fields wiped — a blind
+# resubmit only answers "輸入資料有誤" and burns every captcha retry. Capture
+# the whole form before the first click and re-set it the instant before each
+# resubmit, same as run3 does with setV.
+FORM_STATE_SELECTORS = (
+    "input#pid",
+    "input[name='startStation']",
+    "input[name='endStation']",
+    'input[name="ticketOrderParamList[0].rideDate"]',
+    'input[name="ticketOrderParamList[0].trainNoList[0]"]',
+    'input[name="ticketOrderParamList[0].trainNoList[1]"]',
+    'input[name="ticketOrderParamList[0].trainNoList[2]"]',
+)
+_JS_CAPTURE_FORM = """(selectors) => {
+  const out = {values: {}, checked: ''};
+  for (const s of selectors) { const el = document.querySelector(s); if (el) out.values[s] = el.value; }
+  const r = document.querySelector('input[name=custIdTypeEnum]:checked');
+  if (r) out.checked = r.value;
+  return out;
+}"""
+_JS_RESTORE_FORM = """([values, checked]) => {
+  for (const [s, v] of Object.entries(values)) { const el = document.querySelector(s); if (el) el.value = v; }
+  if (checked) for (const r of document.querySelectorAll('input[name=custIdTypeEnum]')) r.checked = r.value === checked;
+}"""
+
 
 def page_shows_captcha(page_text: str) -> bool:
     return CAPTCHA_MARKER in (page_text or "")
@@ -292,6 +318,12 @@ class PlaywrightAutoSubmitter:
             # picture-code fallback instead — read it, OCR it, try again.
             # The click is issued on the next line; from there on a raised
             # browser error can only mean an outcome we cannot read.
+            # Capture the full form (station/date/train/pid) the moment before
+            # the first click; captcha resubmits must restore it verbatim.
+            try:
+                prefill = page.evaluate(_JS_CAPTURE_FORM, list(FORM_STATE_SELECTORS))
+            except Exception:  # noqa: BLE001 - capture is best-effort recovery aid
+                prefill = {"values": {}, "checked": ""}
             try:
                 submit_button.click()
                 deadline = self.timeout_ms / 1000.0
@@ -308,7 +340,7 @@ class PlaywrightAutoSubmitter:
                         and captcha_attempts < self.captcha_retries
                     ):
                         captcha_attempts += 1
-                        if self._solve_captcha(page):
+                        if self._solve_captcha(page, prefill):
                             outcome = parse_booking_outcome(page.content())
                             if outcome.ok or "官方頁面回報" in outcome.reason:
                                 return outcome
@@ -341,8 +373,8 @@ class PlaywrightAutoSubmitter:
         finally:
             browser.close()
 
-    def _solve_captcha(self, page: Any) -> bool:
-        """Read the picture code, fill the form and resubmit. True on success.
+    def _solve_captcha(self, page: Any, prefill: dict | None = None) -> bool:
+        """Read the picture code, refill the form and resubmit. True on success.
 
         The image is fetched through the page's own request context so the
         session cookie (the picture is session-bound) comes along for free.
@@ -381,6 +413,20 @@ class PlaywrightAutoSubmitter:
         type_field = page.query_selector(CAPTCHA_TYPE_FIELD)
         if type_field is not None:
             type_field.evaluate("el => { el.value = 'text'; }")
+        if prefill and (prefill.get("values") or prefill.get("checked")):
+            # The re-rendered page answers "輸入資料有誤" unless every field is
+            # put back the instant before this click (run3.mjs pitfall).
+            page.evaluate(_JS_RESTORE_FORM, [prefill.get("values", {}), prefill.get("checked", "")])
+        # Picture-code mode is the server's second-verify path: the leftover
+        # empty v3 token must not ride along (run3 disables these inputs).
+        page.evaluate(
+            """() => {
+                document.querySelectorAll("input[name=g-recaptcha-response]").forEach(
+                    i => { i.value = ''; i.disabled = true; });
+                const isv = document.querySelector("input[name=isSecondVerify]");
+                if (isv) isv.value = 'true';
+            }"""
+        )
         submit_button = self._first_visible(page, SUBMIT_BUTTON_SELECTORS)
         if submit_button is None:
             return False

@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from tra_sniper.api import create_app
 from tra_sniper.auth import TokenManager
 from tra_sniper.autobook import (
+    _JS_RESTORE_FORM,
     OcrChain,
     PlaywrightAutoSubmitter,
     SubmitResult,
@@ -381,6 +382,10 @@ class FakePage:
         self.verify_type = FakeElement()
         self.button = FakeElement()
         self.request = FakeRequest()
+        self.evaluates: list[tuple[str, object]] = []
+
+    def evaluate(self, script, arg=None):
+        self.evaluates.append((script, arg))
 
     def query_selector(self, selector):
         return {
@@ -428,6 +433,27 @@ def test_solve_captcha_reads_image_fills_and_resubmits() -> None:
     assert page.verify.filled == "AB3D9F"
     assert page.verify_type.evaluated is not None  # verifyType set to 'text'
     assert page.button.clicked is True
+
+
+def test_solve_captcha_refills_wiped_form_before_resubmit() -> None:
+    # Live-verified failure mode: the server re-render wipes train/date/pid, so
+    # a resubmit that does not restore them only ever answers "輸入資料有誤".
+    page = FakePage()
+    submitter = PlaywrightAutoSubmitter(
+        captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
+    )
+    prefill = {
+        "values": {'input[name="ticketOrderParamList[0].trainNoList[0]"]': "179"},
+        "checked": "PERSON_ID",
+    }
+    assert submitter._solve_captcha(page, prefill) is True
+    restore_scripts = [(s, a) for s, a in page.evaluates if "custIdTypeEnum" in s]
+    assert restore_scripts == [(
+        _JS_RESTORE_FORM,
+        [{'input[name="ticketOrderParamList[0].trainNoList[0]"]': "179"}, "PERSON_ID"],
+    )]
+    second_verify = [s for s, _ in page.evaluates if "isSecondVerify" in s]
+    assert second_verify, "empty v3 token must not ride along on resubmit"
 
 
 def test_solve_captcha_without_readable_code_gives_up_quietly() -> None:
