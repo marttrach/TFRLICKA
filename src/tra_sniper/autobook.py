@@ -427,11 +427,10 @@ class PlaywrightAutoSubmitter:
             def advance() -> bool:
                 """Native-submit the current wizard step; False if unadvanceable."""
                 prev_url, prev_content = page.url, page.content()
-                # Live 2026-11-07: a server re-render UNCHECKS the selectLoc
-                # radio; submitting then answers 查詢時出現錯誤 forever. The
-                # click lands only when unchecked, so a solved code is safe.
-                with suppress(error_type):
-                    page.evaluate(_JS_SELECT_TRAIN)
+                # NO radio click here: the row's click handler re-fetches the
+                # picture captcha and invalidates a code just OCR'd (live NAS
+                # incident 2026-11-07: 3 correct keras answers, all rejected).
+                # Train selection belongs BEFORE the OCR fetch -- see the gate.
                 if not page.evaluate(_JS_ADVANCE_FORM):
                     return False
                 # A submit was issued: whether the server answered or stayed
@@ -494,6 +493,14 @@ class PlaywrightAutoSubmitter:
                                 False, reason="圖形驗證碼連續未通過，下一輪自動重試"
                             )
                         captcha_budget -= 1
+                        # Re-render may have UNCHECKED the row: re-select it
+                        # BEFORE fetching the picture (the click re-fetches
+                        # the captcha; fetching first would OCR a doomed
+                        # image, see the 2026-11-07 rejection loop) and let
+                        # the reload land before _solve_captcha reads it.
+                        with suppress(error_type):
+                            page.evaluate(_JS_SELECT_TRAIN)
+                            self._human_pause(0.4, 0.8)
                         try:
                             self._solve_captcha(page, prefill, submit=False)
                         except error_type:
