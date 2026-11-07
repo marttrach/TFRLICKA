@@ -421,7 +421,7 @@ class PlaywrightAutoSubmitter:
                         if (page.url, page.content()) != (prev_url, prev_content):
                             return True
                     except error_type:
-                        return False
+                        pass  # mid-navigation: keep polling until it lands
                 return False
 
             def advance() -> bool:
@@ -503,6 +503,16 @@ class PlaywrightAutoSubmitter:
                             solved = False  # stale page: advance() re-reads
                         if solved:
                             clicked_any = True
+                            # An accepted native submit means navigation:
+                            # read the page only after it lands (live NAS
+                            # 2026-11-07: re-reading mid-navigation raised
+                            # 'Unable to retrieve content' and the round
+                            # died as a clean failure -> every-minute
+                            # re-queue would book again).
+                            with suppress(Exception):
+                                page.wait_for_load_state(
+                                    "load", timeout=STEP_DEADLINE_SECONDS * 1000
+                                )
                             continue
                     try:
                         clicked_any = clicked_any or advance()
@@ -536,6 +546,21 @@ class PlaywrightAutoSubmitter:
                 ) if clicked_any else SubmitResult(
                     False, reason="找不到可送出的表單（頁面可能已改版）"
                 )
+            except error_type as exc:
+                # The invariant: once any submit has left the browser, only
+                # the official page can say whether a ticket exists. A crash
+                # here (navigation races included) must park as unknown --
+                # a clean failure re-queues every minute and books twice
+                # (live NAS incident 2026-11-07 01:21).
+                if not clicked_any:
+                    raise
+                logger.warning(
+                    "auto-submit browser error after a submit; outcome unknown",
+                    extra={"event": "autobook.browser_error_post_click"},
+                    exc_info=True,
+                )
+                message = str(exc).splitlines()[0] if str(exc) else "送出後瀏覽器錯誤"
+                return SubmitResult(False, unknown=True, reason=f"瀏覽器錯誤：{message}")
             finally:
                 pass  # keeps the wizard try honest; browser closes outside
         finally:

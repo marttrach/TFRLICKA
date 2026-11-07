@@ -879,11 +879,17 @@ class _DeadPage:
         self.evaluates: list[tuple[str, object]] = []
         self.url = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip123/query"
         self.show_captcha_field = False
+        self.raise_content_after_submit = False
 
     def goto(self, url, **kwargs):
         pass
 
     def content(self):
+        if self.submitted and self.raise_content_after_submit:
+            raise RuntimeError(
+                "Page.content: Unable to retrieve content because the "
+                "page is navigating and changing the content."
+            )
         if len(self._contents) > 1:
             return self._contents.pop(0)
         return self._contents[-1]
@@ -917,6 +923,22 @@ def test_post_click_unreadable_page_returns_unknown_not_raise(monkeypatch) -> No
     assert (result.ok, result.unknown) == (False, True)
     assert "訂票結果" in result.reason
     assert page.submitted  # the native submit really happened
+
+
+def test_navigation_crash_after_submit_parks_unknown(monkeypatch) -> None:
+    # Live NAS 2026-11-07 01:21: the captcha submit was ACCEPTED and the
+    # page navigated; the loop re-read page.content() mid-navigation, the
+    # error escaped as a CLEAN failure -- and the every-minute re-queue
+    # would have booked a second real ticket. Post-submit crashes park.
+    page = _DeadPage(["<html>請先選擇乘車日期</html>"])
+    page.raise_content_after_submit = True
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(
+        timeout_ms=10, sleeper=lambda seconds: None, captcha_solver=None
+    )
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.unknown) == (False, True)
+    assert page.submitted  # the submit really happened: no blind re-queue
 
 
 def test_captcha_gate_without_ocr_is_a_clean_failure(monkeypatch) -> None:
