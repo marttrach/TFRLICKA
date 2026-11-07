@@ -627,16 +627,21 @@ class PlaywrightAutoSubmitter:
             # The re-rendered page answers "輸入資料有誤" unless every field is
             # put back the instant before this click (run3.mjs pitfall).
             page.evaluate(_JS_RESTORE_FORM, [prefill.get("values", {}), prefill.get("checked", "")])
-        # Picture-code mode is the server's second-verify path: any leftover
-        # EMPTY v3 token must not ride along; a field we just filled with the
-        # picture code (tip123 reuses the g-recaptcha-response name) must.
+        # Picture-code mode is the server's second-verify path. The
+        # replay-proven (two real tickets) handling is an UNCONDITIONAL clear:
+        # grecaptcha.execute() leaves a scored-and-burned v3 token in this
+        # field, and the server re-validates whatever rides along -- keeping
+        # it made three correctly OCR'd codes get rejected in a loop (live
+        # NAS incident 2026-11-07). Empty + enabled makes the server take the
+        # picture-code branch. Our code lives in #verifyCode, never here.
         page.evaluate(
-            """() => {
+            """(code) => {
                 document.querySelectorAll("input[name=g-recaptcha-response]").forEach(
-                    i => { if (!i.value) { i.value = ''; i.disabled = true; } });
+                    i => { if (i.value !== code) { i.value = ''; } i.disabled = false; });
                 const isv = document.querySelector("input[name=isSecondVerify]");
                 if (isv) isv.value = 'true';
-            }"""
+            }""",
+            code,
         )
         if not submit:
             return True
