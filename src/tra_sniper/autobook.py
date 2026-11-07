@@ -111,7 +111,6 @@ CAPTCHA_INPUT_SELECTORS = (
     "input[name='g-recaptcha-response']",
 )
 CAPTCHA_TYPE_FIELD = "input[name='verifyType']"
-CAPTCHA_FALLBACK_IMAGE_PATH = "/tra-tip-web/tip/player/picture"
 
 # Live-verified pitfall (run3.mjs, 2026-11-03): resubmitting the picture code
 # on a page the server re-rendered arrives with these fields wiped — a blind
@@ -424,6 +423,20 @@ class PlaywrightAutoSubmitter:
                         pass  # mid-navigation: keep polling until it lands
                 return False
 
+            def page_evidence() -> dict:
+                """Best-effort server answer for the docker logs: WHAT the
+                page says after a crash decides the next fix, no round-trip
+                with the user needed (2026-11-07 lesson)."""
+                text = ""
+                with suppress(Exception):
+                    text = page.evaluate(
+                        "() => document.body.innerText.replace(/\\s+/g,' ').slice(0, 600)"
+                    )
+                return {
+                    "url": str(getattr(page, "url", ""))[:120],
+                    "page_text": text,
+                }
+
             def advance() -> bool:
                 """Native-submit the current wizard step; False if unadvanceable."""
                 prev_url, prev_content = page.url, page.content()
@@ -521,7 +534,8 @@ class PlaywrightAutoSubmitter:
                         # server: a retry could book a second real, paid ticket.
                         logger.warning(
                             "auto-submit browser error after a submit; outcome unknown",
-                            extra={"event": "autobook.browser_error_post_click"},
+                            extra={"event": "autobook.browser_error_post_click",
+                                   **page_evidence()},
                             exc_info=True,
                         )
                         message = str(exc).splitlines()[0] if str(exc) else "送出後瀏覽器錯誤"
@@ -556,7 +570,8 @@ class PlaywrightAutoSubmitter:
                     raise
                 logger.warning(
                     "auto-submit browser error after a submit; outcome unknown",
-                    extra={"event": "autobook.browser_error_post_click"},
+                    extra={"event": "autobook.browser_error_post_click",
+                           **page_evidence()},
                     exc_info=True,
                 )
                 message = str(exc).splitlines()[0] if str(exc) else "送出後瀏覽器錯誤"
@@ -569,42 +584,34 @@ class PlaywrightAutoSubmitter:
     def _solve_captcha(self, page: Any, prefill: dict | None = None, submit: bool = True) -> bool:
         """Read the picture code, refill the form and resubmit. True on success.
 
-        The image is fetched through the page's own request context so the
-        session cookie (the picture is session-bound) comes along for free.
+        The picture is screenshotted from the rendered page -- the exact
+        pixels the server expects an answer for (an extra GET of its URL can
+        return a different image than the one bound to the session).
         """
+        import hashlib
         import os
-        import secrets
         import tempfile
-        from urllib.parse import urljoin
 
         assert self.captcha_solver is not None
         image = self._first_visible(page, CAPTCHA_IMG_SELECTORS)
         if image is None:
             return False
-        src = image.get_attribute("src") or CAPTCHA_FALLBACK_IMAGE_PATH
         try:
-            # Cache-buster MUST be per-fetch random (replay used Math.random):
-            # the container's uvicorn is always pid 1, and a constant ?r= made
-            # every round re-fetch one cached picture while the server's
-            # expected code rotated -- nine correct OCR answers, nine rejects
-            # (NAS incident 2026-11-07).
-            url = urljoin(page.url, f"{src.split('?')[0]}?r={secrets.token_hex(6)}")
-            # Fetch inside the page so every session cookie (SameSite included)
-            # rides along -- proven path from the puppeteer replay, 2026-11-06.
-            body_b64 = page.evaluate(
-                """async (u) => {
-                    const r = await fetch(u, { cache: 'no-store' });
-                    const buf = new Uint8Array(await r.arrayBuffer());
-                    let s = ''; for (const c of buf) s += String.fromCharCode(c);
-                    return btoa(s);
-                }""",
-                url,
-            )
-            import base64
-
-            body = base64.b64decode(body_b64)
-        except Exception:  # noqa: BLE001 - unreadable picture means the round falls back
+            # OCR the pixels the BROWSER shows, never a separately fetched
+            # copy: the server binds the expected code to the picture that
+            # rendered with the page, so an extra GET can return a different
+            # image -- correct answers to the wrong picture (NAS incident
+            # 2026-11-07 round two: three correct OCR hits, three rejects,
+            # the gate re-rendered verbatim). A human reads the screen; so
+            # do we.
+            body = image.screenshot()
+        except Exception:  # noqa: BLE001 - stale element: clean failure re-queues
             return False
+        if not body or len(body) < 100:
+            return False
+        # sha256 of the exact OCR'd bytes: makes "server sent us the same
+        # picture three times" (or different ones) provable from docker logs.
+        digest = hashlib.sha256(body).hexdigest()[:12]
         code_path = ""
         try:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
@@ -625,6 +632,7 @@ class PlaywrightAutoSubmitter:
                     "event": "autobook.captcha_ocr_empty",
                     "tried": "+".join(n for n, _ in self.captcha_solver.commands),
                     "stderr": getattr(self.captcha_solver, "last_stderr", "")[:300],
+                    "digest": digest,
                 },
             )
             return False
@@ -634,6 +642,7 @@ class PlaywrightAutoSubmitter:
                 "event": "autobook.captcha_ocr_ok",
                 "chain": self.captcha_solver.last_used,
                 "len": len(code),
+                "digest": digest,
             },
         )
 

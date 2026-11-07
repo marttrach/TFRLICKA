@@ -15,6 +15,7 @@ SAFE_EXTRA_FIELDS = (
     "task_id",
     "url",
     "page_text",
+    "digest",
     "captcha",
     "tried",
     "chain",

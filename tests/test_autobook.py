@@ -333,9 +333,12 @@ class FakeChain:
         self.calls = 0
         self.commands = [("fake", ["/bin/fake"])]  # OcrChain-shaped for the logs
         self.last_used = ""
+        self.last_image: bytes | None = None
 
     def solve(self, image_path):
         self.calls += 1
+        with open(image_path, "rb") as handle:  # what OCR sees must be what renders
+            self.last_image = handle.read()
         if self.code:
             self.last_used = "fake"
         return self.code
@@ -349,12 +352,17 @@ class FakeElement:
         self.clicked = False
         self.evaluated = None
         self.value = None
+        self.screenshotted = False
 
     def is_visible(self):
         return self._visible
 
     def get_attribute(self, name):
         return self.src
+
+    def screenshot(self):
+        self.screenshotted = True
+        return b"fake-jpeg-bytes" * 20  # > 100 bytes: a real-looking picture
 
     def fill(self, value, timeout=None):
         self.filled = value
@@ -503,19 +511,18 @@ def test_resolve_deeplink_passes_through_non_deeplinks_and_failures() -> None:
     assert _resolve_deeplink(dead) == dead  # unresolvable: still worth a browser try
 
 
-def test_captcha_image_url_cache_buster_is_random() -> None:
-    # NAS incident 2026-11-07: cache-buster was os.getpid(), uvicorn in the
-    # container is ALWAYS pid 1, every round re-fetched one cached picture
-    # while the server's expected code rotated -- 9 correct OCR hits, 0 pass.
-    urls = []
-    for _ in range(2):
-        page = FakePage()
-        submitter = PlaywrightAutoSubmitter(
-            captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
-        )
-        assert submitter._solve_captcha(page) is True
-        urls.extend(str(a) for s, a in page.evaluates if "player/picture" in str(a))
-    assert len(urls) == 2 and urls[0] != urls[1]
+def test_captcha_ocr_reads_the_rendered_picture_not_a_refetch() -> None:
+    # NAS incident 2026-11-07 round two: a separate GET of the picture URL
+    # returned an image the server never expected to be answered (three
+    # correct OCR hits, three rejects). OCR must read the pixels rendered
+    # in the page -- the ones the user would read.
+    page = FakePage()
+    chain = FakeChain("AB3D9F")
+    submitter = PlaywrightAutoSubmitter(captcha_solver=chain, sleeper=lambda seconds: None)
+    assert submitter._solve_captcha(page) is True
+    assert page.picture.screenshotted is True
+    assert chain.last_image == b"fake-jpeg-bytes" * 20
+    assert page.verify.value == "AB3D9F"
 
 
 def test_solve_captcha_reads_image_fills_and_resubmits() -> None:
@@ -524,8 +531,6 @@ def test_solve_captcha_reads_image_fills_and_resubmits() -> None:
         captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
     )
     assert submitter._solve_captcha(page) is True
-    # the picture is fetched inside the page so session cookies ride along
-    assert any("/tra-tip-web/tip/player/picture" in str(a) for _, a in page.evaluates)
     assert page.verify.value == "AB3D9F"
     assert page.verify_type.evaluated is not None  # verifyType set to 'text'
     assert page.button.clicked is True
