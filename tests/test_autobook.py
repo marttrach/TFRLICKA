@@ -41,14 +41,16 @@ OFFICIAL = "https://maas.transportdata.tw/trip/api/v1/booking/deeplink/redirect?
 
 
 def test_parser_reads_success_with_code() -> None:
-    result = parse_booking_outcome("恭喜，訂票成功！請记下電腦代碼 A1234567 并于三日内缴费")
+    result = parse_booking_outcome("恭喜，訂票成功！請记下電腦代碼 1234567 并于三日内缴费")
     assert result.ok
-    assert result.booking_code == "A1234567"
+    assert result.booking_code == "1234567"
 
 
 def test_parser_handles_success_without_code() -> None:
+    # Success wording with no labeled pure-digit code proves nothing (the
+    # unpaid-order banner says the same words about a PREVIOUS order): park.
     result = parse_booking_outcome("預約成功")
-    assert result.ok
+    assert (result.ok, result.unknown) == (False, True)
     assert result.booking_code is None
 
 
@@ -491,6 +493,20 @@ def test_parse_booking_outcome_reads_the_live_tip115_page() -> None:
     )
     result = parse_booking_outcome(text)
     assert result.ok and result.booking_code == "2854451"
+
+
+def test_parse_booking_unlabeled_success_wording_is_unknown() -> None:
+    # Live false positive 2026-11-07: the unpaid-order banner on the landing
+    # page says 已訂票成功 (for a PREVIOUS order) and carries an A-prefixed
+    # order number -- the old fallback regex reported "A15240000" as if THIS
+    # booking had succeeded. Only a labeled pure-digit 訂票代碼 proves a
+    # booking; anything else parks for human verification.
+    banner = (
+        "個人訂票 您已訂票成功，請於規定期限內完成付款。 "
+        "未付款訂單：1210 新竹 到 2200 大甲 訂票單號：A15240000"
+    )
+    result = parse_booking_outcome(banner)
+    assert (result.ok, result.unknown, result.booking_code) == (False, True, None)
 
 
 def test_parse_booking_reports_bad_credential_as_clean_failure() -> None:

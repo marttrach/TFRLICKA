@@ -49,10 +49,9 @@ FAILURE_MARKERS = (
 )
 # TRA's 電腦代碼. Live-verified 2026-11-07 (tip115 success page): the current
 # code is PLAIN digits ("訂票代碼 2854451") — a letters-only pattern silently
-# misses it. Label-anchored first so prices/seat numbers never masquerade as
-# a code; the older letters-hyphen shape stays as fallback.
+# misses it. Label-anchored ONLY: unlabeled success text is a banner, not a
+# booking (see parse_booking_outcome).
 _BOOKING_CODE_LABELLED = re.compile(r"(?:訂票代碼|電腦訂票代碼|電腦代碼)[^0-9A-Z]{0,4}(\d{4,9})")
-BOOKING_CODE_PATTERN = re.compile(r"[A-Z]{1,2}-?\d{5,9}|[A-Z]-?\d{4,}-?\d*")
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -254,8 +253,15 @@ def parse_booking_outcome(page_text: str) -> SubmitResult:
         labeled = _BOOKING_CODE_LABELLED.search(text)
         if labeled:
             return SubmitResult(True, booking_code=labeled.group(1))
-        match = BOOKING_CODE_PATTERN.search(text.upper())
-        return SubmitResult(True, booking_code=match.group(0) if match else None)
+        # Success wording WITHOUT the labeled pure-digit code is not proof of
+        # a booking: the TRA unpaid-order banner on landing/query pages also
+        # says 已訂票成功 (live false positive 2026-11-07: the banner's order
+        # number A15240000 was notified as this booking's code). Real tip115
+        # pages always carry 訂票代碼 NNNNNNN (3/3 live) -- without one the
+        # outcome is unknown; a human checks the official records.
+        return SubmitResult(
+            False, unknown=True, reason="讀到成功字樣但無電腦訂票代碼，請至訂票紀錄確認"
+        )
     for marker in FAILURE_MARKERS:
         if marker in text:
             return SubmitResult(False, reason=f"官方頁面回報：{marker}")
