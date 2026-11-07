@@ -10,7 +10,8 @@ OCR chain and a duck-typed fake page.
 import threading
 import time
 import typing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -461,7 +462,8 @@ def test_captcha_chain_prefers_the_baked_crnn_when_tensorflow_is_present(monkeyp
     chain = build_captcha_solver_from_env()
     assert chain is not None
     name, argv = chain.commands[0]
-    assert name == "keras-baked" and argv[-1].endswith("_ocr/tra_predict.py")
+    # Path parts, not a "/" suffix: the separator is "\\" on Windows.
+    assert name == "keras-baked" and Path(argv[-1]).parts[-2:] == ("_ocr", "tra_predict.py")
 
 
 def test_captcha_chain_is_none_without_any_ocr(monkeypatch, tmp_path) -> None:
@@ -608,7 +610,7 @@ def _scheduler_with(db, submitter, notifier) -> TaskScheduler:
 def test_submit_result_as_dict_carries_unknown() -> None:
     assert SubmitResult(False).unknown is False
     assert SubmitResult(False, unknown=True, reason="x").as_dict() == {
-        "ok": False, "booking_code": None, "reason": "x", "unknown": True,
+        "ok": False, "booking_code": None, "reason": "x", "unknown": True, "sold_out": False,
     }
 
 
@@ -1096,3 +1098,158 @@ def test_pre_click_browser_error_stays_a_clean_failure(monkeypatch) -> None:
     result = submitter.submit(OFFICIAL, "A123456789")
     assert (result.ok, result.unknown) == (False, False)
     assert "瀏覽器錯誤" in result.reason
+
+
+# ---- review fixes 2026-11-07 ---------------------------------------------------
+
+
+class _WizardPage(_DeadPage):
+    """Each native submit moves one page forward, like the real tip123."""
+
+    STEPS = (
+        "<html>tip123 query 請輸入身分證</html>",
+        "<html>queryTrain 請選擇車次</html>",
+        "<html>bookingTicket 請選擇票種</html>",
+        "<html>訂票成功 訂票代碼 2912979</html>",
+    )
+
+    def __init__(self):
+        super().__init__(self.STEPS)
+        self.advances = 0
+
+    def content(self):
+        return self.STEPS[min(self.advances, len(self.STEPS) - 1)]
+
+    def evaluate(self, script, arg=None):
+        if script is _JS_ADVANCE_FORM:
+            self.advances += 1
+            self.url = f"{self.url.split('#')[0]}#{self.advances}"
+            return True
+        return None
+
+
+def test_wizard_submits_every_step_without_a_captcha(monkeypatch) -> None:
+    # `clicked_any or advance()` short-circuited after the first submit, so a
+    # captcha-free wizard stopped at step one and parked as unknown.
+    page = _WizardPage()
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    result = PlaywrightAutoSubmitter(
+        timeout_ms=10, sleeper=lambda seconds: None, captcha_solver=None
+    ).submit(OFFICIAL, "A123456789")
+    assert page.advances == 3
+    assert (result.ok, result.booking_code) == (True, "2912979")
+
+
+def test_parser_tells_no_seat_from_a_real_failure() -> None:
+    assert parse_booking_outcome("此車次已售完，請改選其他時段").sold_out
+    assert parse_booking_outcome("該車次座位已滿").sold_out
+    assert not parse_booking_outcome("身分證字號格式錯誤").sold_out
+
+
+def _auto_task(tmp_path, monitor_until=None):
+    db = Database(tmp_path / "fix.db", encryption_key=Fernet.generate_key().decode())
+    user = db.create_user("a@b.com", "hash")
+    now = datetime.now(UTC)
+    task = db.create_task(
+        user.id, BookingRequest.from_dict(_booking()),
+        (now - timedelta(minutes=1)).isoformat(), _booking(),
+        mode=MODE_AUTO_SUBMIT, poll_interval_seconds=300,
+        monitor_until=monitor_until(now).isoformat() if monitor_until else None,
+    )
+    return db, user, task, now
+
+
+def test_sold_out_keeps_polling_on_schedule_until_the_window_closes(tmp_path) -> None:
+    db, user, task, now = _auto_task(tmp_path, lambda now: now + timedelta(minutes=40))
+    submitter = StubSubmitter(parse_booking_outcome("此車次已售完"))
+    scheduler = _scheduler_with(db, submitter, RecordingNotifier())
+    rounds = 0
+    for minute in range(1, 40, 5):  # one round per poll interval inside the window
+        scheduler.tick(now=(now + timedelta(minutes=minute)).isoformat())
+        _wait_for_browser_rounds()
+        rounds += 1
+        current = db.get_task(task.id, user.id)
+        # No seat is not a failure: no strike, no park, no reminder spam.
+        assert (current.status, current.check_failures) == ("monitoring", 0)
+    assert rounds > MAX_AUTOBOOK_FAILURES
+    assert len(submitter.calls) == rounds
+    assert scheduler.notifier.reminded == []
+    scheduler.tick(now=(now + timedelta(minutes=41)).isoformat())
+    assert db.get_task(task.id, user.id).status == "expired"
+
+
+def test_cancel_after_the_reread_still_stops_the_submit(tmp_path) -> None:
+    db, user, task, now = _auto_task(tmp_path)
+    [claimed] = db.claim_due_checks(now.isoformat())
+    original_get_task = db.get_task
+    reads = {"n": 0}
+
+    def get_task(task_id, user_id):
+        record = original_get_task(task_id, user_id)
+        reads["n"] += 1
+        if reads["n"] == 2:  # the person cancels right after the last re-read
+            db.update_task_status(task_id, user_id, "cancelled")
+        return record  # the stale 'monitoring' copy
+
+    db.get_task = get_task
+    submitter = StubSubmitter(SubmitResult(True, booking_code="2912979"))
+    scheduler = _scheduler_with(db, submitter, RecordingNotifier())
+    scheduler._autobook_round(claimed)
+    assert submitter.calls == []  # the sentinel compare-and-swap refused
+    assert original_get_task(task.id, user.id).status == "cancelled"
+
+
+def test_parking_never_revives_a_cancelled_task(tmp_path) -> None:
+    db, user, task, _ = _auto_task(tmp_path)
+    db.update_task_status(task.id, user.id, "cancelled")
+    assert not db.park_for_human_review(task.id, user.id, last_error="x")
+    assert db.get_task(task.id, user.id).status == "cancelled"
+
+
+def test_monitoring_window_defaults_to_departure(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TRA_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("TRA_AUTOBOOK_ENABLED", raising=False)
+    monkeypatch.setenv("TRA_TOKEN_SECRET", "x" * 32)
+
+    class TimetableTdx:
+        configured = True
+
+        def stations(self, fallback):
+            return list(fallback)
+
+        def load_cached_stations(self):
+            return []
+
+        def booking_link(self, *args):
+            return OFFICIAL
+
+        def daily_timetable(self, start_id, end_id, ride_date):
+            return [{
+                "TrainInfo": {"TrainNo": "152"},
+                "StopTimes": [{"DepartureTime": "17:53"}, {"ArrivalTime": "19:00"}],
+            }]
+
+    db = Database(tmp_path / "tra.db", encryption_key=Fernet.generate_key().decode())
+    app = create_app(database=db, token_manager=TokenManager(), tdx_client=TimetableTdx(),
+                     start_scheduler=False, autobook=StubSubmitter(SubmitResult(False)))
+
+    def until(client, headers, booking, monitor_until=None):
+        body = {"booking": booking, "mode": MODE_AUTO_SUBMIT, "train_label": "152"}
+        if monitor_until:
+            body["monitor_until"] = monitor_until
+        response = client.post("/tasks", json=body, headers=headers)
+        assert response.status_code == 201, response.text
+        return datetime.fromisoformat(response.json()["monitor_until"])
+
+    taipei = timezone(timedelta(hours=8))
+    departure = datetime(2099, 1, 1, 17, 53, tzinfo=taipei)
+    with TestClient(app) as client:
+        headers = _register(client)
+        assert until(client, headers, _booking()) == departure
+        # A later stop time still ends at departure; an earlier one wins.
+        assert until(client, headers, _booking(), "2099-01-02T12:00:00+08:00") == departure
+        earlier = datetime(2099, 1, 1, 12, 0, tzinfo=taipei)
+        assert until(client, headers, _booking(), earlier.isoformat()) == earlier
+        # No timetable match: the end of the ride date bounds it.
+        unknown = {**_booking(), "outbound": {"ride_date": "2099/01/01", "train_numbers": ["999"]}}
+        assert until(client, headers, unknown) == datetime(2099, 1, 1, 23, 59, 59, tzinfo=taipei)

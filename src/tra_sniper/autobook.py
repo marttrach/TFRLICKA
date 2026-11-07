@@ -47,6 +47,8 @@ FAILURE_MARKERS = (
     # Not in the initial HTML (grep-verified), so it cannot misfire pre-submit.
     "身分證字號格式錯誤",
 )
+# The FAILURE_MARKERS that mean "no seat right now", not "something broke".
+SOLD_OUT_MARKERS = frozenset({"已售完", "售完", "已滿", "已满"})
 # TRA's 電腦代碼. Live-verified 2026-11-07 (tip115 success page): the current
 # code is PLAIN digits ("訂票代碼 2854451") — a letters-only pattern silently
 # misses it. Label-anchored ONLY: unlabeled success text is a banner, not a
@@ -230,6 +232,9 @@ class SubmitResult:
     booking_code: str | None = None
     reason: str = ""
     unknown: bool = False
+    # No seat this round: the normal answer while waiting for one, so the
+    # scheduler keeps polling instead of counting it as a failure.
+    sold_out: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -237,6 +242,7 @@ class SubmitResult:
             "booking_code": self.booking_code,
             "reason": self.reason,
             "unknown": self.unknown,
+            "sold_out": self.sold_out,
         }
 
 
@@ -264,7 +270,9 @@ def parse_booking_outcome(page_text: str) -> SubmitResult:
         )
     for marker in FAILURE_MARKERS:
         if marker in text:
-            return SubmitResult(False, reason=f"官方頁面回報：{marker}")
+            return SubmitResult(
+                False, reason=f"官方頁面回報：{marker}", sold_out=marker in SOLD_OUT_MARKERS
+            )
     return SubmitResult(False, reason="讀不到訂票結果（頁面可能已改版）")
 
 
@@ -556,7 +564,9 @@ class PlaywrightAutoSubmitter:
                                 )
                             continue
                     try:
-                        clicked_any = clicked_any or advance()
+                        # advance() first: `clicked_any or advance()` would
+                        # short-circuit and never submit past the first step.
+                        clicked_any = advance() or clicked_any
                     except error_type as exc:
                         # A raised submit may still have been accepted by the
                         # server: a retry could book a second real, paid ticket.

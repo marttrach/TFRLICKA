@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from typing import Annotated, Any
 
 from fastapi import (
@@ -34,7 +35,7 @@ from .agent import BearerGuard
 from .auth import TokenManager, hash_password, verify_password
 from .autobook import build_autobook_submitter_from_env
 from .logging_config import configure_logging
-from .models import BOOKING_TIME_LABELS, TAIWAN_TZ, BookingRequest
+from .models import BOOKING_TIME_LABELS, TAIWAN_TZ, BookingRequest, OrderType
 from .ocr import MAX_IMAGE_BYTES, OcrService
 from .scheduler import TaskScheduler
 from .storage import (
@@ -47,7 +48,7 @@ from .storage import (
     TaskRecord,
     UserRecord,
 )
-from .suggestions import SuggestionService
+from .suggestions import SuggestionService, _station_id, parse_candidate
 from .tdx import TdxClient, TdxError
 from .tra_ocr import TraOcrService
 
@@ -481,6 +482,41 @@ def create_app(
             raise HTTPException(status_code=404, detail="常用資料不存在")
         return Response(status_code=204)
 
+    def _departure_deadline(booking: BookingRequest) -> datetime:
+        """When the outbound ride leaves, as precisely as we can know it.
+
+        The latest departure among the task's train numbers from the TDX
+        timetable; without TDX (or a match), the end of the ride date. A
+        time-window task leaves by the window's end when it searches by
+        departure.
+        """
+        leg = booking.outbound
+        day = date.fromisoformat(leg.ride_date.replace("/", "-"))
+        end_of_day = datetime.combine(day, dt_time(23, 59, 59), TAIWAN_TZ)
+        if booking.order_type is OrderType.BY_TIME:
+            if leg.search_by_departure and leg.end_time:
+                return datetime.combine(day, dt_time.fromisoformat(leg.end_time), TAIWAN_TZ)
+            return end_of_day
+        if not getattr(tdx, "configured", False):
+            return end_of_day
+        try:
+            records = tdx.daily_timetable(
+                _station_id(booking.start_station), _station_id(booking.end_station), leg.ride_date
+            )
+            departures = [
+                candidate.departure_time
+                for candidate in (parse_candidate(record, 0, 24 * 60) for record in records)
+                if candidate.train_no in leg.train_numbers
+            ]
+            if departures:
+                return datetime.combine(day, dt_time.fromisoformat(max(departures)), TAIWAN_TZ)
+        except Exception:  # noqa: BLE001 - a missing timetable falls back to the day's end
+            logger.warning(
+                "could not read the departure time; monitoring until the end of the ride date",
+                extra={"event": "task.departure_unknown"},
+            )
+        return end_of_day
+
     def _create_task(body: TaskCreate, user: UserRecord) -> TaskRecord:
         booking_payload = dict(body.booking)
         booking_payload.pop("member_login", None)
@@ -518,6 +554,13 @@ def create_app(
                 raise HTTPException(
                     status_code=422, detail="monitor_until must be after the start time"
                 )
+        # Polling past departure can only chase a train that has left, so the
+        # window closes at the earlier of the person's stop time and departure.
+        departure = _departure_deadline(booking)
+        if departure <= scheduled_at:
+            raise HTTPException(status_code=422, detail="這班車已經發車，無法再監控")
+        if monitor_until is None or departure < monitor_until:
+            monitor_until = departure
         task = db.create_task(
             user.id,
             booking,
@@ -1007,9 +1050,11 @@ def create_app(
 
         From start_at (ISO time, Taiwan time if no offset; default now) it sends
         a webhook reminder every remind_every_minutes (min 1) until booked,
-        cancelled or monitor_until; remind_once sends a single reminder. The
-        returned official_url is the pre-filled TRA booking page; send it to
-        the person straight away (it expires within minutes).
+        cancelled or monitor_until; remind_once sends a single reminder.
+        Monitoring never runs past the train's departure, which is also the
+        default monitor_until. The returned official_url is the pre-filled TRA
+        booking page; send it to the person straight away (it expires within
+        minutes).
 
         auto_submit (needs TRA_AUTOBOOK_ENABLED) makes every round open the
         official page in a headless browser, enter the person's stored ID and

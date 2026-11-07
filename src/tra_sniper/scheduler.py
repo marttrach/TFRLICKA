@@ -164,10 +164,14 @@ class TaskScheduler:
         try:
             with self._browser_slot:
                 current = self.database.get_task(task_id, user_id)
-                if current is None or current.status not in AUTOBOOK_CLAIMABLE_STATUSES:
+                # The sentinel write is the compare-and-swap: a person who
+                # cancelled after the read above makes it match nothing.
+                if (
+                    current is None
+                    or current.status not in AUTOBOOK_CLAIMABLE_STATUSES
+                    or not self._mark_autobooking(current)
+                ):
                     return SubmitResult(False, reason="任務已結束，不再訂票")
-                # Last durable trace that a submit may have been accepted.
-                self.database.update_task_status(task_id, user_id, "autobooking")
                 try:
                     result = self.autobook.submit(official_url, identity)
                 except Exception as exc:
@@ -188,6 +192,9 @@ class TaskScheduler:
                         last_error=None,
                         only_from=AUTOBOOK_CLAIMABLE_STATUSES,
                     )
+                    return result
+                if result.sold_out:
+                    self._note_no_seat(current)
                     return result
                 failures = self._count_autobook_failure(current)
                 if result.unknown:
@@ -254,8 +261,11 @@ class TaskScheduler:
             fresh = self.database.get_task(task.id, task.user_id)
             if fresh is None or fresh.status not in AUTOBOOK_CLAIMABLE_STATUSES:
                 return True
-            # Durable trace that a submit may have been accepted (crash-safe).
-            self.database.update_task_status(task.id, task.user_id, "autobooking")
+            # Durable trace that a submit may have been accepted (crash-safe),
+            # written as a compare-and-swap so a cancel landing after the
+            # re-read still wins.
+            if not self._mark_autobooking(task):
+                return True
             clicked = True
             result = self.autobook.submit(official_url, identity)
         except Exception as exc:
@@ -284,9 +294,14 @@ class TaskScheduler:
                 booking_code=code, last_error=None,
                 only_from=AUTOBOOK_CLAIMABLE_STATUSES,
             ):
+                # The ticket exists either way; the code must survive somewhere.
                 logger.warning(
                     "a person ended this task while the browser was on the page",
-                    extra={"event": "autobook.completed_refused", "task_id": task.id},
+                    extra={
+                        "event": "autobook.completed_refused",
+                        "task_id": task.id,
+                        "booking_code": code,
+                    },
                 )
                 return True
             booked = self.database.get_task(task.id, task.user_id)
@@ -304,6 +319,9 @@ class TaskScheduler:
             )
             return True
 
+        if result.sold_out:
+            self._note_no_seat(task)
+            return True
         logger.info(
             "auto-submit did not finish; reminding the person instead",
             extra={
@@ -330,6 +348,36 @@ class TaskScheduler:
         except Exception:  # noqa: BLE001, S110 - bookkeeping must never outrank the reminder
             pass
         return False
+
+    def _mark_autobooking(self, task: TaskRecord) -> bool:
+        """Swap to the 'autobooking' sentinel; False if the task left the loop."""
+        return self.database.update_task_status(
+            task.id, task.user_id, "autobooking", only_from=AUTOBOOK_CLAIMABLE_STATUSES
+        )
+
+    def _note_no_seat(self, task: TaskRecord) -> None:
+        """No seat this round: keep polling on schedule, no strike, no reminder.
+
+        Waiting for a seat is the job, so this is not a failure; the window
+        (monitor_until, defaulted to departure) is what ends the task.
+        """
+        logger.info(
+            "no seat this round; polling again on schedule",
+            extra={"event": "autobook.sold_out", "task_id": task.id},
+        )
+        try:
+            self.database.clear_check_failures(task.id)
+            self.database.update_task_status(
+                task.id, task.user_id,
+                "monitoring" if task.status == "autobooking" else task.status,
+                last_error="本輪無票，依排程繼續輪詢",
+                only_from=AUTOBOOK_CLAIMABLE_STATUSES,
+            )
+        except Exception:
+            logger.exception(
+                "could not record the no-seat round",
+                extra={"event": "autobook.sold_out_record_failed", "task_id": task.id},
+            )
 
     def _count_autobook_failure(self, task: TaskRecord) -> int:
         try:

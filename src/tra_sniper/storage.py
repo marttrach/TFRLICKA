@@ -684,13 +684,16 @@ class Database:
         """One atomic write taking a task out of the poll loop for a person.
 
         Status leaves POLLABLE_STATUSES and next_check_at goes NULL, so no
-        tick can claim it again; the reason stays visible on the task.
+        tick can claim it again; the reason stays visible on the task. Only an
+        automated round's states qualify: a task the person already cancelled
+        or completed stays that way.
         """
+        guard = ", ".join("?" for _ in AUTOBOOK_CLAIMABLE_STATUSES)
         with self.connect() as connection:
             cursor = connection.execute(
                 "UPDATE tasks SET status = 'waiting_human', updated_at = ?, last_error = ?, "
-                "next_check_at = NULL WHERE id = ? AND user_id = ?",
-                (utc_now(), last_error, task_id, user_id),
+                f"next_check_at = NULL WHERE id = ? AND user_id = ? AND status IN ({guard})",
+                (utc_now(), last_error, task_id, user_id, *AUTOBOOK_CLAIMABLE_STATUSES),
             )
         return cursor.rowcount == 1
 
