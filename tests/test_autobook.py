@@ -885,11 +885,18 @@ class _DeadPage:
         self.url = "https://www.trc.com.tw/tra-tip-web/tip/tip001/tip123/query"
         self.show_captcha_field = False
         self.raise_content_after_submit = False
+        self.navigate_errors = 0
 
     def goto(self, url, **kwargs):
         pass
 
     def content(self):
+        if self.submitted and self.navigate_errors > 0:
+            self.navigate_errors -= 1
+            raise RuntimeError(
+                "Page.content: Unable to retrieve content because the "
+                "page is navigating and changing the content."
+            )
         if self.submitted and self.raise_content_after_submit:
             raise RuntimeError(
                 "Page.content: Unable to retrieve content because the "
@@ -928,6 +935,27 @@ def test_post_click_unreadable_page_returns_unknown_not_raise(monkeypatch) -> No
     assert (result.ok, result.unknown) == (False, True)
     assert "訂票結果" in result.reason
     assert page.submitted  # the native submit really happened
+
+
+def test_accepted_submit_reports_booking_code_not_parked(monkeypatch) -> None:
+    # Live NAS 2026-11-07 06:37: the captcha answer was ACCEPTED and tip115
+    # answered 訂票成功 代碼 2912979 -- but the loop-top content() read raced
+    # the navigation and parked a BOOKED ticket as unknown. Reads must poll
+    # through navigation and report the code.
+    page = _DeadPage([
+        "<html>請選擇車次</html>",
+        "<html>訂票人H12536" + "XXXX" + " 訂票成功！ 請選擇票種/付款方式，並於 11/07 (Sat) 24:00 "
+        "前完成付款。 訂票代碼 2912979 11/08(星期日) 17:53 新竹 到 18:52 大甲 "
+        "自強(3000) 179 下一步</html>",
+    ])
+    page.navigate_errors = 45  # settle burns 20; the loop-top read the rest
+    _fake_playwright(monkeypatch, page, error_type=RuntimeError)
+    submitter = PlaywrightAutoSubmitter(
+        timeout_ms=10, sleeper=lambda seconds: None, captcha_solver=None
+    )
+    result = submitter.submit(OFFICIAL, "A123456789")
+    assert (result.ok, result.booking_code) == (True, "2912979")
+    assert page.submitted
 
 
 def test_navigation_crash_after_submit_parks_unknown(monkeypatch) -> None:

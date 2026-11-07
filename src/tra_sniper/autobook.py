@@ -386,9 +386,31 @@ class PlaywrightAutoSubmitter:
                 )
             self._human_pause()
 
+            def read_content() -> str:
+                """page.content() that survives navigation races.
+
+                A just-accepted submit can leave Playwright raising
+                'Unable to retrieve content' for a beat (the 2026-11-07
+                tip115 miss: the booking had ALREADY succeeded, the read
+                raced the navigation and the round parked as unknown).
+                Poll until readable; the final raise keeps the
+                post-submit unknown-park invariant intact.
+                """
+                last: Exception | None = None
+                waited = 0.0
+                while waited < STEP_DEADLINE_SECONDS:
+                    try:
+                        return page.content()
+                    except error_type as exc:
+                        last = exc
+                        self._sleep(0.5)
+                        waited += 0.5
+                assert last is not None
+                raise last
+
             identity_input = self._first_visible(page, IDENTITY_INPUT_SELECTORS)
             if identity_input is None:
-                outcome = parse_booking_outcome(page.content())
+                outcome = parse_booking_outcome(read_content())
                 if outcome.ok or "官方頁面回報" in outcome.reason:
                     return outcome  # the page already resolved before we typed
                 # Name the page we actually landed on: the last incident was a
@@ -439,7 +461,7 @@ class PlaywrightAutoSubmitter:
 
             def advance() -> bool:
                 """Native-submit the current wizard step; False if unadvanceable."""
-                prev_url, prev_content = page.url, page.content()
+                prev_url, prev_content = page.url, read_content()
                 # NO radio click here: the row's click handler re-fetches the
                 # picture captcha and invalidates a code just OCR'd (live NAS
                 # incident 2026-11-07: 3 correct keras answers, all rejected).
@@ -456,7 +478,7 @@ class PlaywrightAutoSubmitter:
             last_url = ""
             try:
                 for _step in range(WIZARD_STEPS):
-                    content = page.content()
+                    content = read_content()
                     url_now = page.url
                     gate = (
                         self.captcha_solver is not None
@@ -540,7 +562,7 @@ class PlaywrightAutoSubmitter:
                         )
                         message = str(exc).splitlines()[0] if str(exc) else "送出後瀏覽器錯誤"
                         return SubmitResult(False, unknown=True, reason=f"瀏覽器錯誤：{message}")
-                outcome = parse_booking_outcome(page.content())
+                outcome = parse_booking_outcome(read_content())
                 if outcome.ok or "官方頁面回報" in outcome.reason:
                     return outcome
                 logger.warning(
