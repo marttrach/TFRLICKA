@@ -493,18 +493,17 @@ class PlaywrightAutoSubmitter:
                                 False, reason="圖形驗證碼連續未通過，下一輪自動重試"
                             )
                         captcha_budget -= 1
-                        # Re-render may have UNCHECKED the row: re-select it
-                        # BEFORE fetching the picture (the click re-fetches
-                        # the captcha; fetching first would OCR a doomed
-                        # image, see the 2026-11-07 rejection loop) and let
-                        # the reload land before _solve_captcha reads it.
-                        with suppress(error_type):
-                            page.evaluate(_JS_SELECT_TRAIN)
-                            self._human_pause(0.4, 0.8)
+                        # Solve AND submit in one shot (replay order): the
+                        # atomic last-tick inside _solve_captcha re-checks the
+                        # row, burns the v3 token and native-submits without
+                        # ever releasing the solved code back to the page.
                         try:
-                            self._solve_captcha(page, prefill, submit=False)
+                            solved = self._solve_captcha(page, prefill, submit=True)
                         except error_type:
-                            pass  # stale page under us: the advance re-reads
+                            solved = False  # stale page: advance() re-reads
+                        if solved:
+                            clicked_any = True
+                            continue
                     try:
                         clicked_any = clicked_any or advance()
                     except error_type as exc:
@@ -549,6 +548,7 @@ class PlaywrightAutoSubmitter:
         session cookie (the picture is session-bound) comes along for free.
         """
         import os
+        import secrets
         import tempfile
         from urllib.parse import urljoin
 
@@ -558,7 +558,12 @@ class PlaywrightAutoSubmitter:
             return False
         src = image.get_attribute("src") or CAPTCHA_FALLBACK_IMAGE_PATH
         try:
-            url = urljoin(page.url, f"{src.split('?')[0]}?r={os.getpid()}")
+            # Cache-buster MUST be per-fetch random (replay used Math.random):
+            # the container's uvicorn is always pid 1, and a constant ?r= made
+            # every round re-fetch one cached picture while the server's
+            # expected code rotated -- nine correct OCR answers, nine rejects
+            # (NAS incident 2026-11-07).
+            url = urljoin(page.url, f"{src.split('?')[0]}?r={secrets.token_hex(6)}")
             # Fetch inside the page so every session cookie (SameSite included)
             # rides along -- proven path from the puppeteer replay, 2026-11-06.
             body_b64 = page.evaluate(
@@ -644,6 +649,38 @@ class PlaywrightAutoSubmitter:
             code,
         )
         if not submit:
+            return True
+        # Last-tick pass, verbatim from the replay that booked real tickets:
+        # radio re-check, token burn, code refill and native form.submit() in
+        # ONE evaluate -- nothing (captcha re-fetch, page JS, round-trips)
+        # can slip between the filled code and the request leaving the
+        # browser. Falls back to the visible button on pages with no
+        # selectLoc form (other wizard steps).
+        try:
+            submitted = bool(
+                page.evaluate(
+                    """(code) => {
+                        const rows = [...document.querySelectorAll("input[name^='selectLoc']")];
+                        if (!rows.length) return false;
+                        const hidden = document.querySelector("input[name*='trainNoList']");
+                        const want = hidden ? String(hidden.value || '').trim() : '';
+                        const tg = rows.find(r => want && (r.closest('tr')?.innerText || '').includes(want)) || rows[0];
+                        if (tg && !tg.checked) tg.click();
+                        document.querySelectorAll("input[name=g-recaptcha-response]").forEach(
+                            i => { if (i.value !== code) { i.value = ''; } i.disabled = false; });
+                        const vc = document.querySelector("#verifyCode"); if (vc) vc.value = code;
+                        const isv = document.querySelector("input[name=isSecondVerify]"); if (isv) isv.value = 'true';
+                        const vt = document.querySelector("input[name=verifyType]"); if (vt) vt.value = 'text';
+                        const f = [...document.querySelectorAll("form")].find(x => x.querySelector("input[name^='selectLoc']"));
+                        if (f) { f.submit(); return true; }
+                        return false;
+                    }""",
+                    code,
+                )
+            )
+        except Exception:  # noqa: BLE001 - stale page; button fallback below
+            submitted = False
+        if submitted:
             return True
         submit_button = self._first_visible(page, SUBMIT_BUTTON_SELECTORS)
         if submit_button is None:
