@@ -503,6 +503,21 @@ def test_resolve_deeplink_passes_through_non_deeplinks_and_failures() -> None:
     assert _resolve_deeplink(dead) == dead  # unresolvable: still worth a browser try
 
 
+def test_captcha_image_url_cache_buster_is_random() -> None:
+    # NAS incident 2026-11-07: cache-buster was os.getpid(), uvicorn in the
+    # container is ALWAYS pid 1, every round re-fetched one cached picture
+    # while the server's expected code rotated -- 9 correct OCR hits, 0 pass.
+    urls = []
+    for _ in range(2):
+        page = FakePage()
+        submitter = PlaywrightAutoSubmitter(
+            captcha_solver=FakeChain("AB3D9F"), sleeper=lambda seconds: None
+        )
+        assert submitter._solve_captcha(page) is True
+        urls.extend(str(a) for s, a in page.evaluates if "player/picture" in str(a))
+    assert len(urls) == 2 and urls[0] != urls[1]
+
+
 def test_solve_captcha_reads_image_fills_and_resubmits() -> None:
     page = FakePage()
     submitter = PlaywrightAutoSubmitter(
