@@ -85,7 +85,7 @@ CI 需要 repository secrets `DOCKERHUB_USERNAME` 與 `DOCKERHUB_TOKEN`（Read &
 
 ## 🚀 自動訂票（auto_submit，reCAPTCHA v3）
 
-第三種執行模式：到點不再只提醒你，而是由伺服器**自己開官方訂票頁、輸入身分證、按下訂票**。
+唯一的執行模式：每一輪由伺服器**自己開官方訂票頁、輸入身分證、按下訂票**。
 reCAPTCHA v3 沒有圖要認——它只看不動聲色地打分數，所以「破解」的做法是讓頁面在**真正的
 headless Chromium**（真實指紋、逐字鍵入、隨機停留）裡自己生出 v3 token，不偽造、不重放。
 
@@ -94,11 +94,12 @@ headless Chromium**（真實指紋、逐字鍵入、隨機停留）裡自己生�
 - **圖形驗證碼後備**：reCAPTCHA Enterprise v3 對 datacenter IP 分數歸零時，官方頁會改出
   圖形驗證碼；內建 OCR 鏈（自訓 Keras CRNN 為主、ddddocr 為備，見 `TRA_OCR_HOME`）
   抓圖、認字、重填再送，預設重試 3 次（台鐵驗證碼大小寫不敏感）
-- 每一輪：成功 → 自動記錄電腦代碼、任務結束並通知；失敗（售完、驗證沒過、頁面改版）
-  → 自動**退回原本的提醒**，訂票機會不會遺失
+- 每一輪：成功 → 自動記錄電腦代碼、任務結束並通知；售完／已滿 → 不算失敗，照排程下一輪再試；
+  其他失敗（驗證沒過、頁面改版）→ 自動**退回提醒**，訂票機會不會遺失
+- 監控最晚到**發車時間**（TDX 時刻表；查不到時為乘車日結束），或你指定的停止時間，取較早者
 - 任務需有身分證（乘車人帶入）；失敗原因顯示在任務的 `last_error`
 - 手動試單：`POST /api/tasks/{id}/autobook/try`，或 MCP 工具 `try_auto_booking`
-- 開關：MCP `set_auto_submit(task_id, true/false)`；建立任務時 `auto_submit=true`
+- 伺服器沒設 `TRA_AUTOBOOK_ENABLED` 時，每一輪只會發提醒
 
 > 官方頁面改版時，只需更新 `src/tra_sniper/autobook.py` 頂部的 selector 與結果字樣。
 
@@ -149,11 +150,9 @@ agent 以 `TRA_AGENT_EMAIL` 這個帳號的身分操作，`TRA_AGENT_TOKEN` 未�
 
 | 欄位 | 意義 | 預設 |
 |---|---|---|
-| `scheduled_at`／`monitor_start_at` | 何時**開始**提醒 | 立即 |
-| `poll_interval_seconds` | 沒回報訂到時，多久再提醒一次 | 300 秒（5 分鐘） |
-| `monitor_until` | 提醒**截止**時間 | 未設定＝直到回報訂到或取消 |
-
-執行模式：`monitor_only`（到點提醒一次）或 `book_when_available`（每個間隔提醒一次）。
+| `scheduled_at`／`monitor_start_at` | 何時**開始**自動訂票 | 立即 |
+| `poll_interval_seconds` | 沒訂到時，多久再試一次 | 300 秒（5 分鐘） |
+| `monitor_until` | **截止**時間 | 未設定＝發車時間（晚於發車也會截在發車） |
 
 > **提醒代表「現在可以去訂」，不代表有位。** 台鐵沒有可用的餘位開放資料，
 > 任務回應中的 `availability` 恆為 `unknown`；有沒有位只有你按下訂票後才知道。

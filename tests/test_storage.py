@@ -176,3 +176,24 @@ def test_database_runs_in_wal_mode(tmp_path) -> None:
     database = Database(tmp_path / "wal.db", encryption_key=Fernet.generate_key().decode())
     with database.connect() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_reminder_only_modes_migrate_to_auto_submit_on_start(tmp_path) -> None:
+    # monitor_only / book_when_available were removed; rows left by an older
+    # build must come back as auto_submit, not as a mode nothing handles.
+    key = Fernet.generate_key().decode()
+    database = Database(tmp_path / "app.db", encryption_key=key)
+    user = database.create_user("user@example.com", "password-hash")
+    tasks = [
+        database.create_task(
+            user.id, BookingRequest.from_dict(booking_data()),
+            datetime.now(UTC).isoformat(), booking_data(),
+        )
+        for _ in range(2)
+    ]
+    with database.connect() as connection:
+        for task, old_mode in zip(tasks, ("monitor_only", "book_when_available"), strict=True):
+            connection.execute("UPDATE tasks SET mode = ? WHERE id = ?", (old_mode, task.id))
+
+    reopened = Database(tmp_path / "app.db", encryption_key=key)
+    assert {reopened.get_task(task.id, user.id).mode for task in tasks} == {"auto_submit"}

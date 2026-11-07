@@ -8,8 +8,6 @@ from .autobook import SubmitResult
 from .notifications import WebhookNotifier
 from .storage import (
     AUTOBOOK_CLAIMABLE_STATUSES,
-    MODE_AUTO_SUBMIT,
-    MODE_MONITOR_ONLY,
     Database,
     TaskRecord,
 )
@@ -25,16 +23,15 @@ MAX_AUTOBOOK_FAILURES = 5
 
 
 class TaskScheduler:
-    """Send a booking reminder, carrying the official link, for every due round.
+    """Try to book every due task in a headless browser, round after round.
 
-    No seat-availability source exists, so a round cannot know whether a seat
-    freed up; it reminds the person, whose browser does the booking. Reminders
-    repeat every poll interval until the task is booked, cancelled or its
-    window closes. monitor_only reminds once, and only parks after that
-    reminder actually left — a reminder nobody received is not a sent reminder.
-    auto_submit asks the browser submitter to book on the person's behalf
-    first; the reminder only goes out when that attempt could not finish the
-    job and did not end with a click whose outcome we cannot read.
+    No seat-availability source exists, so each round simply attempts the
+    booking; a sold-out answer waits for the next round. Rounds repeat every
+    poll interval until the task is booked, cancelled or its window closes
+    (departure at the latest). A reminder carrying the official link only
+    goes out when an attempt could not finish the job and did not end with a
+    click whose outcome we cannot read — or on every round when the server
+    runs without the browser (TRA_AUTOBOOK_ENABLED off).
     """
 
     def __init__(
@@ -48,8 +45,8 @@ class TaskScheduler:
         self.database = database
         self.interval_seconds = interval_seconds
         self.notifier = notifier or WebhookNotifier.from_env()
-        # Anything with submit(url, identity) -> SubmitResult; None disables
-        # auto_submit mode, whose tasks then behave like book_when_available.
+        # Anything with submit(url, identity) -> SubmitResult; None (the
+        # server's kill switch) turns every round into a plain reminder.
         self.autobook = autobook
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -92,7 +89,7 @@ class TaskScheduler:
             else self.database.claim_due_checks()
         )
         for task in claimed:
-            if task.mode == MODE_AUTO_SUBMIT and self.autobook is not None:
+            if self.autobook is not None:
                 self._start_autobook(task)
             else:
                 due.append(task)
@@ -102,10 +99,7 @@ class TaskScheduler:
                 extra={"event": "scheduler.tasks_claimed", "claimed_count": len(due)},
             )
         for task in due:
-            # Park monitor_only only after the reminder is out: a failed send
-            # leaves the task monitoring so the next interval retries it.
-            if self._remind(task) and task.mode == MODE_MONITOR_ONLY:
-                self.database.pause_monitoring(task.id, task.user_id, "waiting_human")
+            self._remind(task)
         return len(due)
 
     def _remind(self, task: TaskRecord) -> bool:
@@ -222,12 +216,12 @@ class TaskScheduler:
     def _autobook_round(self, task: TaskRecord) -> None:
         try:
             with self._browser_slot:
-                # The task may have been booked, cancelled or switched to plain
-                # reminders while this round queued for the browser.
+                # The task may have been booked or cancelled while this round
+                # queued for the browser.
                 current = self.database.get_task(task.id, task.user_id)
                 if current is None or current.status in FINISHED_STATUSES:
                     return
-                if current.mode != MODE_AUTO_SUBMIT or not self._try_autobook(current):
+                if not self._try_autobook(current):
                     self._remind(current)
         except Exception:
             logger.exception(

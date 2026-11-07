@@ -21,7 +21,7 @@ services:
       TRA_AGENT_TOKEN: ${TRA_AGENT_TOKEN:-}
       TRA_AGENT_EMAIL: ${TRA_AGENT_EMAIL:-}
       # Auto-submit (reCAPTCHA v3 + picture-code OCR baked into the image).
-      # Leave TRA_AUTOBOOK_ENABLED empty to keep pure reminder behaviour.
+      # Every task auto-books; leaving this empty turns each round into a reminder.
       TRA_AUTOBOOK_ENABLED: ${TRA_AUTOBOOK_ENABLED:-}
       TRA_AUTOBOOK_HEADLESS: ${TRA_AUTOBOOK_HEADLESS:-1}
       TRA_AUTOBOOK_TIMEOUT_MS: ${TRA_AUTOBOOK_TIMEOUT_MS:-30000}

@@ -100,7 +100,6 @@ interface BookingFormState {
   endCounty: string;
   startStation: string;
   endStation: string;
-  mode: "monitor_only" | "book_when_available" | "auto_submit";
   startNow: boolean;
   pollIntervalMinutes: number;
   monitorUntil: string;
@@ -128,7 +127,6 @@ const defaultForm: BookingFormState = {
   endCounty: "臺中市",
   startStation: "1000-臺北",
   endStation: "3300-臺中",
-  mode: "book_when_available",
   startNow: true,
   pollIntervalMinutes: 5,
   monitorUntil: "",
@@ -583,7 +581,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         // server compare it to its own only ever measured the gap between them.
         scheduled_at: form.startNow ? null : new Date(form.scheduledAt).toISOString(),
         traveler_id: form.travelerId,
-        mode: form.mode,
         train_label: form.chosenTrain ? trainLabel(form.chosenTrain) : `車次 ${form.trainNumber}`,
         poll_interval_seconds: form.pollIntervalMinutes * 60,
         monitor_until: form.monitorUntil ? new Date(form.monitorUntil).toISOString() : null,
@@ -791,12 +788,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               )}
               <label>一般座票數<select value={form.quantity} onChange={(e) => setForm({ ...form, quantity: Number(e.target.value) })}>{[1, 2, 3, 4, 5, 6].map((value) => <option key={value}>{value}</option>)}</select></label>
               <fieldset className="mode-switch wide">
-                <legend>執行模式</legend>
-                <label><input type="radio" checked={form.mode === "monitor_only"} onChange={() => setForm({ ...form, mode: "monitor_only" })} /> 只監控，到點提醒我</label>
-                <label><input type="radio" checked={form.mode === "book_when_available"} onChange={() => setForm({ ...form, mode: "book_when_available" })} /> 到點就準備訂票頁</label>
-                <label><input type="radio" checked={form.mode === "auto_submit"} onChange={() => setForm({ ...form, mode: "auto_submit" })} /> 自動訂票（reCAPTCHA v3，需伺服器啟用）</label>
-              </fieldset>
-              <fieldset className="mode-switch wide">
                 <legend>開始時間</legend>
                 <label><input type="radio" checked={form.startNow} onChange={() => setForm({ ...form, startNow: true })} /> 立即開始</label>
                 <label><input type="radio" checked={!form.startNow} onChange={() => setForm({ ...form, startNow: false })} /> 指定時間</label>
@@ -860,7 +851,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <span className={`status status-${task.status}`}>{LIVE_STATUSES.includes(task.status) && <i className="pulse-dot" />}{STATUS_TEXT[task.status] ?? task.status}</span>
                     <h3>{task.route}</h3>
                     <p className="task-train">{task.train_label ?? "未指定車次"}</p>
-                    <p>{task.ride_date} · {task.mode === "monitor_only" ? "到點提醒一次" : task.mode === "auto_submit" ? "自動訂票，失敗才提醒" : "每輪提醒並附訂票連結"}</p>
+                    <p>{task.ride_date} · 自動訂票，沒票就照排程再試</p>
                     {task.booking_code && <p className="booking-code">訂位代碼 <b>{task.booking_code}</b></p>}
                   </div>
                   <dl className="task-time">
@@ -879,7 +870,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
                     <details className="task-details">
                       <summary>查看詳情</summary>
                       <p>查詢間隔：每 {Math.round(task.poll_interval_seconds / 60)} 分鐘</p>
-                      <p>監控截止：{task.monitor_until ? formatDate(task.monitor_until) : task.mode === "monitor_only" ? "未設定（提醒一次）" : "未設定（直到訂到或取消）"}</p>
+                      <p>監控截止：{task.monitor_until ? formatDate(task.monitor_until) : "發車時"}</p>
                       <p className="unknown">{task.availability_note}</p>
                       {task.last_error && <p className="error">最近錯誤：{task.last_error}</p>}
                       {task.status === "waiting_human" && <button className="compact" title="檔案可能包含已保存的台鐵會員登入資料，使用後請妥善刪除" onClick={() => downloadConfig(task.id)}>下載訂票設定</button>}

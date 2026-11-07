@@ -42,8 +42,6 @@ from .storage import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     MIN_POLL_INTERVAL_SECONDS,
     MODE_AUTO_SUBMIT,
-    MODE_BOOK_WHEN_AVAILABLE,
-    TASK_MODES,
     Database,
     TaskRecord,
     UserRecord,
@@ -114,11 +112,11 @@ class TaskCreate(BaseModel):
     traveler_id: int | None = None
     # How the chosen train reads on the task card and in reminders.
     train_label: str = Field(default="", max_length=120)
-    mode: str = MODE_BOOK_WHEN_AVAILABLE
+    # Every task auto-submits; an older client's `mode` field is ignored.
     poll_interval_seconds: int = Field(
         default=DEFAULT_POLL_INTERVAL_SECONDS, ge=MIN_POLL_INTERVAL_SECONDS, le=86_400
     )
-    # Omitted means retry until booked or cancelled (monitor_only still reminds once).
+    # Omitted means the train's departure ends the monitoring.
     monitor_until: datetime | None = None
 
 
@@ -146,7 +144,7 @@ class TaskResponse(BaseModel):
     updated_at: str
     last_error: str | None
     booking_code: str | None = None
-    mode: str = MODE_BOOK_WHEN_AVAILABLE
+    mode: str = MODE_AUTO_SUBMIT
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     monitor_until: str | None = None
     last_checked_at: str | None = None
@@ -540,10 +538,6 @@ def create_app(
             raise HTTPException(status_code=422, detail="scheduled_at must include a timezone")
         elif scheduled_at.astimezone(UTC) < datetime.now(UTC) - START_TIME_GRACE:
             raise HTTPException(status_code=422, detail="scheduled_at cannot be in the past")
-        if body.mode not in TASK_MODES:
-            raise HTTPException(
-                status_code=422, detail=f"mode must be one of: {', '.join(sorted(TASK_MODES))}"
-            )
         monitor_until = body.monitor_until
         if monitor_until is not None:
             if monitor_until.tzinfo is None:
@@ -566,7 +560,6 @@ def create_app(
             booking,
             scheduled_at.astimezone(UTC).isoformat(),
             booking_payload,
-            mode=body.mode,
             poll_interval_seconds=body.poll_interval_seconds,
             monitor_until=monitor_until.astimezone(UTC).isoformat() if monitor_until else None,
             train_label=body.train_label.strip() or None,
@@ -997,8 +990,6 @@ def create_app(
         start_at: str | None,
         remind_every_minutes: int,
         monitor_until: str | None,
-        remind_once: bool,
-        auto_submit: bool,
     ) -> dict[str, Any]:
         def moment(value: str | None) -> datetime | None:
             if not value:
@@ -1006,11 +997,6 @@ def create_app(
             parsed = datetime.fromisoformat(value)
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=TAIWAN_TZ)
 
-        mode = (
-            MODE_AUTO_SUBMIT
-            if auto_submit
-            else ("monitor_only" if remind_once else MODE_BOOK_WHEN_AVAILABLE)
-        )
         body = TaskCreate(
             scheduled_at=moment(start_at),
             booking={
@@ -1020,7 +1006,6 @@ def create_app(
                 "outbound": {"ride_date": date.replace("-", "/"), "train_numbers": train_numbers},
             },
             train_label="、".join(train_numbers),
-            mode=mode,
             poll_interval_seconds=max(remind_every_minutes, 1) * 60,
             monitor_until=moment(monitor_until),
         )
@@ -1043,28 +1028,24 @@ def create_app(
         start_at: str | None = None,
         remind_every_minutes: int = 5,
         monitor_until: str | None = None,
-        remind_once: bool = False,
-        auto_submit: bool = False,
     ) -> dict[str, Any]:
-        """Watch one to three train numbers on date (YYYY-MM-DD) for 1-6 tickets.
+        """Auto-book one to three train numbers on date (YYYY-MM-DD), 1-6 tickets.
 
-        From start_at (ISO time, Taiwan time if no offset; default now) it sends
-        a webhook reminder every remind_every_minutes (min 1) until booked,
-        cancelled or monitor_until; remind_once sends a single reminder.
-        Monitoring never runs past the train's departure, which is also the
-        default monitor_until. The returned official_url is the pre-filled TRA
-        booking page; send it to the person straight away (it expires within
-        minutes).
-
-        auto_submit (needs TRA_AUTOBOOK_ENABLED) makes every round open the
-        official page in a headless browser, enter the person's stored ID and
-        submit -- the page mints its own reCAPTCHA v3 token. A round that the
-        browser cannot finish falls back to the reminder, so booking is never
-        lost. Requires identity saved on the task."""
+        From start_at (ISO time, Taiwan time if no offset; default now), every
+        remind_every_minutes (min 1) the server opens the official page in a
+        headless browser, enters the person's stored ID and submits; success
+        records the booking code. A sold-out round just waits for the next
+        one. A round the browser cannot finish sends a webhook reminder with
+        the booking link instead, so nothing is lost. Monitoring ends when
+        booked, cancelled, at monitor_until or at the train's departure,
+        whichever comes first. The returned official_url is the pre-filled TRA
+        booking page (it expires within minutes). Requires identity saved on
+        the task; needs TRA_AUTOBOOK_ENABLED on the server, without which
+        every round is a reminder."""
         return await run_in_threadpool(
             _create_booking_task,
             from_station, to_station, date, train_numbers, quantity,
-            start_at, remind_every_minutes, monitor_until, remind_once, auto_submit,
+            start_at, remind_every_minutes, monitor_until,
         )
 
     @agent.tool(name="list_tasks")
@@ -1107,24 +1088,6 @@ def create_app(
             user = _agent_user()
             _as_tool_error(lambda: _cancel_task(task_id, user.id))
             return "cancelled"
-
-        return await run_in_threadpool(_call)
-
-    @agent.tool()
-    async def set_auto_submit(task_id: str, enabled: bool) -> dict[str, Any]:
-        """Switch a task between auto-submit (the server books in a headless
-        browser) and plain reminders. Use it to turn auto-booking on or off
-        for an open task."""
-
-        def _call() -> dict[str, Any]:
-            user = _agent_user()
-            mode = MODE_AUTO_SUBMIT if enabled else MODE_BOOK_WHEN_AVAILABLE
-            if not _as_tool_error(lambda: db.set_task_mode(task_id, user.id, mode)):
-                raise ValueError("任務不存在或已結束")
-            updated = db.get_task(task_id, user.id)
-            if updated is None:
-                raise ValueError("任務不存在或已結束")
-            return _agent_task(updated)
 
         return await run_in_threadpool(_call)
 

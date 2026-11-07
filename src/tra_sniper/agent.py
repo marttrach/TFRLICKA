@@ -8,35 +8,29 @@ from typing import Any
 from starlette.responses import JSONResponse
 
 INSTRUCTIONS = """\
-TFRLICKA books Taiwan Railway (台鐵 TRA) tickets with a person in the loop.
-You can do everything up to the official booking page; the person finishes it.
+TFRLICKA auto-books Taiwan Railway (台鐵 TRA) tickets.
 
 Flow:
 1. find_stations: turn a station name into its value, e.g. "板橋" -> "1020-板橋".
 2. search_trains: list the trains for a date between two stations.
-3. create_booking_task: watch one to three train numbers. It returns
-   official_url, and every round sends a webhook reminder carrying one too.
-4. official_url is a maas.transportdata.tw link that opens TRA's own booking
-   page already filled with date, stations, train and ticket count.
-   Always send the person official_url -- never a TFRLICKA dashboard link.
-   It expires within minutes, so call get_booking_link for a fresh one
-   whenever the person is about to book.
-5. On the official page the person enters their national ID, passes the
-   verification (CAPTCHA) and presses 訂票. Nobody else can do that step.
-6. Ask the person for the booking code (電腦代碼) and call report_booked, or
-   cancel_task if they no longer want the trip.
+3. create_booking_task: book one to three train numbers. Every round the
+   server opens the official page in a headless browser, enters the stored
+   ID and submits (the page mints its own reCAPTCHA v3 token); success
+   records the booking code (電腦代碼) and ends the task. A sold-out round
+   waits for the next one. Monitoring stops at monitor_until or the train's
+   departure, whichever is first. try_auto_booking forces an attempt now.
+4. A round the browser cannot finish sends a webhook reminder carrying
+   official_url instead, so nothing is lost. official_url opens TRA's own
+   booking page already filled in; always send the person that link --
+   never a TFRLICKA dashboard link. It expires within minutes, so call
+   get_booking_link for a fresh one whenever the person is about to book.
+5. If the person booked by hand, ask for the booking code and call
+   report_booked, or cancel_task if they no longer want the trip.
 
 TRA has no public seat-availability data, so a reminder never means a seat is
 free; it means "try now". Ticket sales open 28 days before the ride date.
 Dates are Taiwan local dates (YYYY-MM-DD); times are Taiwan time (HH:MM).
-
-Auto-submit mode (reCAPTCHA v3, headless browser): if the server runs with
-TRA_AUTOBOOK_ENABLED, create_booking_task with auto_submit=true (or call
-set_auto_submit) makes every round drive the official page itself — the page
-mints its own reCAPTCHA v3 token, the ID comes from the task's stored
-identity, and success records the booking code automatically. Any round the
-browser cannot finish falls back to the normal reminder, so nothing is lost.
-try_auto_booking forces an attempt immediately.
+Without TRA_AUTOBOOK_ENABLED on the server, every round is a reminder.
 """
 
 

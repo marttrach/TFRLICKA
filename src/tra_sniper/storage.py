@@ -32,13 +32,11 @@ class UserRecord:
 # Monitoring is a poll loop, not a promise of seats: TDX exposes no TRA seat
 # availability (PLAN.md 7.1), so a check can report a timetable change or that a
 # task is ready for a person, never "there is a seat". See PLAN.md section 13.
-MODE_MONITOR_ONLY = "monitor_only"
-MODE_BOOK_WHEN_AVAILABLE = "book_when_available"
-# auto_submit: the scheduler drives the official page itself (headless browser
-# generating its own reCAPTCHA v3 token) and only falls back to reminders when
-# a page it does not understand appears.
+# auto_submit, the only mode: the scheduler drives the official page itself
+# (headless browser generating its own reCAPTCHA v3 token) and only falls back
+# to reminders when a round cannot finish. The reminder-only modes
+# (monitor_only, book_when_available) are gone; old rows migrate on start.
 MODE_AUTO_SUBMIT = "auto_submit"
-TASK_MODES = frozenset({MODE_MONITOR_ONLY, MODE_BOOK_WHEN_AVAILABLE, MODE_AUTO_SUBMIT})
 
 DEFAULT_POLL_INTERVAL_SECONDS = 300
 MIN_POLL_INTERVAL_SECONDS = 60
@@ -75,7 +73,7 @@ class TaskRecord:
     updated_at: str
     last_error: str | None
     booking_code: str | None = None
-    mode: str = MODE_BOOK_WHEN_AVAILABLE
+    mode: str = MODE_AUTO_SUBMIT
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     monitor_until: str | None = None
     last_checked_at: str | None = None
@@ -215,7 +213,7 @@ class Database:
             # the start time, so existing one-shot tasks stay correct: they get
             # a NULL monitor_until and simply stop after their first check.
             for column, ddl in (
-                ("mode", f"TEXT NOT NULL DEFAULT '{MODE_BOOK_WHEN_AVAILABLE}'"),
+                ("mode", f"TEXT NOT NULL DEFAULT '{MODE_AUTO_SUBMIT}'"),
                 (
                     "poll_interval_seconds",
                     f"INTEGER NOT NULL DEFAULT {DEFAULT_POLL_INTERVAL_SECONDS}",
@@ -228,6 +226,9 @@ class Database:
             ):
                 if column not in task_columns:
                     connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {ddl}")
+            connection.execute(
+                "UPDATE tasks SET mode = ? WHERE mode != ?", (MODE_AUTO_SUBMIT, MODE_AUTO_SUBMIT)
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_next_check "
                 "ON tasks(next_check_at) WHERE status IN ('scheduled', 'monitoring')"
@@ -558,7 +559,7 @@ class Database:
         scheduled_at: str,
         payload: dict[str, Any],
         *,
-        mode: str = MODE_BOOK_WHEN_AVAILABLE,
+        mode: str = MODE_AUTO_SUBMIT,
         poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
         monitor_until: str | None = None,
         train_label: str | None = None,
@@ -615,16 +616,6 @@ class Database:
                 "DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id)
             )
         return cursor.rowcount > 0
-
-    def set_task_mode(self, task_id: str, user_id: int, mode: str) -> bool:
-        """Switch an open task's run mode. Finished tasks stay finished."""
-        with self.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE tasks SET mode = ?, updated_at = ? "
-                "WHERE id = ? AND user_id = ? AND status NOT IN ('completed', 'cancelled', 'expired')",
-                (mode, utc_now(), task_id, user_id),
-            )
-        return cursor.rowcount == 1
 
     def get_task(self, task_id: str, user_id: int) -> TaskRecord | None:
         with self.connect() as connection:

@@ -10,8 +10,7 @@ from cryptography.fernet import Fernet
 from tra_sniper.models import BookingRequest
 from tra_sniper.storage import (
     DEFAULT_POLL_INTERVAL_SECONDS,
-    MODE_BOOK_WHEN_AVAILABLE,
-    MODE_MONITOR_ONLY,
+    MODE_AUTO_SUBMIT,
     Database,
 )
 
@@ -30,7 +29,7 @@ def _booking():
     }
 
 
-def _task(database, user_id, *, start, until, mode=MODE_BOOK_WHEN_AVAILABLE, interval=None):
+def _task(database, user_id, *, start, until, mode=MODE_AUTO_SUBMIT, interval=None):
     data = _booking()
     return database.create_task(
         user_id,
@@ -93,7 +92,7 @@ def test_check_runs_again_after_the_interval_elapses(tmp_path) -> None:
         user.id,
         start=now - timedelta(minutes=1),
         until=now + timedelta(hours=2),
-        mode=MODE_MONITOR_ONLY,
+        mode=MODE_AUTO_SUBMIT,
     )
 
     assert len(database.claim_due_checks(now.isoformat())) == 1
@@ -110,7 +109,7 @@ def test_monitoring_stops_at_the_deadline(tmp_path) -> None:
         user.id,
         start=now - timedelta(hours=2),
         until=now - timedelta(minutes=1),
-        mode=MODE_MONITOR_ONLY,
+        mode=MODE_AUTO_SUBMIT,
     )
 
     assert database.claim_due_checks(now.isoformat()) == []

@@ -47,10 +47,7 @@ def test_scheduler_survives_a_failed_tick(caplog) -> None:
 def test_scheduler_tick_returns_promoted_count() -> None:
     class DatabaseStub(QuietMonitorMixin):
         def claim_due_checks(self) -> list[object]:
-            return [SimpleNamespace(id=str(i), user_id=1, mode="monitor_only") for i in range(3)]
-
-        def pause_monitoring(self, task_id, user_id, status):
-            return True
+            return [SimpleNamespace(id=str(i), user_id=1, mode="auto_submit") for i in range(3)]
 
     scheduler = TaskScheduler(DatabaseStub())  # type: ignore[arg-type]
     assert scheduler.tick() == 3
