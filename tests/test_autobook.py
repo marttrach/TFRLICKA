@@ -1253,3 +1253,70 @@ def test_monitoring_window_defaults_to_departure(tmp_path, monkeypatch) -> None:
         # No timetable match: the end of the ride date bounds it.
         unknown = {**_booking(), "outbound": {"ride_date": "2099/01/01", "train_numbers": ["999"]}}
         assert until(client, headers, unknown) == datetime(2099, 1, 1, 23, 59, 59, tzinfo=taipei)
+
+
+# ---- departed trains are refused at creation and skipped at runtime ------------
+
+
+def _timetable_app(tmp_path, monkeypatch, departures: dict[str, str]):
+    monkeypatch.setenv("TRA_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("TRA_AUTOBOOK_ENABLED", raising=False)
+    monkeypatch.setenv("TRA_TOKEN_SECRET", "x" * 32)
+
+    class TimetableTdx:
+        configured = True
+
+        def stations(self, fallback):
+            return list(fallback)
+
+        def load_cached_stations(self):
+            return []
+
+        def booking_link(self, start, end, train_no, ride_date, quantity):
+            return f"{OFFICIAL}&train={train_no}"
+
+        def daily_timetable(self, start_id, end_id, ride_date):
+            return [
+                {"TrainInfo": {"TrainNo": no},
+                 "StopTimes": [{"DepartureTime": leaves}, {"ArrivalTime": "23:00"}]}
+                for no, leaves in departures.items()
+            ]
+
+    db = Database(tmp_path / "tra.db", encryption_key=Fernet.generate_key().decode())
+    return create_app(database=db, token_manager=TokenManager(), tdx_client=TimetableTdx(),
+                      start_scheduler=False, autobook=StubSubmitter(SubmitResult(False)))
+
+
+def _two_trains() -> dict:
+    return {**_booking(), "outbound": {"ride_date": "2099/01/01", "train_numbers": ["152", "179"]}}
+
+
+def test_task_with_a_train_gone_before_the_start_is_refused(tmp_path, monkeypatch) -> None:
+    app = _timetable_app(tmp_path, monkeypatch, {"152": "17:53", "179": "20:00"})
+    with TestClient(app) as client:
+        headers = _register(client)
+        response = client.post("/tasks", headers=headers, json={
+            "booking": _two_trains(), "scheduled_at": "2099-01-01T18:00:00+08:00",
+        })
+        assert response.status_code == 422
+        assert "152" in response.json()["detail"] and "179" not in response.json()["detail"]
+        assert client.get("/tasks", headers=headers).json() == []
+
+
+def test_booking_link_skips_trains_that_already_left(tmp_path, monkeypatch) -> None:
+    import tra_sniper.api as api_module
+
+    app = _timetable_app(tmp_path, monkeypatch, {"152": "17:53", "179": "20:00"})
+    taipei = timezone(timedelta(hours=8))
+    with TestClient(app) as client:
+        headers = _register(client)
+        task = client.post("/tasks", headers=headers, json={"booking": _two_trains()}).json()
+        link = f"/tasks/{task['id']}/booking-link"
+        assert client.post(link, headers=headers).json()["train_no"] == "152"
+        # 152 has left: the round goes for 179 instead of a dead train.
+        monkeypatch.setattr(api_module, "_utc_now",
+                            lambda: datetime(2099, 1, 1, 18, 0, tzinfo=taipei))
+        assert client.post(link, headers=headers).json()["train_no"] == "179"
+        monkeypatch.setattr(api_module, "_utc_now",
+                            lambda: datetime(2099, 1, 1, 20, 1, tzinfo=taipei))
+        assert client.post(link, headers=headers).status_code == 409

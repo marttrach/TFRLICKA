@@ -72,6 +72,10 @@ def _link_clock() -> float:
     return time.monotonic()  # monkeypatch seam for TTL tests
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)  # monkeypatch seam for departed-train tests
+
+
 class LoginCredentials(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     password: str = Field(min_length=1, max_length=256)
@@ -480,13 +484,40 @@ def create_app(
             raise HTTPException(status_code=404, detail="常用資料不存在")
         return Response(status_code=204)
 
-    def _departure_deadline(booking: BookingRequest) -> datetime:
+    def _train_departures(booking: BookingRequest) -> dict[str, datetime]:
+        """Departure of each of the task's train numbers, from the TDX timetable.
+
+        Empty when TDX is not configured or cannot answer: callers then know
+        nothing about departures and must not exclude any train on a guess.
+        """
+        leg = booking.outbound
+        if not leg.train_numbers or not getattr(tdx, "configured", False):
+            return {}
+        day = date.fromisoformat(leg.ride_date.replace("/", "-"))
+        try:
+            records = tdx.daily_timetable(
+                _station_id(booking.start_station), _station_id(booking.end_station), leg.ride_date
+            )
+            return {
+                candidate.train_no: datetime.combine(
+                    day, dt_time.fromisoformat(candidate.departure_time), TAIWAN_TZ
+                )
+                for candidate in (parse_candidate(record, 0, 24 * 60) for record in records)
+                if candidate.train_no in leg.train_numbers
+            }
+        except Exception:  # noqa: BLE001 - an unreadable timetable means "unknown"
+            logger.warning(
+                "could not read the departure times from the TDX timetable",
+                extra={"event": "task.departure_unknown"},
+            )
+            return {}
+
+    def _departure_deadline(booking: BookingRequest, departures: dict[str, datetime]) -> datetime:
         """When the outbound ride leaves, as precisely as we can know it.
 
-        The latest departure among the task's train numbers from the TDX
-        timetable; without TDX (or a match), the end of the ride date. A
-        time-window task leaves by the window's end when it searches by
-        departure.
+        The latest departure among the task's train numbers; without one, the
+        end of the ride date. A time-window task leaves by the window's end
+        when it searches by departure.
         """
         leg = booking.outbound
         day = date.fromisoformat(leg.ride_date.replace("/", "-"))
@@ -495,25 +526,7 @@ def create_app(
             if leg.search_by_departure and leg.end_time:
                 return datetime.combine(day, dt_time.fromisoformat(leg.end_time), TAIWAN_TZ)
             return end_of_day
-        if not getattr(tdx, "configured", False):
-            return end_of_day
-        try:
-            records = tdx.daily_timetable(
-                _station_id(booking.start_station), _station_id(booking.end_station), leg.ride_date
-            )
-            departures = [
-                candidate.departure_time
-                for candidate in (parse_candidate(record, 0, 24 * 60) for record in records)
-                if candidate.train_no in leg.train_numbers
-            ]
-            if departures:
-                return datetime.combine(day, dt_time.fromisoformat(max(departures)), TAIWAN_TZ)
-        except Exception:  # noqa: BLE001 - a missing timetable falls back to the day's end
-            logger.warning(
-                "could not read the departure time; monitoring until the end of the ride date",
-                extra={"event": "task.departure_unknown"},
-            )
-        return end_of_day
+        return max(departures.values(), default=end_of_day)
 
     def _create_task(body: TaskCreate, user: UserRecord) -> TaskRecord:
         booking_payload = dict(body.booking)
@@ -550,7 +563,19 @@ def create_app(
                 )
         # Polling past departure can only chase a train that has left, so the
         # window closes at the earlier of the person's stop time and departure.
-        departure = _departure_deadline(booking)
+        departures = _train_departures(booking)
+        # A train that leaves before monitoring even starts can never be
+        # booked; refuse the task instead of quietly carrying a dead option.
+        gone = [
+            no for no in booking.outbound.train_numbers
+            if no in departures and departures[no] <= scheduled_at
+        ]
+        if gone:
+            raise HTTPException(
+                status_code=422,
+                detail=f"車次 {'、'.join(gone)} 在開始時間前就已發車，請移除後再建立任務",
+            )
+        departure = _departure_deadline(booking, departures)
         if departure <= scheduled_at:
             raise HTTPException(status_code=422, detail="這班車已經發車，無法再監控")
         if monitor_until is None or departure < monitor_until:
@@ -728,9 +753,18 @@ def create_app(
             raise HTTPException(status_code=422, detail="這個任務沒有指定車次，無法產生官方訂票連結")
         if not tdx.configured:
             raise HTTPException(status_code=409, detail="尚未設定 TDX 金鑰，無法產生官方訂票連結")
-        # The official page has three train fields, so the first one is enough
-        # to land there; each extra link would cost another TDX call.
-        train_no = booking.outbound.train_numbers[0]
+        # The official page has three train fields, so one train is enough to
+        # land there; each extra link would cost another TDX call. It is the
+        # first one still to leave: a departed train can only fail the round.
+        departures = _train_departures(booking)
+        now = _utc_now()
+        open_trains = [
+            no for no in booking.outbound.train_numbers
+            if no not in departures or departures[no] > now
+        ]
+        if not open_trains:
+            raise HTTPException(status_code=409, detail="任務的車次都已發車，無法再訂票")
+        train_no = open_trains[0]
         try:
             url = tdx.booking_link(
                 booking.start_station,
