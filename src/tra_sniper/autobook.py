@@ -46,9 +46,17 @@ FAILURE_MARKERS = (
     # with this AFTER the submit -- a clean identity failure, not unreadable.
     # Not in the initial HTML (grep-verified), so it cannot misfire pre-submit.
     "身分證字號格式錯誤",
+    # Live 2026-11-07 16:10 (NAS, tip123/bookingTicket wizard): the no-seat
+    # answer here is "車次均沒有空位" / "目前查無可售座位" -- neither the
+    # 已售完 wording above nor anything matched, so a routine sold-out round
+    # parked as unknown instead of quietly re-polling.
+    "沒有空位",
+    "查無可售座位",
 )
 # The FAILURE_MARKERS that mean "no seat right now", not "something broke".
-SOLD_OUT_MARKERS = frozenset({"已售完", "售完", "已滿", "已满"})
+SOLD_OUT_MARKERS = frozenset(
+    {"已售完", "售完", "已滿", "已满", "沒有空位", "查無可售座位"}
+)
 # TRA's 電腦代碼. Live-verified 2026-11-07 (tip115 success page): the current
 # code is PLAIN digits ("訂票代碼 2854451") — a letters-only pattern silently
 # misses it. Label-anchored ONLY: unlabeled success text is a banner, not a

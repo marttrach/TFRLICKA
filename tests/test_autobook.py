@@ -64,6 +64,23 @@ def test_parser_reads_failure_pages() -> None:
     assert "已售完" in sold_out.reason
 
 
+def test_parser_reads_wizard_sold_out_wording() -> None:
+    # Live 2026-11-07 16:10 (NAS): tip123/bookingTicket answers "no seat"
+    # with this wording; it matched no marker and parked as unknown instead
+    # of sold_out. Exact captured text (account digits masked at source).
+    page = (
+        "跳到主要內容 ::: ::: 個人訂票 訂票 付款 完成 訂票 行程1 的車次均沒有"
+        "空位，請重新調整查詢條件 行程一 2026-11-08 臺北 到 臺中 票數 1 進階篩選"
+        " 系統依您所設定的訂票內容查詢，目前查無可售座位，請您調整訂票內容後再重"
+        "新查詢！您所查詢的條件，均沒有空位。請返回上一步調整查詢條件。騰雲座艙"
+        " 查詢 返回，重設訂票條件 ::: 國營臺灣鐵路股份有限公司 版權所有 ©2024"
+        " All Rights Reserved ▲ 處理中，請稍候..."
+    )
+    result = parse_booking_outcome(page)
+    assert (result.ok, result.unknown) == (False, False)
+    assert result.sold_out
+
+
 def test_parser_flags_unknown_pages_as_not_understood() -> None:
     result = parse_booking_outcome("請先選擇乘車日期")
     assert not result.ok
